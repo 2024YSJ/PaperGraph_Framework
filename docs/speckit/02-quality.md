@@ -34,6 +34,19 @@ flowchart LR
 
 **언제 건너뛰나** — 명세가 이미 충분히 구체적일 때. 판단 기준은 "`plan`이 추측 없이 설계할 수 있는가"입니다. `spec.md`에 `NEEDS CLARIFICATION` 표시가 남아 있다면 건너뛰지 마세요.
 
+### `/speckit-decompose`와의 차이
+
+둘 다 질문을 던지지만 목적과 한도가 다릅니다.
+
+| | `clarify` | [`decompose`](07-decompose.md) |
+|---|---|---|
+| 대상 | 이미 존재하는 `spec.md` **하나** | 러프한 구상 또는 **비대해진** 스펙 |
+| 질문 상한 | **최대 5개** | **없음 — 확정될 때까지** |
+| 결과 | 같은 spec이 더 정밀해짐 | spec **여러 개**로 쪼개짐 |
+| 위치 | `specify` **이후** | `specify` **이전** |
+
+스펙이 흐릿하면 `clarify`, 스펙이 너무 크면 `decompose`입니다.
+
 ---
 
 ## `/speckit-checklist`

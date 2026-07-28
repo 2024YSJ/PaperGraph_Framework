@@ -40,6 +40,8 @@ Spec-Driven Development의 뼈대입니다. `specify → plan → tasks → impl
 
 **사용 시점** — 새 기능의 출발점. Discovery 트랙을 거쳤다면 `decide`가 `go` 판정을 낸 직후.
 
+> **구상이 시스템 전체를 덮을 만큼 크다면 먼저 [`/speckit-decompose`](07-decompose.md)를 돌리세요.** 스펙 하나에 전부 담으면 `plan`이 실행 불가능한 계획을, `tasks`가 끝나지 않는 목록을 내놓습니다. decompose가 확정될 때까지 질문한 뒤 브리프 여러 개로 쪼개주면, 그 브리프를 하나씩 이 스킬에 넘기면 됩니다.
+
 **입력** — 만들고 싶은 기능 설명 (자연어)
 
 **산출물** — `specs/<NNN>-<feature-name>/spec.md`

@@ -1,10 +1,11 @@
 # Spec Kit 스킬 가이드
 
-이 프로젝트에 설치된 **24개 Spec Kit 스킬**의 역할, 사용 시점, 실행 순서를 정리한 문서입니다.
+이 프로젝트에 설치된 **25개 스킬**(공식 24 + 자체 제작 1)의 역할, 사용 시점, 실행 순서를 정리한 문서입니다.
 
 - 설치 버전: `specify` CLI `0.14.3.dev0` (프로젝트 스캐폴딩은 `0.12.3.dev0`으로 생성)
 - 인테그레이션: `claude` / 스크립트 타입: `ps` (PowerShell)
 - 확장: `git`, `agent-context`, `bug`, `assess` (core 4종 전부)
+- 자체 제작: [`/speckit-decompose`](07-decompose.md) — 공식 배포물이 아니며 업그레이드 시 덮어쓰일 수 있음
 
 > **슬래시 커맨드 표기**
 > Spec Kit의 정식 커맨드 ID는 점 표기(`speckit.specify`)지만, Claude Code는 하이픈 구분자를 씁니다.
@@ -19,9 +20,10 @@ Spec Kit은 성격이 다른 두 흐름으로 나뉩니다. 이 구분을 놓치
 | 트랙 | 묻는 질문 | 담당 스킬 |
 |---|---|---|
 | **Discovery (발견)** | *이걸 만들 가치가 있나?* | `assess` 5종 |
+| **Decomposition (분해)** | *한 덩어리인가, 여러 개인가?* | `decompose` 1종 |
 | **Delivery (구현)** | *어떻게 만들 것인가?* | core 워크플로우 + 품질 보강 |
 
-Discovery를 통과(`go`)한 아이디어만 Delivery로 넘어갑니다. 이미 만들기로 결정된 일이라면 Discovery는 건너뛰고 `/speckit-specify`부터 시작하면 됩니다.
+Discovery를 통과(`go`)한 아이디어만 다음으로 넘어갑니다. 이미 만들기로 결정된 일이라면 Discovery는 건너뜁니다. 구상이 시스템 전체를 덮을 만큼 크면 `/speckit-specify` 전에 `/speckit-decompose`로 먼저 쪼갭니다.
 
 ```mermaid
 flowchart TD
@@ -30,7 +32,15 @@ flowchart TD
     end
 
     A5 -->|kill| X[기록 후 종료]
-    A5 -->|go| S
+    A5 -->|go| DC
+
+    subgraph DEC["Decomposition — 한 덩어리인가?"]
+        DC{규모 판단} -->|너무 큼| DP[decompose]
+        DP --> BR["브리프 01·02·03…"]
+    end
+
+    DC -->|적정| S
+    BR -->|하나씩| S
 
     subgraph V["Delivery — 어떻게 만드나?"]
         C[constitution] -.최초 1회.-> S[specify]
@@ -58,6 +68,7 @@ flowchart TD
 | # | 스킬 | 필수 | 하는 일 |
 |---|---|:---:|---|
 | 0 | `/speckit-constitution` | 최초 1회 | 프로젝트 원칙 수립 |
+| 0.5 | `/speckit-decompose` | 구상이 클 때 | 확정될 때까지 질문 후 여러 스펙으로 분해 |
 | 1 | **`/speckit-specify`** | ● | 기능 명세 작성 (`spec.md`) |
 | 2 | `/speckit-clarify` | | 모호한 지점을 질문으로 해소 |
 | 3 | **`/speckit-plan`** | ● | 설계 산출물 생성 (`plan.md` 외) |
@@ -76,6 +87,8 @@ flowchart TD
 | 하고 싶은 일 | 시작 스킬 | 문서 |
 |---|---|---|
 | 새 기능을 처음부터 만든다 | `/speckit-specify` | [01-core-workflow](01-core-workflow.md) |
+| **구상이 너무 커서 쪼개야 한다** | `/speckit-decompose` | [07-decompose](07-decompose.md) |
+| **러프한 생각을 질문으로 다듬는다** | `/speckit-decompose` | [07-decompose](07-decompose.md) |
 | 아이디어가 쓸모 있는지부터 판단한다 | `/speckit-assess-intake` | [03-assess](03-assess.md) |
 | 버그를 잡는다 | `/speckit-bug-assess` | [04-bug](04-bug.md) |
 | 명세가 흐릿해 보인다 | `/speckit-clarify` | [02-quality](02-quality.md) |
@@ -103,6 +116,11 @@ flowchart TD
 │
 ├── .specify/
 │   ├── memory/constitution.md      # ← constitution
+│   ├── decompositions/<slug>/      # ← decompose
+│   │   ├── overview.md             #   확정된 전체 스코프
+│   │   ├── decisions.md            #   Q&A 기록 (append-only)
+│   │   ├── handoff.md              #   순서·의존성·Body-Hash
+│   │   └── specs/NN-<name>.md      #   스펙 브리프 → /speckit-specify 입력
 │   ├── assessments/<slug>/         # ← assess 5종
 │   │   ├── intake.md
 │   │   ├── research.md
@@ -140,4 +158,5 @@ flowchart TD
 | [04-bug.md](04-bug.md) | assess, fix, test | 3 |
 | [05-git.md](05-git.md) | initialize, feature, validate, remote, commit | 5 |
 | [06-agent-context.md](06-agent-context.md) | update | 1 |
-| | **합계** | **24** |
+| [07-decompose.md](07-decompose.md) | decompose *(자체 제작)* | 1 |
+| | **합계** | **25** |
