@@ -82,8 +82,10 @@ PCA Class 제작.	-> 다예
 
 ## 다음 담당자 참고
 
-- 위 3~4번 판단은 `docs/Structure/PaperGraph3D_Class_Diagram.md` 하단
-  "2026-08-02 합의 사항" 절에도 동일하게 기록해둠.
+- (2026-08-02 정정) 개발 기록·변경 이력·논의 배경은 이 계획 문서(`primary_plan.md`)에만
+  남긴다. `docs/Structure/PaperGraph3D_Class_Diagram.md`는 날짜/이력 없이 현재 클래스
+  구조만 다루고, 배경 설명이 필요한 지점은 이 문서로 링크만 건다. (이전에는 두 문서에
+  같은 내용을 중복 기록했었음 — 아래처럼 두 문서의 서술이 갈라지는 문제가 있어 정리함.)
 
 ## 8월 2일 후속 수정 — ObsidianFileAdapter static 전환
 
@@ -129,3 +131,77 @@ PCA Class 제작.	-> 다예
 - 수집(Collect) 쪽은 다이어그램상 `run()` 밖으로 흐름 제어를 빼지 말라는 규칙이
   있고, 이미 recent/backfill 커맨드 + 임베딩 설치 확인/설치 버튼으로 단계가
   나뉘어 있다고 판단해 추가로 손대지 않음.
+
+## 8월 2일 후속 수정 3 — File/ObsidianFileAdapter 분리 폐기
+
+`File`을 `interface`로 두고 `ObsidianFileAdapter`를 별도 구현체로 분리했던 이전 결정을
+되돌렸다. static 클래스는 인스턴스 인터페이스를 `implements`할 수 없어서, static 전환
+이후 `File` interface는 어디에도 연결되지 않는 죽은 코드가 됐고(참조하는 소비자도 없이
+`SettingTab`/`main.ts`가 `ObsidianFileAdapter`를 직접 호출), 애초에 "저장 매체 교체
+가능성 때문에 인터페이스로 추상화한다"는 목적 자체가 static 단일 구현체 구조와 상충했다.
+저장 매체를 실제로 교체할 계획이 없다고 보고, 인터페이스+구현체 분리 대신 `File` 자체를
+구현체로 합쳤다.
+
+- `src/adapter/ObsidianFileAdapter.ts` 삭제.
+- `src/common/File.ts`: `interface File`을 삭제하고, `ObsidianFileAdapter`에 있던
+  static 멤버(`vault`, `init`, `readSecret`/`writeSecret`/`readSubscriptions`/
+  `writeSubscriptions`/`readPaper`/`writePaper`)를 그대로 옮겨 `export class File`로
+  만들었다. 메소드 본문은 이전처럼 전부 `throw` 스텁.
+- `src/main.ts`, `src/adapter/SettingTab.ts`: `ObsidianFileAdapter` import/호출을 전부
+  `File`로 교체 (`File.init(vault)`, `File.writeSecret(...)` 등).
+- 부작용: `src/common/`이 더 이상 Obsidian API를 모르는 순수 TS 영역이 아니게 됐다 —
+  `File.ts`가 `obsidian`의 `Vault`를 직접 import한다. 다이어그램/AGENTS/README의
+  "common은 Obsidian을 모른다" 서술도 이에 맞춰 갱신함.
+- `docs/Structure/PaperGraph3D_Class_Diagram.md`의 "2026-08-02 합의 사항" 절, `README.md`,
+  `AGENTS.md`의 폴더 구조 설명도 `ObsidianFileAdapter` 삭제에 맞춰 갱신함.
+
+## 8월 2일 후속 수정 4 — File을 PaperStore/SecretStore로 분리
+
+`File`을 하나의 static 클래스로 합친 직후, `Secret`(보안 정보, 저장 매체 미정)과
+`Paper`(vault 노트, 저장 매체 사실상 확정)가 같은 클래스의 static 상태(`vault` 필드)를
+공유하는 문제가 드러났다:
+
+- `Secret`만 테스트하려 해도 `File.init(vault)`를 만족시켜야 하는데, `obsidian` 패키지는
+  타입 선언만 제공해서 실제 `Vault`를 만들 수 없다 — 목(mock)을 억지로 캐스팅해 넣어야 함.
+- 한쪽(`Paper`) 저장 로직을 고치다 다른 쪽(`Secret`) 초기화 상태를 실수로 건드릴 위험.
+- `Secret`은 팀 논의 결과 vault 파일이 아니라 Obsidian 플러그인 데이터
+  (`Plugin.saveData/loadData`) + 암호화로 가는 방향이 유력해졌다 — 이건 `Vault`가 아니라
+  `Plugin` 인스턴스가 필요해서 애초에 `Paper`와 API 자체가 다르다.
+  - 다만 "plugin 데이터 폴더에 저장한다"는 것 자체는 보안 대책이 아니다. `data.json`도
+    vault 안(`.obsidian/plugins/papergraph3d/`)에 있는 평문 파일이라, vault를 git/클라우드로
+    동기화하면 그대로 같이 노출된다. 실제로 보호하려면 저장 전 암호화가 필요하고, 암호화
+    키를 어디서 가져올지(사용자 패스프레이즈 / OS 자격 증명 저장소 등)는 아직 미정 —
+    우빈이 `Secret` 구현 전 팀과 재확인할 것.
+
+- `src/common/File.ts` 삭제.
+- `src/adapter/PaperStore.ts` 신설: `Vault` 기반, `readPaper`/`writePaper`만 담당. static.
+- `src/adapter/SecretStore.ts` 신설: `Plugin` 기반, `readSecret`/`writeSecret`/
+  `readSubscriptions`/`writeSubscriptions` 담당. static. 암호화는 아직 스텁.
+- `src/main.ts`: `init()`에서 `PaperStore.init(this.app.vault)` + `SecretStore.init(this)`
+  두 줄로 등록 (`this`는 `Plugin`을 상속한 `PaperGraph3D` 자신).
+- `src/adapter/SettingTab.ts`: `File.xxx(...)` 호출을 `PaperStore.writePaper(...)` /
+  `SecretStore.writeSecret(...)` / `SecretStore.writeSubscriptions(...)`로 교체.
+- 부작용(의도한 효과): `PaperStore`/`SecretStore`를 둘 다 `src/adapter/`로 두면서
+  `src/common/`이 다시 Obsidian API를 모르는 순수 TS 영역으로 복원됐다 — `File.ts`가
+  `common/`에서 유일하게 `obsidian`을 import하던 예외였는데, 그 예외가 없어짐.
+- `docs/Structure/PaperGraph3D_Class_Diagram.md`, `README.md`, `AGENTS.md`도 `File` →
+  `PaperStore`/`SecretStore` 분리에 맞춰 갱신함.
+
+## 8월 2일 후속 수정 5 — 다이어그램 문서 구조 정리, 개발 기록 이관
+
+`docs/Structure/PaperGraph3D_Class_Diagram.md`에 날짜·담당자가 붙은 "합의 사항"(변경
+이력 서술)이 이 계획 문서(`primary_plan.md`)의 "후속 수정" 절들과 중복 기록되고 있었다.
+같은 내용이 두 문서에 흩어져 있으면 한쪽만 고치고 다른 쪽을 놓치는 사고가 나기 쉬워서,
+역할을 분리했다: **다이어그램 문서 = 현재 클래스 구조만(날짜/이력 없음)**,
+**이 계획 문서 = 변경 이력·논의 배경·TODO**.
+
+- 구조 모순 발견: `Class PaperStore`/`Class SecretStore`가 다이어그램의 `## 공통` 절
+  아래 남아 있었는데, 실제로는 `src/adapter/`에 있다("폴더 구조" 서술과도 어긋남).
+  `## 어댑터 (Obsidian 전용, src/adapter/)` 절을 새로 만들어 그 아래로 옮김.
+- 다이어그램의 "2026-08-02 합의 사항" 절을 "설계 참고"로 개명하고, 날짜/담당자 표기와
+  변경 이력 서술(예: "File → PaperStore/SecretStore 3차 수정" 문단), 개별 TODO(예:
+  "우빈이 발행 년도 제거 여부 재확인")를 모두 제거 — 해당 내용은 이 문서(item 4, 이번
+  절)에만 남긴다. 다이어그램에는 현재도 유효한 구조적 사실(프레임워크화 의미, 진입점,
+  폴더 구조, Paper (+)/(-) 표기 규칙)만 남겼다.
+- "다음 담당자 참고" 절의 "다이어그램에도 동일하게 기록해둠" 문구를 위 정책 설명으로
+  교체 — 더 이상 두 문서에 같은 내용을 중복 기록하지 않는다.

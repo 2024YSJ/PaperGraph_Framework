@@ -1,6 +1,7 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { ObsidianFileAdapter } from './ObsidianFileAdapter';
+import { PaperStore } from './PaperStore';
+import { SecretStore } from './SecretStore';
 import { PipelineTestModal } from './PipelineTestModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
@@ -38,7 +39,7 @@ interface ApiDraft {
 // 정하지 않았으므로, 여기서는 SettingTab 자체의 로컬 상태에만 바인딩한다 (담당자들의
 // 설계를 선점하지 않기 위함). 다만 구조(API 하나 : 조건 여러 개)는 다이어그램의
 // Subscriptions/API/SearchQuery 관계를 그대로 반영한다.
-// 실제 저장은 File/Secret/Subscriptions/API 구현이 끝난 뒤 TODO 부분에서 연결한다.
+// 실제 저장은 PaperStore/SecretStore/Secret/Subscriptions/API 구현이 끝난 뒤 TODO 부분에서 연결한다.
 export class SettingTab extends PluginSettingTab {
 	plugin: PaperGraph3D;
 
@@ -117,13 +118,13 @@ export class SettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName('저장 (File)')
-			.setDesc('입력창에서 값을 받아 ObsidianFileAdapter의 쓰기 함수를 호출합니다.')
+			.setName('저장 (PaperStore/SecretStore)')
+			.setDesc('입력창에서 값을 받아 PaperStore/SecretStore의 쓰기 함수를 호출합니다.')
 			.addButton((button) =>
 				button.setButtonText('Secret').onClick(async () => {
 					// Secret은 아직 필드가 없는 빈 클래스라 입력창 없이 바로 호출한다.
 					try {
-						await ObsidianFileAdapter.writeSecret(new Secret());
+						await SecretStore.writeSecret(new Secret());
 					} catch {
 						new Notice('아직 구현되지 않음: 저장(Secret)');
 					}
@@ -149,7 +150,7 @@ export class SettingTab extends PluginSettingTab {
 								subscriptions.updateTime = Number.isNaN(updateTime) ? Date.now() : updateTime;
 								subscriptions.secret = new Secret();
 								subscriptions.apis = [];
-								await ObsidianFileAdapter.writeSubscriptions(subscriptions);
+								await SecretStore.writeSubscriptions(subscriptions);
 							} catch {
 								new Notice('아직 구현되지 않음: 저장(Subscriptions)');
 							}
@@ -178,7 +179,7 @@ export class SettingTab extends PluginSettingTab {
 								paper.abstract = '';
 								paper.sourceId = values.sourceId ?? 'settings-test-paper';
 								paper.references = [];
-								await ObsidianFileAdapter.writePaper(paper);
+								await PaperStore.writePaper(paper);
 							} catch {
 								new Notice('아직 구현되지 않음: 저장(Paper)');
 							}
@@ -209,7 +210,7 @@ export class SettingTab extends PluginSettingTab {
 					.setValue(this.apiKeyDraft)
 					.onChange((value) => {
 						this.apiKeyDraft = value;
-						// TODO: File/Secret 구현 후 ObsidianFileAdapter.writeSecret(...)로 연결
+						// TODO: Secret 구현 후 SecretStore.writeSecret(...)로 연결
 					}),
 			);
 
@@ -270,7 +271,7 @@ export class SettingTab extends PluginSettingTab {
 							newConditionQuery: '',
 						});
 						this.apiLabelDraft = '';
-						// TODO: File/Subscriptions/API 구현 후 ObsidianFileAdapter.writeSubscriptions(...)로 연결
+						// TODO: Subscriptions/API 구현 후 SecretStore.writeSubscriptions(...)로 연결
 						this.display();
 					}),
 			);
@@ -330,7 +331,7 @@ export class SettingTab extends PluginSettingTab {
 						query: api.newConditionQuery.trim(),
 					});
 					api.newConditionQuery = '';
-					// TODO: File/Subscriptions/API 구현 후 this.plugin.files.writeSubscriptions(...)로 연결
+					// TODO: Subscriptions/API 구현 후 SecretStore.writeSubscriptions(...)로 연결
 					this.display();
 				}),
 			);

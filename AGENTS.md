@@ -52,18 +52,30 @@ npm run build
       collect/      # Collection pipeline: CollectAndSave, Subscriptions, Secret, API,
                      # SearchQuery, Paper, Embedding
       visualize/    # Visualization pipeline: VisualizationFlow, PCA, Visualization, GraphData
-      common/       # Shared building blocks: Middleware, File (interface), EventListener,
-                     # TaskManager, Task
-      adapter/      # Obsidian-specific implementations/UI: ObsidianFileAdapter, SettingTab,
-                     # VisualizationView
+      common/       # Shared building blocks: Middleware, EventListener, TaskManager, Task
+                     # (no obsidian import — plain TS)
+      adapter/      # Obsidian-specific: SettingTab, VisualizationView, PaperStore,
+                     # SecretStore
     ```
 - Keep `main.ts` small and focused on plugin lifecycle (loading, unloading, registering
   commands) — delegate feature logic to `collect/`, `visualize/`, `common/`, `adapter/`.
-- `File` (in `src/common/File.ts`) is a storage-medium-agnostic interface; its Obsidian
-  implementation lives in `src/adapter/ObsidianFileAdapter.ts` as a **static** class
-  (no instantiation — call `ObsidianFileAdapter.method(...)` directly, after
-  `ObsidianFileAdapter.init(vault)` has registered the vault reference once in
-  `PaperGraph3D.init()`).
+- `common/` is Obsidian-agnostic plain TypeScript; anything touching the `obsidian` API
+  (Vault, Plugin, etc.) belongs in `adapter/`.
+- Persistence is split by storage medium and owner concern:
+  - `PaperStore` (`src/adapter/PaperStore.ts`) is a **static** class backed by `Vault`
+    (call `PaperStore.method(...)` directly, after `PaperStore.init(vault)` has run once
+    in `PaperGraph3D.init()`).
+  - `SecretStore` (`src/adapter/SecretStore.ts`) is a **static** class backed by
+    `Plugin.saveData/loadData` (call `SecretStore.method(...)` directly, after
+    `SecretStore.init(plugin)` has run once in `PaperGraph3D.init()`). Secrets are meant
+    to be encrypted before being written — the key-management approach isn't decided yet
+    (see the `TODO` in that file); merely storing under the plugin data folder is **not**
+    itself a security boundary (it's still a plaintext file inside the vault tree).
+  - They're kept separate on purpose: `Secret`'s storage medium/security needs are still
+    undecided while `Paper`'s (vault notes) is essentially fixed, and merging them into
+    one class previously forced anything touching `Secret` to also satisfy `Vault`
+    initialization (impossible to construct outside real Obsidian — the `obsidian` npm
+    package ships types only, no runtime).
 - **Do not commit build artifacts**: Never commit `node_modules/`, `main.js`, or other
   generated files to version control (already gitignored).
 - Keep the plugin small. Avoid large dependencies. Prefer browser-compatible packages.
@@ -97,8 +109,8 @@ npm run build
 - User-facing commands are added via `this.addCommand(...)` in `main.ts`.
 - Settings live in `src/adapter/SettingTab.ts`. It currently binds to local component
   state only (Secret/Subscriptions/API field shapes aren't finalized yet) — connect real
-  persistence via `ObsidianFileAdapter` once `File`'s concrete implementation lands (see
-  the `TODO` comments in that file).
+  persistence via `SecretStore`/`PaperStore` once their concrete implementations land
+  (see the `TODO` comments in those files).
 - Use stable command IDs; avoid renaming once released.
 
 ## Versioning & releases
@@ -197,7 +209,8 @@ Follow Obsidian's **Developer Policies** and **Plugin Guidelines**. In particula
   the TypeScript source.
 - Commands not appearing: verify `addCommand` runs after `onload` and IDs are unique.
 - Settings not persisting: expected for now — `SettingTab` only binds to local state
-  until `File`/`Secret`/`Subscriptions` are implemented (see the `TODO` comments there).
+  until `PaperStore`/`SecretStore`/`Secret`/`Subscriptions` are implemented (see the
+  `TODO` comments there).
 - Mobile-only issues: confirm you're not using desktop-only APIs; check
   `isDesktopOnly` and adjust.
 

@@ -5,7 +5,7 @@ Class PaperGraph3D {
 	+ VisualizationFlow visualflow 	// 객체
 	+ EventListener eventListener 	// EventListener
 	+ TaskManager taskManager	// Task manager
-	+ init()					// 초기화 함수 (File은 static이라 필드로 들고 있지 않고, init()에서 ObsidianFileAdapter.init(vault)만 호출)
+	+ init()					// 초기화 함수 (PaperStore/SecretStore는 static이라 필드로 들고 있지 않고, init()에서 PaperStore.init(vault)/SecretStore.init(this)만 호출)
 }
 
 ## 수집
@@ -97,15 +97,6 @@ interface Middleware {
 }
 
 
-Class File {
-	// 파일을 읽고 쓰는 작업을 해주는 클래스
-	// Read 해야하는 파일 -> Secret.json, Subscriptions.json, paper.json
-	// Write 해야하는 파일 -> Secret.json, Subscriptions.json, paper.json, paper.md (각각 논문에 해당하는 json과 md파일)
-	// 내부 함수들 static으로 정의해서 객체 선언 없이 사용할 수 있도록.
-	// 내부 변수들도 static 상수로 선언해서 객체 선언 없이 사용할 수 있도록.
-}
-
-
 Class EventListener {
 	+ events 					// event list
 		++ string eventName			// 발동할 이벤트 이름
@@ -126,30 +117,37 @@ Class Task {
 	+ func 						// 사용자가 등록한 함수.
 }
 
-## 2026-08-02 합의 사항 (성진, 빈 클래스 생성 작업 중 확정)
+## 어댑터 (Obsidian 전용, src/adapter/)
+
+Class PaperStore {
+	// paper.json + paper.md(vault 노트)를 읽고 쓰는 클래스. 저장 매체는 Vault로 확정.
+	// Read -> paper.json / Write -> paper.json, paper.md (각각 논문에 해당하는 json과 md파일)
+	// 내부 함수/변수들 static으로 정의해서 객체 선언 없이 사용할 수 있도록.
+}
+
+Class SecretStore {
+	// Secret.json/Subscriptions.json에 해당하는 보안 정보를 읽고 쓰는 클래스. Vault 파일이
+	// 아니라 Obsidian 플러그인 데이터(Plugin.saveData/loadData)에 암호화해서 저장한다.
+	// Read/Write -> Secret, Subscriptions
+	// 내부 함수/변수들 static으로 정의해서 객체 선언 없이 사용할 수 있도록.
+	// 암호화 키 출처는 미정 (docs/plan/primary_plan.md 참고).
+}
+
+## 설계 참고
+
+이 문서는 클래스/인터페이스의 현재 구조만 다룬다. 왜 이렇게 바뀌었는지에 대한 변경
+이력·논의 배경은 [`docs/plan/primary_plan.md`](../plan/primary_plan.md)에 기록한다.
 
 - **프레임워크화의 의미**: PaperGraph3D는 멀티플랫폼 분리가 아니라, 개발자가 미들웨어/태스크를
-	얹어 기능을 확장할 수 있는 "확장 가능한 옵시디언 플러그인"으로 간다.
-- **File**: 저장 형식(Secret.json/Subscriptions.json 실 파일 vs Obsidian data.json)은 여전히
-	미정. 그래서 File은 `interface`로 추상화하고, Obsidian 기반 구현체는
-	`src/adapter/ObsidianFileAdapter.ts`에 별도로 둔다. 코어 클래스들은 Obsidian API를
-	모르는 순수 TS로 작성한다.
-	- (2026-08-02 추가) `ObsidianFileAdapter`는 다이어그램의 `Class File` 정의대로
-		객체 선언 없이 static 멤버로만 구성했다. `PaperGraph3D`도 더 이상 `files` 인스턴스
-		필드를 들고 있지 않고, `init()`에서 `ObsidianFileAdapter.init(vault)`로 vault
-		참조만 등록한 뒤 `ObsidianFileAdapter.readSecret()`처럼 바로 호출한다.
+	얹어 기능을 확장할 수 있는 "확장 가능한 옵시디언 플러그인"이다.
 - **PaperGraph3D 진입점**: PaperGraph3D 클래스 자체가 Obsidian의 Plugin을 직접 상속한다
 	(별도 어댑터로 감싸지 않음). `src/main.ts`가 곧 PaperGraph3D.
-- **폴더 구조**: `src/collect/`(수집), `src/visualize/`(시각화), `src/common/`(공통),
-	`src/adapter/`(Obsidian 전용 UI/File 구현체).
+- **폴더 구조**: `src/collect/`(수집), `src/visualize/`(시각화), `src/common/`(공통,
+	Obsidian API를 모르는 순수 TS), `src/adapter/`(Obsidian 전용: SettingTab,
+	VisualizationView, PaperStore, SecretStore).
 - **Paper의 (+)/(-) 표기**: (+) = 새 Paper 클래스에 추가하는 필드, (-) = 새 Paper 클래스에서
-	빼는 필드 (기존 프로젝트에 이미 있었는지 여부와는 무관한 표기임).
-	- ⚠️ `발행 년도 (-)` 표기대로 publicationYear를 새 Paper에서 제외했다. 다만 기존
-		PaperGraph3D 프로젝트에서는 이 필드가 그래프 z축/backfill 윈도우/refresh 판단 등에
-		널리 쓰였다. **우빈은 Paper 구현 전에 이 제거가 정말 맞는지 팀과 한 번 더 확인할 것.**
-	- 새로 추가된 필드: `citationsKnown`(인용수 확인 여부), `collectionMethod`(수집 방법,
-		'recent' | 'backfill'), `embeddingSucceeded`(임베딩 성공/실패 T/F — 기존
-		embedding/embeddingFailure 조합을 대체).
+	빼는 필드 (기존 프로젝트에 이미 있었는지 여부와는 무관한 표기임). 발행 년도(-)는
+	제외됐고, `citationsKnown`/`collectionMethod`/`embeddingSucceeded`(+)가 추가됐다.
 
 
 

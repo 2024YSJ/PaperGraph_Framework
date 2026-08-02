@@ -7,7 +7,8 @@ import { Visualization } from './visualize/Visualization';
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
-import { ObsidianFileAdapter } from './adapter/ObsidianFileAdapter';
+import { PaperStore } from './adapter/PaperStore';
+import { SecretStore } from './adapter/SecretStore';
 import { SettingTab } from './adapter/SettingTab';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 
@@ -57,16 +58,17 @@ export default class PaperGraph3D extends Plugin {
 	}
 
 	// 다이어그램의 PaperGraph3D.init() — collectflow/visualflow/eventListener/
-	// taskManager를 생성하고 연결한다. ObsidianFileAdapter는 static이라 인스턴스
-	// 없이 init()으로 vault 참조만 등록한다. 등록 계열 함수만 호출하므로 안전하게
-	// 완료된다.
+	// taskManager를 생성하고 연결한다. PaperStore/SecretStore는 static이라 인스턴스
+	// 없이 init()으로 각각 vault/plugin 참조만 등록한다. 등록 계열 함수만 호출하므로
+	// 안전하게 완료된다.
 	init(): void {
 		this.collectflow = new CollectAndSave();
 		this.collectflow.embedding = new Embedding();
 		this.visualflow = new VisualizationFlow();
 		this.visualflow.pca = new PCA();
 		this.visualflow.visual = new Visualization();
-		ObsidianFileAdapter.init(this.app.vault);
+		PaperStore.init(this.app.vault);
+		SecretStore.init(this);
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
 
