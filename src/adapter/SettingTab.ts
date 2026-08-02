@@ -51,7 +51,7 @@ export class SettingTab extends PluginSettingTab {
 					.setValue(this.apiKeyDraft)
 					.onChange((value) => {
 						this.apiKeyDraft = value;
-						// TODO: File/Secret 구현 후 this.plugin.files.writeSecret(...)로 연결
+						// TODO: File/Secret 구현 후 ObsidianFileAdapter.writeSecret(...)로 연결
 					}),
 			);
 
@@ -112,7 +112,7 @@ export class SettingTab extends PluginSettingTab {
 							newConditionQuery: '',
 						});
 						this.apiLabelDraft = '';
-						// TODO: File/Subscriptions/API 구현 후 this.plugin.files.writeSubscriptions(...)로 연결
+						// TODO: File/Subscriptions/API 구현 후 ObsidianFileAdapter.writeSubscriptions(...)로 연결
 						this.display();
 					}),
 			);

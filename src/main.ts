@@ -2,7 +2,8 @@ import { Notice, Plugin } from 'obsidian';
 import { CollectAndSave } from './collect/CollectAndSave';
 import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
-import { File } from './common/File';
+import { PCA } from './visualize/PCA';
+import { Visualization } from './visualize/Visualization';
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
@@ -13,7 +14,6 @@ import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/Visualizati
 export default class PaperGraph3D extends Plugin {
 	collectflow!: CollectAndSave;
 	visualflow!: VisualizationFlow;
-	files!: File;
 	eventListener!: EventListener;
 	taskManager!: TaskManager;
 
@@ -56,13 +56,17 @@ export default class PaperGraph3D extends Plugin {
 		});
 	}
 
-	// 다이어그램의 PaperGraph3D.init() — collectflow/visualflow/files/eventListener/
-	// taskManager를 생성하고 연결한다. 등록 계열 함수만 호출하므로 안전하게 완료된다.
+	// 다이어그램의 PaperGraph3D.init() — collectflow/visualflow/eventListener/
+	// taskManager를 생성하고 연결한다. ObsidianFileAdapter는 static이라 인스턴스
+	// 없이 init()으로 vault 참조만 등록한다. 등록 계열 함수만 호출하므로 안전하게
+	// 완료된다.
 	init(): void {
 		this.collectflow = new CollectAndSave();
 		this.collectflow.embedding = new Embedding();
 		this.visualflow = new VisualizationFlow();
-		this.files = new ObsidianFileAdapter(this.app.vault);
+		this.visualflow.pca = new PCA();
+		this.visualflow.visual = new Visualization();
+		ObsidianFileAdapter.init(this.app.vault);
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
 
