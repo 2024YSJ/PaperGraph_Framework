@@ -127,6 +127,27 @@ Class Task {
 	+ func 						// 사용자가 등록한 함수.
 }
 
+## 2026-08-02 합의 사항 (성진, 빈 클래스 생성 작업 중 확정)
+
+- **프레임워크화의 의미**: PaperGraph3D는 멀티플랫폼 분리가 아니라, 개발자가 미들웨어/태스크를
+	얹어 기능을 확장할 수 있는 "확장 가능한 옵시디언 플러그인"으로 간다.
+- **File**: 저장 형식(Secret.json/Subscriptions.json 실 파일 vs Obsidian data.json)은 여전히
+	미정. 그래서 File은 `interface`로 추상화하고, Obsidian 기반 구현체는
+	`src/adapter/ObsidianFileAdapter.ts`에 별도로 둔다. 코어 클래스들은 Obsidian API를
+	모르는 순수 TS로 작성한다.
+- **PaperGraph3D 진입점**: PaperGraph3D 클래스 자체가 Obsidian의 Plugin을 직접 상속한다
+	(별도 어댑터로 감싸지 않음). `src/main.ts`가 곧 PaperGraph3D.
+- **폴더 구조**: `src/collect/`(수집), `src/visualize/`(시각화), `src/common/`(공통),
+	`src/adapter/`(Obsidian 전용 UI/File 구현체).
+- **Paper의 (+)/(-) 표기**: (+) = 새 Paper 클래스에 추가하는 필드, (-) = 새 Paper 클래스에서
+	빼는 필드 (기존 프로젝트에 이미 있었는지 여부와는 무관한 표기임).
+	- ⚠️ `발행 년도 (-)` 표기대로 publicationYear를 새 Paper에서 제외했다. 다만 기존
+		PaperGraph3D 프로젝트에서는 이 필드가 그래프 z축/backfill 윈도우/refresh 판단 등에
+		널리 쓰였다. **우빈은 Paper 구현 전에 이 제거가 정말 맞는지 팀과 한 번 더 확인할 것.**
+	- 새로 추가된 필드: `citationsKnown`(인용수 확인 여부), `collectionMethod`(수집 방법,
+		'recent' | 'backfill'), `embeddingSucceeded`(임베딩 성공/실패 T/F — 기존
+		embedding/embeddingFailure 조합을 대체).
+
 
 
 

@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
+	"name": "papergraph3d",
 	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"description": "Collects, embeds, and visualizes academic papers as a 3D graph.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
