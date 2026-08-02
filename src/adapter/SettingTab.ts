@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { ObsidianFileAdapter } from './ObsidianFileAdapter';
+import { File } from '../common/File';
 import { PipelineTestModal } from './PipelineTestModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
@@ -118,12 +118,12 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('저장 (File)')
-			.setDesc('입력창에서 값을 받아 ObsidianFileAdapter의 쓰기 함수를 호출합니다.')
+			.setDesc('입력창에서 값을 받아 File의 쓰기 함수를 호출합니다.')
 			.addButton((button) =>
 				button.setButtonText('Secret').onClick(async () => {
 					// Secret은 아직 필드가 없는 빈 클래스라 입력창 없이 바로 호출한다.
 					try {
-						await ObsidianFileAdapter.writeSecret(new Secret());
+						await File.writeSecret(new Secret());
 					} catch {
 						new Notice('아직 구현되지 않음: 저장(Secret)');
 					}
@@ -149,7 +149,7 @@ export class SettingTab extends PluginSettingTab {
 								subscriptions.updateTime = Number.isNaN(updateTime) ? Date.now() : updateTime;
 								subscriptions.secret = new Secret();
 								subscriptions.apis = [];
-								await ObsidianFileAdapter.writeSubscriptions(subscriptions);
+								await File.writeSubscriptions(subscriptions);
 							} catch {
 								new Notice('아직 구현되지 않음: 저장(Subscriptions)');
 							}
@@ -178,7 +178,7 @@ export class SettingTab extends PluginSettingTab {
 								paper.abstract = '';
 								paper.sourceId = values.sourceId ?? 'settings-test-paper';
 								paper.references = [];
-								await ObsidianFileAdapter.writePaper(paper);
+								await File.writePaper(paper);
 							} catch {
 								new Notice('아직 구현되지 않음: 저장(Paper)');
 							}
@@ -209,7 +209,7 @@ export class SettingTab extends PluginSettingTab {
 					.setValue(this.apiKeyDraft)
 					.onChange((value) => {
 						this.apiKeyDraft = value;
-						// TODO: File/Secret 구현 후 ObsidianFileAdapter.writeSecret(...)로 연결
+						// TODO: File/Secret 구현 후 File.writeSecret(...)로 연결
 					}),
 			);
 
@@ -270,7 +270,7 @@ export class SettingTab extends PluginSettingTab {
 							newConditionQuery: '',
 						});
 						this.apiLabelDraft = '';
-						// TODO: File/Subscriptions/API 구현 후 ObsidianFileAdapter.writeSubscriptions(...)로 연결
+						// TODO: File/Subscriptions/API 구현 후 File.writeSubscriptions(...)로 연결
 						this.display();
 					}),
 			);

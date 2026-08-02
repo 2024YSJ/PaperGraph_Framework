@@ -1,17 +1,40 @@
+import { Vault } from 'obsidian';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
 
-// 저장 매체(Secret.json/Subscriptions.json 같은 실제 파일 vs Obsidian data.json)는
-// 아직 합의되지 않았다 (2026-08-02 회의) — 그래서 File은 구현이 아닌 인터페이스로만
-// 추상화한다. Obsidian 기반 구현체는 src/adapter/ObsidianFileAdapter.ts에 static
-// 클래스로 두며, 이 계약을 인스턴스 없이 static 멤버로 만족시킨다.
-export interface File {
-	readSecret(): Promise<Secret>;
-	writeSecret(secret: Secret): Promise<void>;
-	readSubscriptions(): Promise<Subscriptions>;
-	writeSubscriptions(subscriptions: Subscriptions): Promise<void>;
+// 다이어그램 정의대로 static 클래스로 둔다 (2026-08-02 회의 — 저장 매체를 인터페이스로
+// 분리해둘 만큼 유동적이지 않다고 판단, Obsidian Vault로 확정). 인스턴스를 만들 필요
+// 없이 static으로 접근하며, vault 참조는 init()으로 한 번만 보관한다.
+export class File {
+	private static vault: Vault;
+
+	static init(vault: Vault): void {
+		File.vault = vault;
+	}
+
+	static async readSecret(): Promise<Secret> {
+		throw new Error('Not implemented: File.readSecret');
+	}
+
+	static async writeSecret(secret: Secret): Promise<void> {
+		throw new Error('Not implemented: File.writeSecret');
+	}
+
+	static async readSubscriptions(): Promise<Subscriptions> {
+		throw new Error('Not implemented: File.readSubscriptions');
+	}
+
+	static async writeSubscriptions(subscriptions: Subscriptions): Promise<void> {
+		throw new Error('Not implemented: File.writeSubscriptions');
+	}
+
 	// paper.json + paper.md 두 파일을 함께 다룬다 (다이어그램 File 클래스 주석 참고).
-	readPaper(sourceId: string): Promise<Paper | null>;
-	writePaper(paper: Paper): Promise<void>;
+	static async readPaper(sourceId: string): Promise<Paper | null> {
+		throw new Error(`Not implemented: File.readPaper(${sourceId})`);
+	}
+
+	static async writePaper(paper: Paper): Promise<void> {
+		throw new Error('Not implemented: File.writePaper');
+	}
 }

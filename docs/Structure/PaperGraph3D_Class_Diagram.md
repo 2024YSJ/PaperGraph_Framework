@@ -5,7 +5,7 @@ Class PaperGraph3D {
 	+ VisualizationFlow visualflow 	// 객체
 	+ EventListener eventListener 	// EventListener
 	+ TaskManager taskManager	// Task manager
-	+ init()					// 초기화 함수 (File은 static이라 필드로 들고 있지 않고, init()에서 ObsidianFileAdapter.init(vault)만 호출)
+	+ init()					// 초기화 함수 (File은 static이라 필드로 들고 있지 않고, init()에서 File.init(vault)만 호출)
 }
 
 ## 수집
