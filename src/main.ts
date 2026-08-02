@@ -7,7 +7,12 @@ import { Visualization } from './visualize/Visualization';
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
+<<<<<<< HEAD
 import { File } from './common/File';
+=======
+import { PaperStore } from './adapter/PaperStore';
+import { SecretStore } from './adapter/SecretStore';
+>>>>>>> 76d03860546379ba465b282321dcb54c6408027a
 import { SettingTab } from './adapter/SettingTab';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 

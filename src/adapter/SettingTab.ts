@@ -38,7 +38,7 @@ interface ApiDraft {
 // 정하지 않았으므로, 여기서는 SettingTab 자체의 로컬 상태에만 바인딩한다 (담당자들의
 // 설계를 선점하지 않기 위함). 다만 구조(API 하나 : 조건 여러 개)는 다이어그램의
 // Subscriptions/API/SearchQuery 관계를 그대로 반영한다.
-// 실제 저장은 File/Secret/Subscriptions/API 구현이 끝난 뒤 TODO 부분에서 연결한다.
+// 실제 저장은 PaperStore/SecretStore/Secret/Subscriptions/API 구현이 끝난 뒤 TODO 부분에서 연결한다.
 export class SettingTab extends PluginSettingTab {
 	plugin: PaperGraph3D;
 
@@ -330,7 +330,7 @@ export class SettingTab extends PluginSettingTab {
 						query: api.newConditionQuery.trim(),
 					});
 					api.newConditionQuery = '';
-					// TODO: File/Subscriptions/API 구현 후 this.plugin.files.writeSubscriptions(...)로 연결
+					// TODO: Subscriptions/API 구현 후 SecretStore.writeSubscriptions(...)로 연결
 					this.display();
 				}),
 			);

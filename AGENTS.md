@@ -188,7 +188,8 @@ Follow Obsidian's **Developer Policies** and **Plugin Guidelines**. In particula
   the TypeScript source.
 - Commands not appearing: verify `addCommand` runs after `onload` and IDs are unique.
 - Settings not persisting: expected for now — `SettingTab` only binds to local state
-  until `File`/`Secret`/`Subscriptions` are implemented (see the `TODO` comments there).
+  until `PaperStore`/`SecretStore`/`Secret`/`Subscriptions` are implemented (see the
+  `TODO` comments there).
 - Mobile-only issues: confirm you're not using desktop-only APIs; check
   `isDesktopOnly` and adjust.
 
