@@ -1,5 +1,6 @@
 import { Notice, Plugin } from 'obsidian';
 import { CollectAndSave } from './collect/CollectAndSave';
+import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
 import { File } from './common/File';
 import { EventListener } from './common/EventListener';
@@ -59,6 +60,7 @@ export default class PaperGraph3D extends Plugin {
 	// taskManager를 생성하고 연결한다. 등록 계열 함수만 호출하므로 안전하게 완료된다.
 	init(): void {
 		this.collectflow = new CollectAndSave();
+		this.collectflow.embedding = new Embedding();
 		this.visualflow = new VisualizationFlow();
 		this.files = new ObsidianFileAdapter(this.app.vault);
 		this.eventListener = new EventListener();

@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from 'obsidian';
+import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 
 // 임시 UI. Secret/Subscriptions 클래스의 실제 필드는 아직 우빈이 정하지 않았으므로,
@@ -30,6 +30,33 @@ export class SettingTab extends PluginSettingTab {
 					.onChange((value) => {
 						this.apiKeyDraft = value;
 						// TODO: File/Secret 구현 후 this.plugin.files.writeSecret(...)로 연결
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName('임베딩 모델')
+			.setDesc('설치 여부 확인 필요 (임시 UI — Embedding 구현 전까지는 항상 미구현 알림이 뜹니다)')
+			.addButton((button) =>
+				button.setButtonText('확인').onClick(async () => {
+					try {
+						await this.plugin.collectflow.embedding.isModelInstalled();
+					} catch {
+						new Notice('아직 구현되지 않음: 임베딩 모델 확인');
+					}
+				}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText('설치')
+					.setCta()
+					.onClick(async () => {
+						try {
+							await this.plugin.collectflow.embedding.installModel((progress) => {
+								new Notice(`임베딩 모델 설치 중... ${Math.round(progress * 100)}%`);
+							});
+						} catch {
+							new Notice('아직 구현되지 않음: 임베딩 모델 설치');
+						}
 					}),
 			);
 
