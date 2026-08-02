@@ -54,16 +54,11 @@ npm run build
       visualize/    # Visualization pipeline: VisualizationFlow, PCA, Visualization, GraphData
       common/       # Shared building blocks: Middleware, File (interface), EventListener,
                      # TaskManager, Task
-      adapter/      # Obsidian-specific implementations/UI: ObsidianFileAdapter, SettingTab,
+      adapter/      # Obsidian-specific implementations/UI: SettingTab,
                      # VisualizationView
     ```
 - Keep `main.ts` small and focused on plugin lifecycle (loading, unloading, registering
   commands) — delegate feature logic to `collect/`, `visualize/`, `common/`, `adapter/`.
-- `File` (in `src/common/File.ts`) is a storage-medium-agnostic interface; its Obsidian
-  implementation lives in `src/adapter/ObsidianFileAdapter.ts` as a **static** class
-  (no instantiation — call `ObsidianFileAdapter.method(...)` directly, after
-  `ObsidianFileAdapter.init(vault)` has registered the vault reference once in
-  `PaperGraph3D.init()`).
 - **Do not commit build artifacts**: Never commit `node_modules/`, `main.js`, or other
   generated files to version control (already gitignored).
 - Keep the plugin small. Avoid large dependencies. Prefer browser-compatible packages.
@@ -95,10 +90,6 @@ npm run build
 ## Commands & settings
 
 - User-facing commands are added via `this.addCommand(...)` in `main.ts`.
-- Settings live in `src/adapter/SettingTab.ts`. It currently binds to local component
-  state only (Secret/Subscriptions/API field shapes aren't finalized yet) — connect real
-  persistence via `ObsidianFileAdapter` once `File`'s concrete implementation lands (see
-  the `TODO` comments in that file).
 - Use stable command IDs; avoid renaming once released.
 
 ## Versioning & releases

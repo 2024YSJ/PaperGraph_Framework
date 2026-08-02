@@ -19,7 +19,7 @@ src/
   collect/    수집 관련 클래스 (CollectAndSave, Subscriptions, Secret, API, SearchQuery, Paper, Embedding)
   visualize/  시각화 관련 클래스 (VisualizationFlow, PCA, Visualization, GraphData)
   common/     공통 클래스 (Middleware, File, EventListener, TaskManager, Task)
-  adapter/    Obsidian 전용 UI/구현체 (SettingTab, VisualizationView, ObsidianFileAdapter)
+  adapter/    Obsidian 전용 UI/구현체 (SettingTab, VisualizationView)
   main.ts     PaperGraph3D 플러그인 진입점 (Obsidian Plugin 직접 상속)
 ```
 
