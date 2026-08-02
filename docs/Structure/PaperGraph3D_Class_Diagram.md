@@ -3,10 +3,9 @@
 Class PaperGraph3D {
 	+ CollectAndSave collectflow 	// 객체
 	+ VisualizationFlow visualflow 	// 객체
-	+ File files				// 파일을 쓰고 읽는 객체 <- 아직 합의 안됨 합의 필요.
 	+ EventListener eventListener 	// EventListener
 	+ TaskManager taskManager	// Task manager
-	+ init()					// 초기화 함수
+	+ init()					// 초기화 함수 (File은 static이라 필드로 들고 있지 않고, init()에서 File.init(vault)만 호출)
 }
 
 ## 수집
