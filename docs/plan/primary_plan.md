@@ -84,3 +84,48 @@ PCA Class 제작.	-> 다예
 
 - 위 3~4번 판단은 `docs/Structure/PaperGraph3D_Class_Diagram.md` 하단
   "2026-08-02 합의 사항" 절에도 동일하게 기록해둠.
+
+## 8월 2일 후속 수정 — ObsidianFileAdapter static 전환
+
+다이어그램(`Class File` 정의)에는 원래 "내부 함수/변수를 static으로 정의해서 객체
+선언 없이 사용"하도록 명시돼 있었는데, 처음 껍데기를 만들 때는 `ObsidianFileAdapter`를
+인스턴스 클래스(`constructor(private vault: Vault)`)로 구현해 다이어그램과 어긋나
+있었다. 이를 바로잡아 다이어그램대로 static 클래스로 수정.
+
+- `src/adapter/ObsidianFileAdapter.ts`: 생성자를 제거하고 모든 메소드를 `static`으로
+  전환. `vault`는 `private static vault` 필드에 보관하고, `static init(vault)`로
+  한 번만 등록한다.
+- `src/main.ts`: `PaperGraph3D.files: File` 인스턴스 필드를 제거. `init()`에서
+  `this.files = new ObsidianFileAdapter(this.app.vault)` 대신
+  `ObsidianFileAdapter.init(this.app.vault)`만 호출.
+- `src/common/File.ts`: 인터페이스 자체는 유지(계약 문서화 목적). `implements File`은
+  더 이상 쓰지 않음 — static 멤버는 인스턴스 인터페이스로 표현할 수 없기 때문.
+- `src/adapter/SettingTab.ts`: TODO 주석의 `this.plugin.files.xxx(...)` 호출 예시를
+  `ObsidianFileAdapter.xxx(...)`로 갱신.
+- 앞으로 File 관련 로직을 구현/호출할 때는 인스턴스를 만들지 말고 항상
+  `ObsidianFileAdapter.메소드명(...)` 형태로 static 접근할 것.
+
+## 8월 2일 후속 수정 2 — README/AGENTS/LICENSE 정리, 시각화 UI 단계 분리
+
+옵시디언 샘플 플러그인 템플릿에서 그대로 남아있던 문서를 프로젝트에 맞게 정리하고,
+파이프라인 단계별로 UI를 따로 테스트할 수 있도록 시각화 뷰를 나눴다.
+
+- `README.md`: 샘플 플러그인 템플릿 설명(커뮤니티 목록 등록, 릴리스 절차 등)을 지우고
+  PaperGraph3D가 하는 일 / 프로젝트 구조 / 개발 환경 설정으로 재작성.
+- `AGENTS.md`: 제목·프로젝트 개요·파일 구조 예시를 실제 구조(`src/collect`,
+  `src/visualize`, `src/common`, `src/adapter`)에 맞게 재작성. 보안/성능/manifest
+  규칙 등 일반 가이드는 유지.
+- `LICENSE`: 저작권자를 `Dynalist Inc.`(옵시디언 샘플 템플릿 표기)에서 `AKZIL`로
+  변경. `.specify/`, `.claude/skills/speckit-*`, `docs/speckit/`는 별도 도구인
+  Spec Kit(MIT, Copyright GitHub, Inc.)이 차지하고 있어 이 저작권 고지 대상이
+  아니라는 점을 하단에 명시.
+- `src/main.ts`: `VisualizationFlow.pca`/`.visual`이 `init()`에서 인스턴스화되지
+  않던 버그 수정 (`new PCA()`, `new Visualization()` 추가).
+- `src/adapter/VisualizationView.ts`: 기존에는 "지금 실행" 버튼 하나로
+  `VisualizationFlow.run()`(PCA→초기화→렌더링) 전체만 테스트할 수 있었는데,
+  `Visualization.init()` / `Visualization.render()` / 전체 `run()`을 각각 따로
+  누를 수 있는 버튼으로 분리. PCA는 다예가 아직 함수를 정의하지 않아 버튼 대신
+  안내 문구만 표시(다른 담당자 API를 임의로 만들지 않기 위함).
+- 수집(Collect) 쪽은 다이어그램상 `run()` 밖으로 흐름 제어를 빼지 말라는 규칙이
+  있고, 이미 recent/backfill 커맨드 + 임베딩 설치 확인/설치 버튼으로 단계가
+  나뉘어 있다고 판단해 추가로 손대지 않음.

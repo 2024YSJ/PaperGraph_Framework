@@ -3,10 +3,9 @@
 Class PaperGraph3D {
 	+ CollectAndSave collectflow 	// 객체
 	+ VisualizationFlow visualflow 	// 객체
-	+ File files				// 파일을 쓰고 읽는 객체 <- 아직 합의 안됨 합의 필요.
 	+ EventListener eventListener 	// EventListener
 	+ TaskManager taskManager	// Task manager
-	+ init()					// 초기화 함수
+	+ init()					// 초기화 함수 (File은 static이라 필드로 들고 있지 않고, init()에서 ObsidianFileAdapter.init(vault)만 호출)
 }
 
 ## 수집
@@ -135,6 +134,10 @@ Class Task {
 	미정. 그래서 File은 `interface`로 추상화하고, Obsidian 기반 구현체는
 	`src/adapter/ObsidianFileAdapter.ts`에 별도로 둔다. 코어 클래스들은 Obsidian API를
 	모르는 순수 TS로 작성한다.
+	- (2026-08-02 추가) `ObsidianFileAdapter`는 다이어그램의 `Class File` 정의대로
+		객체 선언 없이 static 멤버로만 구성했다. `PaperGraph3D`도 더 이상 `files` 인스턴스
+		필드를 들고 있지 않고, `init()`에서 `ObsidianFileAdapter.init(vault)`로 vault
+		참조만 등록한 뒤 `ObsidianFileAdapter.readSecret()`처럼 바로 호출한다.
 - **PaperGraph3D 진입점**: PaperGraph3D 클래스 자체가 Obsidian의 Plugin을 직접 상속한다
 	(별도 어댑터로 감싸지 않음). `src/main.ts`가 곧 PaperGraph3D.
 - **폴더 구조**: `src/collect/`(수집), `src/visualize/`(시각화), `src/common/`(공통),
