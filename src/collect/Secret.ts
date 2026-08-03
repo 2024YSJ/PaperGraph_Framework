@@ -20,6 +20,7 @@ export class Secret {
 	// provider 키가 등록돼 있는지 확인한다.
 	hasKey(provider: string): boolean {
 		return provider in this.apiKeys;
+	}
 
 	// File이 Secret.json으로 저장할 때 쓰는 평문 맵. 복사본을 넘겨 내부 상태 보호.
 	toJSON(): Record<string, string> {
