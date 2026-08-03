@@ -2,7 +2,6 @@ import { App, Modal, Notice, Setting } from 'obsidian';
 import { File } from '../common/File';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
-import { API } from '../collect/API';
 
 // File 클래스 저장 함수(writePaper / writeSecret / writeSubscriptions)를 한 창에서
 // 직접 눌러보는 테스트용 모달. 세 폼이 각자 "추가하기" 버튼을 가지며, 버튼을 눌러도
@@ -189,10 +188,12 @@ export class FileTestModal extends Modal {
 						if (!Array.isArray(subscriptions.apis)) {
 							subscriptions.apis = [];
 						}
-						if (subscriptions.apis.length === 0) {
-							subscriptions.apis.push(FileTestModal.stubApi([query]));
+						const firstApi = subscriptions.apis[0];
+						if (firstApi) {
+							firstApi.querys.push(query);
 						} else {
-							(subscriptions.apis[0] as API).querys.push(query);
+							// 테스트는 arxiv API로 고정. createApi로 만들어야 저장→복원 왕복이 된다.
+							subscriptions.apis.push(File.createApi('arxiv', [query]));
 						}
 						subscriptions.updateTime = Date.now();
 						// secret은 File.writeSubscriptions가 저장에서 제외하므로 여기서 설정하지 않는다.
@@ -205,14 +206,4 @@ export class FileTestModal extends Modal {
 		);
 	}
 
-	// 테스트용 최소 API 스텁. querys만 실제 값이고 호출 함수는 던진다(직렬화 시 함수는
-	// 빠지고 querys만 Subscriptions.json에 남는다).
-	private static stubApi(querys: SearchQuery[]): API {
-		return {
-			querys,
-			SearchBase: () => Promise.reject(new Error('test stub: SearchBase')),
-			SearchRecentPaper: () => Promise.reject(new Error('test stub: SearchRecentPaper')),
-			Backfill: () => Promise.reject(new Error('test stub: Backfill')),
-		};
-	}
 }

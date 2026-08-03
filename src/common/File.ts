@@ -2,6 +2,8 @@ import { TFile, Vault } from 'obsidian';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
+import { API, ArxivAPI } from '../collect/API';
+import { SearchQuery } from '../collect/SearchQuery';
 
 // .json 저장 래퍼. schemaVersion은 향후 대비 상수(현재 분기/마이그레이션엔 안 씀).
 // 설계 근거: docs/devLog/002.md.
@@ -68,7 +70,20 @@ export class File {
 	static readSubscriptions(): Promise<Subscriptions> {
 		return File.readConfig(
 			'Subscriptions.json',
-			(raw) => Object.assign(new Subscriptions(), raw as Partial<Subscriptions>),
+			(raw) => {
+				// 저장된 apis는 평범한 객체({ apiName, querys })라 메서드가 없다. createApi로
+				// apiName에 맞는 구현 클래스를 인스턴스화해 메서드가 살아있는 API로 복원한다.
+				const data = raw as {
+					updateTime?: number;
+					apis?: { apiName: string; querys?: SearchQuery[] }[];
+				};
+				const subscriptions = new Subscriptions();
+				subscriptions.updateTime = data.updateTime ?? 0;
+				subscriptions.apis = (data.apis ?? []).map((api) =>
+					File.createApi(api.apiName, api.querys ?? []),
+				);
+				return subscriptions;
+			},
 			() => new Subscriptions(),
 		);
 	}
@@ -80,6 +95,18 @@ export class File {
 			updateTime: subscriptions.updateTime,
 			apis: subscriptions.apis,
 		});
+	}
+
+	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
+	// 평범한 객체({ apiName, querys })를 메서드가 살아있는 API 인스턴스로 복원할 때 쓴다
+	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md). 새 API는 case를 한 줄 추가한다.
+	static createApi(apiName: string, querys: SearchQuery[] = []): API {
+		switch (apiName) {
+			case 'arxiv':
+				return new ArxivAPI(querys);
+			default:
+				throw new Error(`Unknown apiName: ${apiName}`);
+		}
 	}
 
 	// ── Paper (콘텐츠 트리, .json + .md) ────────────────────────────────
