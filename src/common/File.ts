@@ -247,14 +247,16 @@ export class File {
 	}
 
 	// schemaVersion/타임스탬프/임베딩 벡터는 .json에만. references는 읽기 좋게 미러링.
+	// 문자열 값은 JSON.stringify로 따옴표 처리한다(= 유효한 YAML 이중따옴표 스칼라라
+	// 제목의 ':' 등 특수문자가 있어도 안전).
 	private static renderFrontmatter(paper: Paper): string {
-		const lines: string[] = [`title: ${File.yamlQuote(paper.title)}`];
+		const lines: string[] = [`title: ${JSON.stringify(paper.title)}`];
 		if (paper.authors.length === 0) {
 			lines.push('authors: []');
 		} else {
 			lines.push('authors:');
 			for (const author of paper.authors) {
-				lines.push(`  - ${File.yamlQuote(author)}`);
+				lines.push(`  - ${JSON.stringify(author)}`);
 			}
 		}
 		// 새 Paper는 publicationYear를 제거 → publicationDate(ISO)에서 연도 파생.
@@ -262,7 +264,7 @@ export class File {
 			lines.push(`publicationYear: ${Number(paper.publicationDate.slice(0, 4))}`);
 		}
 		if (paper.publicationDate) {
-			lines.push(`publicationDate: ${File.yamlQuote(paper.publicationDate)}`);
+			lines.push(`publicationDate: ${JSON.stringify(paper.publicationDate)}`);
 		}
 		lines.push(`citationCount: ${paper.citationCount}`);
 		// 외향 인용 3상태(citationsKnown 기준): 미확인 null / 확인+없음 [] / 확인+있음 목록.
@@ -273,20 +275,15 @@ export class File {
 		} else {
 			lines.push('references:');
 			for (const reference of paper.references) {
-				lines.push(`  - ${File.yamlQuote(reference)}`);
+				lines.push(`  - ${JSON.stringify(reference)}`);
 			}
 		}
-		lines.push(`pg3d_sourceId: ${File.yamlQuote(paper.sourceId)}`);
+		lines.push(`pg3d_sourceId: ${JSON.stringify(paper.sourceId)}`);
 		const url = File.paperUrl(paper.sourceId);
 		if (url !== undefined) {
-			lines.push(`url: ${File.yamlQuote(url)}`);
+			lines.push(`url: ${JSON.stringify(url)}`);
 		}
 		return lines.join('\n');
-	}
-
-	// JSON 따옴표 스칼라 = 유효한 YAML 이중따옴표 스칼라.
-	private static yamlQuote(value: string): string {
-		return JSON.stringify(value);
 	}
 
 	// 표준 웹 URL을 sourceId에서 파생(저장 안 함). provider별 규칙은 PAPER_URL_BUILDERS
