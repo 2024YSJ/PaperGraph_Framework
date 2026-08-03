@@ -171,13 +171,18 @@ export class SettingTab extends PluginSettingTab {
 								const paper = new Paper();
 								paper.title = values.title ?? '테스트 논문';
 								paper.authors = [];
-								paper.citationCount = 0;
-								paper.citationsKnown = false;
-								paper.collectionMethod = 'recent';
-								paper.embeddingSucceeded = false;
 								paper.abstract = '';
 								paper.sourceId = values.sourceId ?? 'settings-test-paper';
 								paper.references = [];
+								paper.publicationDate = '';
+								paper.citationCount = 0;
+								paper.citationsKnown = false;
+								paper.collectedApi = '';
+								paper.collectedQuery = { searchType: '', query: '' };
+								paper.embedding = [];
+								paper.embeddingModel = '';
+								paper.embeddingSource = '';
+								paper.embeddingSucceeded = false;
 								await File.writePaper(paper);
 							} catch {
 								new Notice('아직 구현되지 않음: 저장(Paper)');

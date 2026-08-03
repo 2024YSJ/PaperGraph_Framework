@@ -1,21 +1,32 @@
-// 빈 껍데기 — 실제 필드 확정/검증 로직은 우빈이 채운다.
-//
-// 아래 필드 목록은 docs/Structure/PaperGraph3D_Class_Diagram.md의 (+)/(-) 표기를
-// 문자 그대로 반영한 것이다 ((+) = 새 Paper에 추가, (-) = 새 Paper에서 제거).
-//
-// 주의: (-) 표기로 publicationYear를 제거했지만, 기존 PaperGraph3D 프로젝트에서는
-// publicationYear가 그래프 z축/backfill 윈도우/refresh 판단 등 여러 곳에서 핵심적으로
-// 쓰였다 (src/models/paper.ts, src/graph/*). 정말 제거해도 되는지 우빈이 구현 전에
-// 팀과 한 번 더 확인이 필요하다 (2026-08-02 다이어그램 회의 원문: "발행 년도 (-)").
+import { SearchQuery } from './SearchQuery';
+
+// 논문 한 편을 나타내는 데이터 객체. 필드 확정 근거는 docs/devLog/002.md 참고
+// (2026-08-03, 실제 저장 JSON schemaVersion:3 대조 기준).
 export class Paper {
+	// 기본 서지 정보
 	title!: string;
 	authors!: string[];
-	citationCount!: number;
-	citationsKnown!: boolean; // (+) 인용수가 확인된 논문인가
-	collectionMethod!: 'recent' | 'backfill'; // (+) 어떤 방법으로 수집된 것인가
-	// 임베딩 성공/실패를 T/F로 교체 (기존 embedding/embeddingFailure 조합의 대체).
-	embeddingSucceeded!: boolean;
 	abstract!: string;
 	sourceId!: string;
 	references!: string[];
+
+	// 발행 시점: publicationYear(연도)를 제거하고 ISO 날짜 문자열로 대체("2025-11-07").
+	// 연도가 필요하면 이 값에서 파생한다.
+	publicationDate!: string;
+
+	// 인용
+	citationCount!: number;
+	citationsKnown!: boolean; // (+) 인용수가 확인된 논문인가
+
+	// 수집 출처: "어떤 방법으로 수집됐는가" = 어떤 API로, 어떤 검색 쿼리로 수집했는가.
+	// (recent/backfill 구분이 아니다 — 그건 CollectAndSave.run()의 실행 모드다.)
+	collectedApi!: string; // (+) 수집한 API 식별자 (Secret 맵의 provider 키와 동일 체계)
+	collectedQuery!: SearchQuery; // (+) 수집에 사용된 검색 쿼리
+
+	// 임베딩
+	embedding!: number[]; // 임베딩 벡터 (PCA/시각화 입력)
+	embeddingModel!: string;
+	embeddingSource!: string;
+	// 임베딩 성공/실패를 T/F로 표기 (기존 embeddingFailure 값/null 조합의 대체).
+	embeddingSucceeded!: boolean;
 }
