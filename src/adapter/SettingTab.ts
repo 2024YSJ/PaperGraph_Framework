@@ -2,6 +2,7 @@ import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { File } from '../common/File';
 import { PipelineTestModal } from './PipelineTestModal';
+import { FileTestModal } from './FileTestModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
@@ -190,6 +191,18 @@ export class SettingTab extends PluginSettingTab {
 						},
 					).open();
 				}),
+			);
+
+		new Setting(containerEl)
+			.setName('File 테스트')
+			.setDesc('논문 / Secret / Subscriptions 저장을 한 창에서 각각 테스트합니다.')
+			.addButton((button) =>
+				button
+					.setButtonText('File 테스트')
+					.setCta()
+					.onClick(() => {
+						new FileTestModal(this.app).open();
+					}),
 			);
 
 		new Setting(containerEl)
