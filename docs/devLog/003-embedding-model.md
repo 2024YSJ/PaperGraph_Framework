@@ -1,0 +1,69 @@
+# 8월 4일 작업 기록 (성진 — 3순위 작업, Embedding Class)
+
+`docs/plan/primary_plan.md`의 3순위 "임베딩 Class 제작"(성진 담당)을 실제로 구현하기 전, 팀 자매 프로젝트 `PaperGraph3D`(`Desktop/Konkuk/3-1_takeoff/_PaperGraph/PaperGraphDev/PaperGraph3D`)의 검증된 임베딩 구현을 조사하고, 이 저장소의 새 `Paper` 필드 구조(embedding/embeddingModel/embeddingSource/embeddingSucceeded, 전부 non-nullable)에 맞게 이식하기 위한 설계를 코드 작성 전에 먼저 확정한다.
+
+## 2026-08-04 확정 사항
+
+### 모델 선택: specter2 8bit 양자화(q8) 버전, 온디바이스 고정
+
+- 임베딩 모델은 **specter2**(`allenai/specter2_base` + proximity adapter, citation-triplet으로 학습된 BERT-base 인코더)의 **8bit 양자화(q8) ONNX 버전**을 온디바이스로 돌린다. 모델은 사용자가 고를 수 있는 옵션이 아니라 고정값이다 — 코퍼스 전체가 하나의 임베딩 공간을 공유해야 시각화(PCA/그래프)에서 논문들을 같이 투영할 수 있고, 모델을 바꾸면 차원/공간이 달라져 사실상 다른 모델이 되기 때문.
+- 예전 `PaperGraph3D` 프로젝트에서 이미 이 선택을 검증했고, 실제 vault에 저장된 논문 데이터(`embeddingModel: "local-specter2-proximity-v1-d768"`)도 이 모델로 만들어진 것이었다(002.md 참고).
+
+### 모델 배포: 이 저장소의 새 GitHub Release
+
+- 모델 파일(양자화 ONNX ~108MB + WASM 런타임 ~21MB, 합쳐서 ~130MB급)은 플러그인 본체(`main.js`)에 번들하지 않는다. Obsidian은 릴리스에서 `main.js`/`manifest.json`/`styles.css`만 설치하므로, 이 크기를 번들에 넣으면 매 시작마다 파싱해야 하는 130MB+ 파일이 된다.
+- 대신 **이 저장소(`2024YSJ/PaperGraph_Framework`)의 새 GitHub Release**에서 사용자가 설정 탭의 "설치" 버튼을 눌러야만 다운로드한다(자동 다운로드 없음 — `AGENTS.md`의 "로컬/오프라인 우선, 필수적일 때만 네트워크 요청, 사용자에게 무엇이 왜 필요한지 공개" 원칙). 예전 프로젝트(`2024YSJ/PaperGraph3D`)의 릴리스를 재사용하지 않고 소유권을 이 저장소로 옮긴다.
+- **태그**: `model-specter2-q8-v1`. 에셋 6개(flat 이름, GitHub Release 에셋은 `/`를 못 씀): `config.json`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `model_quantized.onnx`(로컬 저장 경로만 `onnx/` 하위), `ort-wasm-simd-threaded.jsep.wasm`.
+- ⚠️ **모델 변환·양자화·업로드는 코딩 작업 범위 밖의 수동 작업이다.** `specter2_base`+adapter를 ONNX로 병합·변환하고 8bit 양자화해서 fast-tokenizer JSON과 함께 위 6개 파일을 실제로 이 태그에 업로드하는 건 사람이 별도로 해야 한다. 코드는 이 상수들을 가리키도록 먼저 작성하지만, 릴리스가 실제로 올라가기 전까지 `installModel()`은 당연히 실패한다.
+- ⚠️ WASM 바이너리는 `package.json`에 고정한 `@huggingface/transformers` 버전과 정확히 짝이 맞아야 한다 — 버전이 바뀌면 WASM도 재검증/재업로드해야 한다.
+
+### 파일 구조: `src/collect/Embedding.ts` 단일 파일
+
+- 예전 프로젝트는 `modelAssets.ts`(다운로드)/`embedding.ts`(베이스라인)/`localTransformer.ts`(ONNX 추론)/`embeddingUpgrade.ts`(오케스트레이션) 4개 파일로 나뉘어 있었지만, 이 저장소는 `src/common/File.ts`가 세운 "한 클래스 + private 헬퍼로 전부 묶기" 컨벤션을 따라 **`Embedding` 하나로 통합**한다.
+- 단, `File`과 달리 `Embedding`은 `private static`이 아니라 **인스턴스 클래스**다. vault/pluginDir/캐시된 모델 위치/캐시된 ONNX 세션 같은 실제 런타임 상태를 들고 있어야 하기 때문 — `main.ts`에서 이미 `this.collectflow.embedding = new Embedding()`으로 인스턴스 필드로 다루고 있던 것과도 일치한다.
+
+### `isDesktopOnly: true`로 변경 — 팀 전체에 영향을 주는 결정
+
+- ~130MB WASM+ONNX를 온디바이스로 돌리는 건 메모리 부담이 커서 모바일에 부적합하다고 판단, `manifest.json`의 `isDesktopOnly`를 `false`에서 `true`로 바꾼다. 예전 프로젝트도 같은 이유로 `true`였다.
+- ⚠️ **이건 Embedding 하나의 문제가 아니라 플러그인 전체의 결정이다.** `isDesktopOnly: true`가 되면 다예의 PCA/시각화, 신빈의 API, 우빈의 File 기능을 포함해 플러그인 전체가 모바일에서 실행되지 않는다. `AGENTS.md`의 Mobile 섹션("가능하면 iOS/Android도 테스트", "`isDesktopOnly`가 true가 아니면 데스크톱 전용을 가정하지 말 것")이 전제하던 방향과 반대다.
+- 이번 3순위 작업 진행을 위해 데스크톱 전용으로 확정하고 진행하지만, **팀 논의에서 다시 뒤집힐 수 있는 결정**이라는 점을 남겨둔다. 이후 모바일 지원이 필요해지면 온디바이스 임베딩을 모바일에서만 선택적으로 끄는 등의 대안을 검토해야 한다.
+
+### `@huggingface/transformers` 의존성 — `dependencies`로 추가 (예전 프로젝트와 다름)
+
+- 예전 프로젝트는 이 패키지를 `optionalDependencies`로 뒀지만, 이 저장소는 **일반 `dependencies`**로 추가한다.
+- 이유: `package.json`의 `build` 스크립트(`tsc -noEmit -skipLibCheck && node esbuild.config.mjs production`)에서 `tsc -noEmit`이 항상 선행되는데, Obsidian은 어차피 `main.js`에 전부 번들된 걸 설치하므로 이 패키지는 실질적으로 옵션이 아니라 필수다. `optionalDependencies`로 두면 `npm ci --omit=optional` 같은 환경에서 설치가 스킵돼 `tsc`가 비결정적으로 실패하거나, 임베딩 기능이 빠진 `main.js`가 조용히 만들어질 위험이 있다.
+- ⚠️ `AGENTS.md`의 "플러그인을 작게 유지하라, 큰 의존성을 피하라" 원칙에서 의도적으로 벗어나는 선택이다. 번들 크기가 수백KB~1MB 이상 늘어나지만, 온디바이스 임베딩 기능 자체가 이 의존성 없이는 불가능하므로 불가피하다고 판단했다.
+
+### 설치 UI: 진행률은 파일 단위로 상세화, 버튼 구조는 기존 2개(확인/설치) 유지
+
+- `installModel()`의 진행률 콜백을 기존의 단순 `0~1` 숫자에서 **`AssetProgress{fileIndex, fileCount, fileName, bytesWritten}`**로 업그레이드한다. 파일 6개를 순차 다운로드하는데, "몇 번째 파일을 받고 있는지"를 보여주는 게 사용자에게 더 유용하다.
+- `SettingTab.ts`의 UI는 기존 "확인"/"설치" 2버튼 구조를 그대로 유지한다(예전 프로젝트의 "설치 상태에 따라 버튼 하나가 바뀌는" 방식으로 통합하지 않기로 함 — 이번 세션에서 논의 후 결정). "확인" 버튼은 `isModelInstalled()` 결과를 Notice로 보여주도록 실동작화하고, "설치" 버튼은 클릭 시 비활성화 후 하나의 지속 Notice에 파일별 진행률을 갱신하며, 완료/실패 후 재활성화한다.
+
+### Paper 필드 매핑: `EmbeddingResult`가 4필드에 정확히 대응
+
+- `Embedding.embed(title, abstract)`는 `{embedding: number[], embeddingModel: string, embeddingSource: string, embeddingSucceeded: boolean}`을 반환한다. 이는 002.md에서 확정된 `Paper`의 4개 임베딩 필드(`embedding`/`embeddingModel`/`embeddingSource`/`embeddingSucceeded`)와 이름까지 정확히 대응해서, 나중에 `CollectAndSave.run()`이 `Object.assign(paper, await embedding.embed(...))`로 바로 꽂을 수 있게 설계했다.
+- 예전 프로젝트는 실패 원인을 `EmbeddingFailure{reason, detail, at}`로 Paper에 저장했지만, 이 저장소의 `Paper`는 `embeddingSucceeded: boolean` 하나뿐이라 그런 진단 필드가 없다(002.md에서 이미 확정, 재논의 안 함). 대신 실패 상세는 Paper에 저장하지 않고 `Notice`로만 사용자에게 알린다 — 논문마다 뜨면 스팸이 되므로, 배치당 최초 실패 시 1회 + 서킷브레이커 트립 시 1회로 제한한다.
+
+### 서킷브레이커: Embedding 내부 소유 + 시간 기반 쿨다운(60초)으로 자동 회복
+
+- 예전 프로젝트는 `CollectAndSave`에 해당하는 수집/재임베딩 "pass"마다 외부에서 새 `attempts` 객체를 만들어 넘겨주는 방식이었다. 이 저장소는 `CollectAndSave.run()`이 아직 스텁이라 그 패턴을 그대로 쓸 수 없다.
+- 그래서 `Embedding`이 서킷브레이커 상태(`consecutiveFailures`, `breakerTrippedAt`)를 인스턴스 내부에 소유하고, 연속 3회(`FAILURE_LIMIT`) 실패하면 트립되어 이후 호출은 바로 폴백을 반환한다. 다만 트립 후 `BREAKER_COOLDOWN_MS`(60초)가 지나면 다음 `embed()` 호출에서 자동으로 한 번 더 시도한다. 이렇게 해야 "한 번 문제가 터지면 그 뒤로 영구히(오늘도 내일도) 모든 문서가 폴백만 받는" 상황을 피할 수 있다.
+- `run()`이 나중에 구현되면 배치(pass) 시작 시 `resetCircuitBreaker()`를 호출해 즉시 초기화할 수도 있지만, 호출하지 않아도 쿨다운 덕분에 안전하게 동작한다.
+
+### 메모리 관리: "연속 임베딩 시 메모리 부족" 문제를 명시적으로 검토
+
+이번 설계 단계에서 "여러 문서를 연속으로 임베딩하면 메모리가 터져서, 이미 완료된 작업이 메모리를 차지해 이후 문서의 임베딩이 만들어지지 않는 문제가 생길 수 있는가"를 별도로 재검토했다. 결론: **이건 예전 `PaperGraph3D` 프로젝트가 실제로 겪고 원인까지 진단해 고쳐둔 버그**이며, 그 5단계 방어를 그대로 이식하기로 했다.
+
+- **원인**: `WebAssembly.Memory`(WASM 힙)는 커지기만 하고 절대 줄어들지 않는다. `@huggingface/transformers`의 기본 파이프라인은 `padding: true`를 쓰는데 배치 크기 1(논문 한 편)에서는 "그 논문 자신의 길이만큼 패딩"이 되어, 논문마다 새로운 shape이 나온다. ONNX는 새 shape마다 새로 메모리를 할당하므로, 힙이 논문 수에 비례해 단조 증가하다가 100~200편 근처에서 할당 실패(OOM)로 죽는다. 실측 실패 지점이 고정된 논문 수가 아니라 초록 길이 분포에 따라 달랐다는 점이 순수 메모리 문제임을 뒷받침한다.
+- **1차 방어 — 고정 길이 버킷 `[128, 256, 512]`**: 모든 입력을 이 3개 shape 중 하나로 강제 패딩(토큰 수를 먼저 잰 뒤 맞는 버킷으로 재토큰화). 코퍼스가 몇 편이든 힙이 겪는 shape은 3가지뿐이라 각 버킷의 첫 논문 이후로는 새 할당이 없는 정상 상태(steady state)에 도달한다. 패딩은 attention mask로 가려지고 CLS 토큰만 풀링하므로 결과 정확도 손해는 없다.
+- **2차 방어 — `enableCpuMemArena: false`**: ORT의 메모리 아레나(해제된 블록을 재사용하려고 계속 들고 있는 구조)를 끈다. shape이 고정되면 재사용할 게 마땅히 없는데 이 구조 자체가 무한정 자라고 있었다.
+- **3차 방어(가장 직접적인 답) — 세션을 64회 추론마다 강제 재생성**: 1·2차로도 ORT가 일부 상태를 누적하는 걸 완전히 막지는 못하므로, 실패 여부와 무관하게 주기적으로 `InferenceSession`을 버리고 새로 만들어 WASM 할당자에게 메모리를 돌려준다. 예전 프로젝트가 실측한 실패 지점(~88편)보다 낮은 64로 안전 마진을 뒀다. **"이미 완료된 작업이 메모리를 계속 차지해서 이후 문서가 안 되는" 상황에 대한 가장 직접적인 대응이 바로 이것**이다.
+- **4차 방어 — 실패 시 새 세션으로 1회만 재시도**: 이미 고갈된 세션으로 재시도해봐야 회복되지 않으므로, 세션을 버리고 새로 만든 뒤 딱 한 번만 다시 시도한다.
+- **5차 방어 — 서킷브레이커 + 60초 쿨다운**: 그래도 계속 실패하면(런타임 자체가 죽었을 가능성) 남은 문서마다 매번 세션을 재구성하며 헛돌지 않고 즉시 폴백으로 전환한다. 위에서 정한 쿨다운 덕분에 일정 시간 뒤 자동으로 회복을 재시도한다.
+- **최후 보증**: 5단계가 전부 실패해도 `embed()`는 절대 throw하지 않고 baseline 해시 임베딩(FNV-1a 기반, 2048차원, 항상 계산 가능)을 반환한다. 즉 메모리 문제가 아무리 심해도 수집/저장 자체가 멈추거나 이후 문서가 통째로 스킵되는 일은 없다 — 그 문서들은 `embeddingSucceeded: false`로만 표시되고, 나중에 재임베딩(이번 범위 밖, 향후 기능으로 고려)으로 복구할 여지를 남긴다.
+
+## 다음 담당자 참고
+
+- `CollectAndSave.run()`을 구현할 담당자는 `Embedding.embed(title, abstract)`를 루프 안에서 호출해 `Object.assign(paper, result)`로 붙이면 된다. `resetCircuitBreaker()`는 배치 시작 시 호출하면 좋지만 필수는 아니다(쿨다운이 자동으로 처리).
+- `installModel()`이 실패한다면 십중팔구 GitHub Release(`model-specter2-q8-v1`)에 아직 에셋이 안 올라가 있는 것이다 — 위 "모델 배포" 절 참고.
+- `isDesktopOnly: true`는 팀 전체 영향 결정이므로, 모바일 지원 논의가 다시 나오면 이 문서를 먼저 참고할 것.

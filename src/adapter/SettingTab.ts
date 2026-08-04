@@ -7,6 +7,37 @@ import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
 
+// 임베딩 스트레스 테스트용 모의 논문 생성. 초록 길이를 문서마다 1~20배로 바꿔서
+// LENGTH_BUCKETS([128,256,512]) 세 버킷을 전부 실제로 밟아보게 한다 — 100편은
+// INFERENCES_PER_SESSION(64)을 넘겨 세션 재생성 경로까지 exercise한다
+// (docs/devLog/003-embedding-model.md의 메모리 방어 5단계 검증 목적).
+const MOCK_SENTENCE =
+	'This mock abstract paragraph discusses neural embeddings, citation graphs, and retrieval benchmarks in scientific literature. ';
+const EMBEDDING_TEST_FOLDER = 'embedding_test';
+
+// Paper 필드를 전부 채운 완전한 객체로 만든다 — File.writeTestPaper가 그대로
+// .json(원본)+.md(뷰)로 저장할 수 있어야 하므로 FileTestModal의 테스트 Paper 생성
+// 방식과 동일하게 맞춘다.
+function buildMockPaper(index: number): Paper {
+	const repeats = 1 + (index % 20);
+	const paper = new Paper();
+	paper.title = `Mock Paper ${index + 1}: A Study of Embedding Stability`;
+	paper.authors = [];
+	paper.abstract = MOCK_SENTENCE.repeat(repeats);
+	paper.sourceId = `test:embedding-mock-${index + 1}`;
+	paper.references = [];
+	paper.publicationDate = '';
+	paper.citationCount = 0;
+	paper.citationsKnown = false;
+	paper.collectedApi = '';
+	paper.collectedQuery = { searchType: '', query: '' };
+	paper.embedding = [];
+	paper.embeddingModel = '';
+	paper.embeddingSource = '';
+	paper.embeddingSucceeded = false;
+	return paper;
+}
+
 // 날짜 입력(YYYY-MM-DD)을 timestamp(ms)로 변환. 비어있거나 잘못된 값이면 undefined —
 // 어차피 아직 CollectAndSave.run()이 스텁이라 값 자체는 쓰이지 않지만, 구현되는 즉시
 // 그대로 넘길 수 있도록 형식만 맞춰둔다.
@@ -233,13 +264,19 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('임베딩 모델')
-			.setDesc('설치 여부 확인 필요 (임시 UI — Embedding 구현 전까지는 항상 미구현 알림이 뜹니다)')
+			.setDesc(
+				'specter2(8bit 양자화) 모델을 GitHub Release에서 받아 온디바이스로 씁니다. ' +
+					'설치 전에는 임베딩이 임시(해시 기반) 벡터로 대체됩니다.',
+			)
 			.addButton((button) =>
 				button.setButtonText('확인').onClick(async () => {
 					try {
-						await this.plugin.collectflow.embedding.isModelInstalled();
-					} catch {
-						new Notice('아직 구현되지 않음: 임베딩 모델 확인');
+						const installed = await this.plugin.collectflow.embedding.isModelInstalled();
+						new Notice(
+							installed ? '임베딩 모델이 설치되어 있습니다.' : '임베딩 모델이 설치되어 있지 않습니다.',
+						);
+					} catch (error) {
+						new Notice(`임베딩 모델 확인 실패: ${String(error)}`);
 					}
 				}),
 			)
@@ -248,14 +285,69 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('설치')
 					.setCta()
 					.onClick(async () => {
+						button.setDisabled(true);
+						const notice = new Notice('임베딩 모델 설치 중...', 0);
 						try {
 							await this.plugin.collectflow.embedding.installModel((progress) => {
-								new Notice(`임베딩 모델 설치 중... ${Math.round(progress * 100)}%`);
+								notice.setMessage(
+									`임베딩 모델 설치 중... (${progress.fileIndex}/${progress.fileCount}) ${progress.fileName}`,
+								);
 							});
-						} catch {
-							new Notice('아직 구현되지 않음: 임베딩 모델 설치');
+							notice.hide();
+							new Notice('임베딩 모델 설치 완료');
+						} catch (error) {
+							notice.hide();
+							new Notice(`임베딩 모델 설치 실패: ${String(error)}`);
+						} finally {
+							button.setDisabled(false);
 						}
 					}),
+			)
+			.addButton((button) =>
+				button.setButtonText('테스트 (100개)').onClick(async () => {
+					button.setDisabled(true);
+					const total = 100;
+					const notice = new Notice(`임베딩 테스트 중... (0/${total})`, 0);
+					const startedAt = Date.now();
+					let succeeded = 0;
+					let failed = 0;
+					try {
+						for (let i = 0; i < total; i++) {
+							const paper = buildMockPaper(i);
+							const result = await this.plugin.collectflow.embedding.embed(
+								paper.title,
+								paper.abstract,
+							);
+							if (result.embeddingSucceeded) {
+								succeeded += 1;
+							} else {
+								failed += 1;
+							}
+
+							// .md(문서)와 .json(임베딩 포함 원본)을 한 번에 저장한다. .md는 임베딩
+							// 벡터를 담지 않으므로 임베딩 전/후로 두 번 나눠 쓸 이유가 없고, 두 번
+							// 쓰면 재실행 시 "임베딩 전" 저장이 이전 실행의 정상 결과를 일시적으로
+							// 지웠다가 복구하는 창이 생겨 중단 시 데이터가 빈 값으로 남을 수 있었다.
+							Object.assign(paper, result);
+							await File.writeTestPaper(paper, EMBEDDING_TEST_FOLDER);
+
+							notice.setMessage(
+								`임베딩 테스트 중... (${i + 1}/${total}) 성공 ${succeeded} / 실패 ${failed}`,
+							);
+						}
+						const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+						notice.hide();
+						new Notice(
+							`임베딩 테스트 완료: 성공 ${succeeded}개 / 실패(임시 벡터로 대체) ${failed}개 (${elapsedSec}초)`,
+							0,
+						);
+					} catch (error) {
+						notice.hide();
+						new Notice(`임베딩 테스트 중 오류: ${String(error)}`);
+					} finally {
+						button.setDisabled(false);
+					}
+				}),
 			);
 
 		new Setting(containerEl)
