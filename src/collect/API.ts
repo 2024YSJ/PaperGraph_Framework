@@ -7,7 +7,6 @@ import {
 	requestWithRetry,
 } from './ApiSupport';
 
-// 빈 껍데기 — 나머지 필요한 함수는 신빈이 채운다.
 export interface API {
 	// 이 API의 식별자(예: 'arxiv', 'semanticScholar'). Subscriptions.json에 저장되고,
 	// 나중에 저장된 구독을 다시 읽을 때 어떤 API 구현체로 복원할지 판별하는 키로 쓴다
@@ -19,11 +18,11 @@ export interface API {
 	Backfill(from: number, to: number): Promise<Paper[]>;
 }
 
-// SearchQuery.searchType 허용값 (2026-08-04 확정, docs/devLog/004.md 예정).
-// 구독은 API 단위 + 최대 3조건, 조건들은 전부 AND로 묶는다(넓히는 OR이 아니라 좁히는 AND).
+// SearchQuery.searchType 허용값
+// 구독은 API 단위 + 최대 3조건, 조건들은 전부 AND로 묶는다
 // - keyword: 제목+초록+저자 등 전체 검색 (arXiv all:)
 // - author: 저자명 (arXiv au:)
-// - category: 분류, arXiv 전용 값 체계(cs.AI 등) — 다른 API에서는 안 쓰일 수 있음
+// - category: 분류, arXiv 전용 값 체계(cs.AI 등) — arxix 전용
 const ARXIV_FIELD_PREFIX: Record<string, string> = {
 	keyword: 'all',
 	author: 'au',
@@ -127,8 +126,8 @@ async function fetchAndParse(url: string, collectedQuery: SearchQuery): Promise<
 }
 
 // ── S2 인용수 보강 ──────────────────────────────────────────────────
-// API 객체는 "하나의 외부 서비스"가 아니라 "Paper를 완성하는 하나의 방법"이다(2026-08-04
-// 팀 논의, 우빈). 인용수는 Paper의 필수 정보인데 arXiv가 제공하지 않으므로, ArxivAPI가
+// API 객체는 "하나의 외부 서비스"가 아니라 "Paper를 완성하는 하나의 방법"
+// 인용수는 Paper의 필수 정보인데 arXiv가 제공하지 않으므로, ArxivAPI가 
 // 반환 전에 Semantic Scholar로 채워 넣는다. 공용 함수로 둔 것은 다른 API 구현체도
 // 같은 보강이 필요하면 재사용하기 위함이다.
 
@@ -207,7 +206,7 @@ async function enrichCitations(papers: Paper[]): Promise<void> {
 	}
 }
 
-// 예시용 구현체 — arXiv API. apiName은 'arxiv' 고정(Subscriptions 복원 시 판별 키).
+//arXiv API 구현체
 export class ArxivAPI implements API {
 	readonly apiName = 'arxiv';
 	querys: SearchQuery[];

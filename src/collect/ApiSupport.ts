@@ -1,9 +1,9 @@
 import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from 'obsidian';
 
-// 모든 API 구현체가 공유하는 실패 처리 정책과 그 도구들 (2026-08-04 확정).
+// 모든 API 구현체가 공유하는 실패 처리 정책과 그 도구들 
 // 새 API(예: Semantic Scholar, PubMed)를 추가할 때도 이 세 규칙을 그대로 따르면 실패
 // 동작이 API마다 달라지지 않는다.
-//
+//수집 중 실패시 이를 어떻게 처리할지 정책을 정리한다. 실패 유형은 크게 세 가지다.
 //   [1] 수집 자체가 불가능 -> throw
 //       설정 오류, 응답 없음/깨짐 등 "결과를 신뢰할 수 없는" 경우. 호출자가 이번 수집을
 //       실패로 판단해야 하므로 조용히 빈 배열을 반환하지 않는다. -> requestWithRetry

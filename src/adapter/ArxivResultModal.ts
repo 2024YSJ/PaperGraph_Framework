@@ -1,10 +1,8 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import { Paper } from '../collect/Paper';
 
-// arXiv 검색 테스트 결과 확인용 임시 창. Obsidian 1.13의 개발자 콘솔은 실제 앱과 다른
-// 프레임(about:blank)을 보고 있어 console.log가 보이지 않는 경우가 있어, 결과를 화면에
-// 직접 띄운다. 실제 파이프라인 코드가 아니라 신빈의 arXiv 연동 검증용이므로,
-// SettingTab 구독 UI 배선이 끝나면 지워도 된다.
+// arXiv 검색 테스트 결과 확인용 임시 창 결과를 화면에 직접 띄운다.
+//파이프 라인 말고 그냥 단순히 arXiv API를 호출해서 결과를 확인하고 싶을 때 쓰는 용도. 
 export class ArxivResultModal extends Modal {
 	constructor(
 		app: App,
