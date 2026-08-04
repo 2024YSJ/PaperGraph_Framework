@@ -80,12 +80,30 @@ export class File {
 				const subscriptions = new Subscriptions();
 				subscriptions.updateTime = data.updateTime ?? 0;
 				subscriptions.apis = (data.apis ?? []).map((api) =>
-					File.createApi(api.apiName, api.querys ?? []),
+					File.createApi(
+						api.apiName,
+						(api.querys ?? []).map((query) => File.migrateSearchType(query)),
+					),
 				);
 				return subscriptions;
 			},
 			() => new Subscriptions(),
 		);
+	}
+
+	// 이름이 바뀐 searchType을 현재 값으로 옮긴다. 설정탭이 'domain'을 저장하던 시절의
+	// Subscriptions.json이 그대로 남아 있으면, 복원된 구독으로 수집할 때 arXiv 쪽에서
+	// "Unknown searchType"으로 throw해 해당 구독 전체가 실패한다. 읽는 시점에 한 번
+	// 정규화해 두면 저장 파일이 다음 writeSubscriptions에서 자연스럽게 갱신된다.
+	private static readonly SEARCH_TYPE_ALIASES: Record<string, string> = {
+		domain: 'category',
+	};
+
+	// typeof 검사는 프로토타입 체인 방어다. searchType이 'toString' 같은 값이면 맵에서
+	// 함수가 잡히는데, truthy라서 그대로 searchType에 대입돼버린다.
+	private static migrateSearchType(query: SearchQuery): SearchQuery {
+		const renamed = File.SEARCH_TYPE_ALIASES[query.searchType];
+		return typeof renamed === 'string' ? { ...query, searchType: renamed } : query;
 	}
 
 	static writeSubscriptions(subscriptions: Subscriptions): Promise<void> {

@@ -17,18 +17,19 @@ function parseDateInput(value: string): number | undefined {
 	return Number.isNaN(parsed) ? undefined : parsed;
 }
 
-// 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들 — 다이어그램에는 문자열로만
-// 정의돼 있어 UI에서 다룰 후보를 여기서 임시로 고정한다. 실제 허용값은 신빈이 API/
-// SearchQuery를 구현하며 확정한다.
-type ConditionType = 'keyword' | 'author' | 'domain';
+// 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들.
+// 여기 값은 API.ts의 ARXIV_FIELD_PREFIX 키와 반드시 일치해야 한다 — 예전에 이 타입만
+// 'domain'으로 남아 있어서, UI로 그 조건을 만들면 formatTerm()이
+// "Unknown searchType"으로 throw하고 [1] 정책에 따라 해당 구독 수집 전체가 실패했다.
+type ConditionType = 'keyword' | 'author' | 'category';
 
 const CONDITION_TYPE_LABEL: Record<ConditionType, string> = {
 	keyword: '키워드',
 	author: '저자',
-	domain: '도메인',
+	category: '분류',
 };
 
-// 구독 한 건 = API 하나. API 하나에 여러 조건(키워드/저자/도메인 등, SearchQuery)을
+// 구독 한 건 = API 하나. API 하나에 여러 조건(키워드/저자/분류 등, SearchQuery)을
 // 동시에 걸 수 있다 (Subscriptions.apis: API[], API.querys: SearchQuery[]와 대응).
 interface ApiDraft {
 	label: string;
@@ -359,7 +360,7 @@ export class SettingTab extends PluginSettingTab {
 				dropdown
 					.addOption('keyword', CONDITION_TYPE_LABEL.keyword)
 					.addOption('author', CONDITION_TYPE_LABEL.author)
-					.addOption('domain', CONDITION_TYPE_LABEL.domain)
+					.addOption('category', CONDITION_TYPE_LABEL.category)
 					.setValue(api.newConditionType)
 					.onChange((value) => {
 						api.newConditionType = value as ConditionType;
