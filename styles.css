@@ -6,3 +6,10 @@
 	white-space: pre-wrap;
 	word-break: break-word;
 }
+
+/* 수집 테스트 결과 창의 검증 항목.
+   판정 근거와 주석을 줄바꿈해서 두 줄로 보여준다(setDesc에 \n을 넣기 때문). */
+.papergraph3d-check-row .setting-item-description {
+	white-space: pre-wrap;
+	word-break: break-word;
+}

@@ -372,6 +372,12 @@ async function enrichCitations(papers: Paper[], secret?: Secret): Promise<void> 
 export interface CollectionCoverage {
 	truncated: boolean;
 	coveredThrough: number; // epoch ms
+	// 실제로 요청한 페이지 수. 페이지네이션이 정말 돌았는지(1페이지에서 안 끝났는지)를
+	// 밖에서 확인할 수 있는 유일한 값이라 테스트 UI가 이걸 표시한다.
+	pages: number;
+	// arXiv가 보고한 이 검색의 전체 건수(<opensearch:totalResults>). 못 읽으면 -1.
+	// "받아온 편수"와 비교하면 빠뜨린 게 있는지 바로 드러난다.
+	totalResults: number;
 }
 
 // 예시용 구현체 — arXiv API. apiName은 'arxiv' 고정(Subscriptions 복원 시 판별 키).
@@ -437,6 +443,7 @@ export class ArxivAPI implements API {
 		const collectedQuery = combineQueries(this.querys);
 		const papers: Paper[] = [];
 		let latestPublishedMs: number | undefined;
+		let totalResults = -1;
 
 		for (let page = 0; page < MAX_PAGES; page += 1) {
 			if (page > 0) {
@@ -449,6 +456,7 @@ export class ArxivAPI implements API {
 				collectedQuery,
 			);
 			papers.push(...result.papers);
+			totalResults = result.totalResults;
 			// 커서는 절대 뒤로 가지 않게 max로 누적한다. ascending이라 보통은 페이지마다
 			// 커지지만, 그 정렬을 커서 정확성의 전제로 삼지는 않는다.
 			if (result.latestPublishedMs !== undefined) {
@@ -460,13 +468,18 @@ export class ArxivAPI implements API {
 
 			// 응답이 비었거나 한 페이지를 다 못 채웠으면 마지막 페이지다.
 			// (totalResults를 못 읽는 경우를 위한 안전망이기도 하다.)
-			if (result.entryCount < PAGE_SIZE) {
-				this.lastCoverage = { truncated: false, coveredThrough: windowTo };
-				return papers;
-			}
+			//
 			// totalResults를 읽었다면 그 기준으로도 종료를 판정한다.
-			if (result.totalResults >= 0 && start + result.entryCount >= result.totalResults) {
-				this.lastCoverage = { truncated: false, coveredThrough: windowTo };
+			const filledPage = result.entryCount >= PAGE_SIZE;
+			const reachedTotal =
+				result.totalResults >= 0 && start + result.entryCount >= result.totalResults;
+			if (!filledPage || reachedTotal) {
+				this.lastCoverage = {
+					truncated: false,
+					coveredThrough: windowTo,
+					pages: page + 1,
+					totalResults,
+				};
 				return papers;
 			}
 		}
@@ -477,6 +490,8 @@ export class ArxivAPI implements API {
 		this.lastCoverage = {
 			truncated: true,
 			coveredThrough: latestPublishedMs ?? windowFrom,
+			pages: MAX_PAGES,
+			totalResults,
 		};
 		console.warn(
 			`ArxivAPI: reached MAX_PAGES(${MAX_PAGES}) for ${dateFilter} — ` +
@@ -495,7 +510,12 @@ export class ArxivAPI implements API {
 		// 빈/역전 구간(시계 되돌림, 잘못 준 Backfill 인자 등)은 요청할 게 없다. 굳이 호출해
 		// arXiv에 빈 범위를 물어보는 대신 즉시 끝내고, 커서는 요청한 끝까지 인정한다.
 		if (window && window.from >= window.to) {
-			this.lastCoverage = { truncated: false, coveredThrough: window.to };
+			this.lastCoverage = {
+				truncated: false,
+				coveredThrough: window.to,
+				pages: 0, // 호출 자체를 안 했다
+				totalResults: -1,
+			};
 			return [];
 		}
 

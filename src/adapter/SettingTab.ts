@@ -3,6 +3,7 @@ import type PaperGraph3D from '../main';
 import { File } from '../common/File';
 import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
+import { CollectResultModal } from './CollectResultModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
@@ -118,29 +119,36 @@ function parseDateInput(value: string): number | undefined {
 	return Number.isNaN(parsed) ? undefined : parsed;
 }
 
+// timestamp -> <input type="date">가 받는 "YYYY-MM-DD".
+function isoDateInput(ms: number): string {
+	return new Date(ms).toISOString().slice(0, 10);
+}
+
 // "수집" 버튼 공용 실행기. CollectAndSave.run()이 스텁이라 그 대신 ArxivAPI를 직접
 // 호출한다("arXiv API 테스트" 버튼과 같던 성격 — 이제 이 버튼들이 그 역할을 흡수했다).
-// 결과는 Notice로 한 줄 요약(전체 목록은 안 보고 있어도 성공/실패를 알 수 있도록)하고,
-// 전체 Paper[]는 console.log로 남긴다 — 매번 모달을 새로 만드는 대신 개발자 도구에서
-// 펼쳐보는 쪽이 필드가 늘어날 때마다 UI를 고칠 필요가 없어 더 오래간다.
+//
+// 결과는 CollectResultModal로 띄운다. 처음엔 console에만 남겼는데 두 가지가 문제였다:
+// obsidianmd 린트가 console.log를 막아 console.debug를 썼더니 DevTools 기본 필터
+// (Verbose 숨김)에 걸려 아예 안 보였고, 무엇보다 "N편 수집" 숫자만으로는 날짜 필터나
+// 페이지네이션이 실제로 동작했는지 알 수 없었다. 모달이 그 판정을 대신 보여준다.
 async function runCollectTest(
+	app: App,
 	label: string,
+	keyword: string,
 	fetchPapers: () => Promise<Paper[]>,
 	api: ArxivAPI,
 	usedS2Key: boolean,
+	window?: { from: number; to: number },
 ): Promise<void> {
 	try {
 		const papers = await fetchPapers();
-		const citationsKnown = papers.filter((p) => p.citationsKnown).length;
-		const coverage = api.lastCoverage;
-		const coverageText = coverage
-			? ` / ${coverage.truncated ? '잘림, ' : ''}${new Date(coverage.coveredThrough).toISOString().slice(0, 10)}까지 확인`
-			: '';
-		const s2Text = usedS2Key ? ' (S2 키 사용)' : '';
-		new Notice(`${label} 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})${coverageText}${s2Text}`);
-		// obsidianmd 린트가 console.log를 금지한다(가이드라인 "Avoid unnecessary logging") —
-		// warn/error/debug만 허용되므로 debug를 쓴다. Notice가 요약이고 이건 전체 상세다.
-		console.debug(`[PaperGraph3D] ${label} 수집 결과`, { papers, coverage });
+		new Notice(`${label} 수집 완료: ${papers.length}편`);
+		new CollectResultModal(app, papers, api.lastCoverage, {
+			label,
+			keyword,
+			window,
+			usedS2Key,
+		}).open();
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
 		new Notice(`${label} 수집 실패: ${message}`);
@@ -202,7 +210,8 @@ export class SettingTab extends PluginSettingTab {
 			.setName('수집')
 			.setDesc(
 				'CollectAndSave.run() 없이 ArxivAPI.SearchRecentPaper()/Backfill()을 단독 호출합니다. ' +
-					'저장하지 않습니다. 결과 요약은 알림으로, 전체 내용은 개발자 도구 콘솔(console.log)로 확인하세요.',
+					'저장하지 않습니다. 결과 창에서 날짜 필터·페이지네이션·인용수 보강이 실제로 ' +
+					'동작했는지 항목별로 확인할 수 있고, 전체 JSON은 클립보드로 복사됩니다.',
 			)
 			.addButton((button) =>
 				button.setButtonText('최근 논문').onClick(() => {
@@ -232,11 +241,16 @@ export class SettingTab extends PluginSettingTab {
 							}
 							const secret = await File.readSecret();
 							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
+							// SearchRecentPaper가 내부에서 잡는 구간과 같은 값을 검증용으로 만든다.
+							const to = Date.now();
 							await runCollectTest(
+								this.app,
 								'최근 논문',
+								keyword,
 								() => api.SearchRecentPaper(hours),
 								api,
 								secret.hasKey(S2_SECRET_PROVIDER),
+								{ from: to - hours * 60 * 60 * 1000, to },
 							);
 						},
 					).open();
@@ -249,8 +263,22 @@ export class SettingTab extends PluginSettingTab {
 						'수집 테스트 — Backfill',
 						[
 							{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' },
-							{ key: 'from', label: '시작일', desc: 'API.Backfill(from, to)의 from', type: 'date' },
-							{ key: 'to', label: '종료일 (당일 포함)', desc: 'API.Backfill(from, to)의 to', type: 'date' },
+							{
+								key: 'from',
+								label: '시작일',
+								desc: 'API.Backfill(from, to)의 from',
+								type: 'date',
+								// 기본 2주 — 좁은 구간을 고르면 100건 미만이라 페이지네이션이
+								// 한 번도 안 돌아 검증이 안 된다.
+								defaultValue: isoDateInput(Date.now() - 14 * 24 * 60 * 60 * 1000),
+							},
+							{
+								key: 'to',
+								label: '종료일 (당일 포함)',
+								desc: 'API.Backfill(from, to)의 to',
+								type: 'date',
+								defaultValue: isoDateInput(Date.now()),
+							},
 						],
 						async (values) => {
 							const keyword = values.keyword?.trim();
@@ -271,10 +299,13 @@ export class SettingTab extends PluginSettingTab {
 							const secret = await File.readSecret();
 							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
 							await runCollectTest(
+								this.app,
 								'Backfill',
+								keyword,
 								() => api.Backfill(from, to),
 								api,
 								secret.hasKey(S2_SECRET_PROVIDER),
+								{ from, to },
 							);
 						},
 					).open();
