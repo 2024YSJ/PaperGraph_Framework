@@ -1,9 +1,14 @@
 import { Notice, requestUrl, type DataAdapter, type Vault } from 'obsidian';
 
-// 온디바이스 SPECTER2(8bit 양자화) 임베딩. 설계 근거는 docs/devLog/003-embedding-model.md
-// 참고 — 모델 파일은 번들에 넣지 않고 GitHub Release에서 사용자가 설치 버튼으로만
-// 받는다. 설치 전/실패 시에는 항상 해시 기반 베이스라인으로 폴백해서 embed()는 절대
-// throw하지 않는다 (Paper의 embedding 계열 필드가 전부 non-nullable이기 때문).
+// 온디바이스 로컬 모델(현재 설정: SPECTER2, 8bit 양자화) 임베딩. 설계 근거는
+// docs/devLog/003-embedding-model.md 참고 — 모델 파일은 번들에 넣지 않고 GitHub
+// Release에서 사용자가 설치 버튼으로만 받는다. 설치 전/실패 시에는 항상 해시 기반
+// 베이스라인으로 폴백해서 embed()는 절대 throw하지 않는다 (Paper의 embedding 계열
+// 필드가 전부 non-nullable이기 때문).
+//
+// 다른 로컬 모델로 교체하려면: 아래 "로컬 모델 설정" 상수 블록 + buildModelInput()
+// (입력 포맷) + poolEmbedding()(풀링 전략) 세 곳만 보면 된다. 교체 조건은
+// docs/devLog/003-embedding-model.md의 "로컬 모델 교체 조건" 절 참고.
 
 export interface AssetProgress {
 	readonly fileIndex: number;
@@ -78,15 +83,23 @@ export class Embedding {
 	private consecutiveFailures = 0;
 	private breakerTrippedAt?: number;
 
-	// ── 상수: GitHub Release / 에셋 레이아웃 ───────────────────────────────
-	// 모델 변환·양자화·업로드는 코딩 작업 범위 밖의 수동 작업이다 (003-embedding-model.md).
+	// ═══ 로컬 모델 설정 — 다른 모델로 교체할 때 이 블록 전체를 같이 갱신할 것 ═══
+	// 파일명·차원·dtype·canonical id가 서로 어긋나면 다운로드는 성공해도 로드/추론이
+	// 조용히 실패해 baseline 폴백으로 빠진다 (docs/devLog/003-embedding-model.md
+	// "로컬 모델 교체 조건" 참고).
 	private static readonly RELEASE_OWNER = '2024YSJ';
 	private static readonly RELEASE_REPO = 'PaperGraph_Framework';
 	private static readonly MODEL_RELEASE_TAG = 'model-specter2-q8-v1';
 	private static readonly WASM_FILE = 'ort-wasm-simd-threaded.jsep.wasm';
 	private static readonly MODELS_SUBDIR = 'models';
 	private static readonly WASM_SUBDIR = 'wasm';
-	private static readonly MODEL_ID = 'specter2-proximity-onnx';
+	// transformers.js AutoTokenizer/AutoModel.from_pretrained에 넘기는 로드 식별자
+	// (= 로컬 저장 시 모델 폴더명). Paper.embeddingModel에 쓰는 canonical id와는 다른
+	// 문자열이다 — 이건 "어디서 로드하는가", canonical id는 "어떤 임베딩 공간인가".
+	private static readonly LOCAL_MODEL_FOLDER_NAME = 'specter2-proximity-onnx';
+	// GitHub Release의 model_quantized.onnx(8bit 양자화)에 대응. MODEL_FILES의
+	// 양자화 가중치 파일명과 반드시 같은 양자화 방식을 가리켜야 한다.
+	private static readonly LOCAL_MODEL_DTYPE = 'q8';
 	// tokenizer.json은 필수 — transformers.js에 vocab.txt 로더가 없다.
 	private static readonly MODEL_FILES = [
 		'config.json',
@@ -95,14 +108,19 @@ export class Embedding {
 		'special_tokens_map.json',
 		'onnx/model_quantized.onnx',
 	] as const;
+	// Paper.embeddingModel에 저장하는 canonical id — 코퍼스 전체가 공유하는 임베딩
+	// 공간의 식별자. 모델을 바꾸면 반드시 함께 바꿔야 한다(안 바꾸면 새 모델 결과가
+	// 옛 공간의 벡터인 척 저장된다).
+	private static readonly LOCAL_MODEL_EMBEDDING_ID = 'local-specter2-proximity-v1-d768';
+	// 기대 hidden 차원. poolEmbedding()이 실제 모델 출력과 이 값을 대조해서, 다르면
+	// "런타임 장애"가 아니라 "이 상수를 안 갱신한 설정 실수"라고 알 수 있는 에러를 낸다.
+	private static readonly LOCAL_MODEL_DIM = 768;
 
-	// ── 상수: 베이스라인 (해시 TF, 항상 계산 가능한 폴백) ───────────────────
+	// ── 상수: 베이스라인 (해시 TF, 항상 계산 가능한 폴백) — 모델 비의존적 ──────
 	private static readonly BASELINE_EMBEDDING_DIM = 2048;
 	private static readonly BASELINE_EMBEDDING_MODEL = 'local-hashtf-v1-d2048';
 
-	// ── 상수: SPECTER2 ─────────────────────────────────────────────────
-	private static readonly SPECTER2_EMBEDDING_MODEL = 'local-specter2-proximity-v1-d768';
-	private static readonly SPECTER2_EMBEDDING_DIM = 768;
+	// ── 상수: 세션/메모리 관리 — 모델 비의존적 ─────────────────────────────
 	private static readonly MAX_SEQUENCE_LENGTH = 512;
 	// 고정 길이 버킷 — WASM 힙이 절대 줄어들지 않아 매 논문마다 새 shape을 주면
 	// 100~200편 근처에서 OOM 나던 문제의 근본 수정 (003-embedding-model.md 1차 방어).
@@ -111,7 +129,7 @@ export class Embedding {
 	// 메모리를 돌려준다 (3차 방어 — "완료된 작업이 메모리를 계속 차지하는" 문제의 핵심 대응).
 	private static readonly INFERENCES_PER_SESSION = 64;
 
-	// ── 상수: 서킷브레이커 (5차 방어) ───────────────────────────────────
+	// ── 상수: 서킷브레이커 (5차 방어) — 모델 비의존적 ───────────────────────
 	private static readonly FAILURE_LIMIT = 3;
 	private static readonly BREAKER_COOLDOWN_MS = 60_000;
 
@@ -142,7 +160,7 @@ export class Embedding {
 		return {
 			modelsDir,
 			wasmDir: `${this.pluginDir}/${Embedding.WASM_SUBDIR}`,
-			modelDir: `${modelsDir}/${Embedding.MODEL_ID}`,
+			modelDir: `${modelsDir}/${Embedding.LOCAL_MODEL_FOLDER_NAME}`,
 		};
 	}
 
@@ -341,7 +359,36 @@ export class Embedding {
 		return norm === 0 ? vector : vector.map((value) => value / norm);
 	}
 
-	// ── ONNX 세션 관리 + SPECTER2 추론 ─────────────────────────────────
+	// ── 로컬 모델 입력/출력 변환 — 모델을 교체하면 이 두 함수만 고치면 된다 ─────
+
+	// SPECTER2 학습 포맷 가정: title + 리터럴 '[SEP]' + abstract. 초록이 없으면
+	// title만 쓴다. 다른 아키텍처/학습 포맷의 모델로 교체한다면 이 함수만 고치면 된다
+	// (공백으로 이어붙이는 등 학습 형식과 다르게 포맷하면 품질이 떨어진다).
+	private buildModelInput(title: string, abstract: string): string {
+		return abstract.length > 0 ? `${title}[SEP]${abstract}` : title;
+	}
+
+	// CLS(첫 토큰) 풀링 가정 — [batch, sequence, hidden]에서 batch=1이므로 CLS는
+	// last_hidden_state 버퍼 앞 LOCAL_MODEL_DIM개. mean-pooling 등 다른 전략의
+	// 모델로 교체한다면 이 함수만 고치면 된다.
+	private poolEmbedding(hidden: Tensor): number[] {
+		const hiddenSize = hidden.dims[2] ?? 0;
+		if (hiddenSize !== Embedding.LOCAL_MODEL_DIM) {
+			// 차원이 다르면 "런타임 장애"가 아니라 "모델을 교체하고 이 상수를 안 바꾼
+			// 설정 실수"일 가능성이 훨씬 크다 — 메시지로 구분되게 한다.
+			throw new Error(
+				`LOCAL_MODEL_DIM 설정(${Embedding.LOCAL_MODEL_DIM})과 실제 모델 출력(${hiddenSize})이 ` +
+					`다릅니다. 모델을 교체했다면 이 상수도 함께 갱신해야 합니다.`,
+			);
+		}
+		const cls = new Array<number>(Embedding.LOCAL_MODEL_DIM);
+		for (let i = 0; i < Embedding.LOCAL_MODEL_DIM; i += 1) {
+			cls[i] = Number(hidden.data[i] ?? Number.NaN);
+		}
+		return Embedding.l2Normalize(cls);
+	}
+
+	// ── ONNX 세션 관리 + 추론 — 모델 비의존적 ──────────────────────────────
 
 	private async createSession(location: LocalModelLocation): Promise<Session> {
 		const transformers = await import('@huggingface/transformers');
@@ -364,10 +411,9 @@ export class Embedding {
 		const autoTokenizer = transformers.AutoTokenizer as unknown as AutoFactory<Tokenizer>;
 		const autoModel = transformers.AutoModel as unknown as AutoFactory<Model>;
 
-		const tokenizer = await autoTokenizer.from_pretrained(Embedding.MODEL_ID);
-		const model = await autoModel.from_pretrained(Embedding.MODEL_ID, {
-			// GitHub Release의 model_quantized.onnx(8bit 양자화)에 대응.
-			dtype: 'q8',
+		const tokenizer = await autoTokenizer.from_pretrained(Embedding.LOCAL_MODEL_FOLDER_NAME);
+		const model = await autoModel.from_pretrained(Embedding.LOCAL_MODEL_FOLDER_NAME, {
+			dtype: Embedding.LOCAL_MODEL_DTYPE,
 			session_options: {
 				// 고정 shape 3종류뿐이라 재사용할 게 없는데, 이 아레나 자체가 무한정
 				// 자라는 구조였으므로 끈다 (003-embedding-model.md 2차 방어).
@@ -426,29 +472,15 @@ export class Embedding {
 		const { last_hidden_state: hidden } = await session.model(inputs);
 		session.uses += 1;
 
-		// [batch, sequence, hidden], batch=1이므로 CLS 토큰은 버퍼 앞 SPECTER2_EMBEDDING_DIM개.
-		const hiddenSize = hidden.dims[2] ?? 0;
-		if (hiddenSize !== Embedding.SPECTER2_EMBEDDING_DIM) {
-			throw new Error(
-				`SPECTER2 produced a ${hiddenSize}-d hidden state, expected ${Embedding.SPECTER2_EMBEDDING_DIM}`,
-			);
-		}
-
-		const cls = new Array<number>(Embedding.SPECTER2_EMBEDDING_DIM);
-		for (let i = 0; i < Embedding.SPECTER2_EMBEDDING_DIM; i += 1) {
-			cls[i] = Number(hidden.data[i] ?? Number.NaN);
-		}
-		return Embedding.l2Normalize(cls);
+		return this.poolEmbedding(hidden);
 	}
 
-	private async specter2Embedding(
+	private async runLocalModel(
 		title: string,
 		abstract: string,
 		location: LocalModelLocation,
 	): Promise<EmbeddingResult> {
-		// SPECTER2가 학습된 입력 형식: title, 리터럴 '[SEP]', abstract. 초록이 없으면
-		// title만 쓴다 (공백으로 이어붙이면 학습 형식과 달라져 품질이 떨어진다).
-		const text = abstract.length > 0 ? `${title}[SEP]${abstract}` : title;
+		const text = this.buildModelInput(title, abstract);
 
 		let session = await this.getSession(location);
 		if (session.uses >= Embedding.INFERENCES_PER_SESSION) {
@@ -476,12 +508,12 @@ export class Embedding {
 		}
 
 		if (embedding.some((value) => !Number.isFinite(value))) {
-			throw new Error('SPECTER2 produced a non-finite embedding');
+			throw new Error('로컬 모델이 non-finite 임베딩을 반환했습니다.');
 		}
 
 		return {
 			embedding,
-			embeddingModel: Embedding.SPECTER2_EMBEDDING_MODEL,
+			embeddingModel: Embedding.LOCAL_MODEL_EMBEDDING_ID,
 			embeddingSource: 'local',
 			embeddingSucceeded: true,
 		};
@@ -548,7 +580,7 @@ export class Embedding {
 	// ── 논문 단위 오케스트레이션 (공개 API) ─────────────────────────────
 
 	// 절대 throw하지 않는다 — Paper의 embedding 필드가 non-nullable이라 "임베딩 안 됨"
-	// 상태를 표현할 방법이 없다. 항상 사용 가능한 벡터(성공 시 SPECTER2, 그 외엔 해시
+	// 상태를 표현할 방법이 없다. 항상 사용 가능한 벡터(성공 시 로컬 모델, 그 외엔 해시
 	// 폴백)를 반환하고 embeddingSucceeded로만 구분한다.
 	async embed(title: string, abstract: string): Promise<EmbeddingResult> {
 		if (this.breakerBlocksAttempt()) {
@@ -563,7 +595,7 @@ export class Embedding {
 		}
 
 		try {
-			const result = await this.specter2Embedding(title, abstract, location);
+			const result = await this.runLocalModel(title, abstract, location);
 			this.recordSuccess();
 			return result;
 		} catch (error) {

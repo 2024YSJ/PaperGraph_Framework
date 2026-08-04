@@ -93,9 +93,29 @@
 
 **요약**: "어떤 모델을 쓸지" 자체를 바꾸는 건(상수 몇 개 + 로직 일부) 몇 시간짜리 작업이지만, "바꾼 뒤 기존 코퍼스를 정합성 있게 유지하는" 재임베딩 기능이 없다는 게 진짜 병목이다. 나중에 모델을 다시 바꿀 계획이 생기면, 이번에 취소했던 provider 전환+재임베딩 설계(대화 로그에 남아있음)를 다시 꺼내 구현하는 게 순서상 맞다.
 
+### 리팩터링 (2026-08-04): 이름/구조를 모델 비의존적으로 정리
+
+위 "쉽지 않은 부분" 2·3·4번(입력/풀링 하드코딩, specter2가 박힌 이름, 조용한 차원 불일치)을 코드 구조로 완화했다. **런타임 provider 전환 기능은 여전히 만들지 않았다** — specter2 하나만 고정 실행하는 건 그대로고, 이번엔 순수 이름/구조 정리다.
+
+- **이름 변경**: `SPECTER2_EMBEDDING_MODEL`→`LOCAL_MODEL_EMBEDDING_ID`, `SPECTER2_EMBEDDING_DIM`→`LOCAL_MODEL_DIM`, `MODEL_ID`→`LOCAL_MODEL_FOLDER_NAME`, `specter2Embedding()`→`runLocalModel()`. 새 상수 `LOCAL_MODEL_DTYPE`('q8')도 인라인이던 `dtype:'q8'`을 명시적 상수로 뺐다.
+- **`buildModelInput(title, abstract)` / `poolEmbedding(hidden)` 분리**: 각각 `[SEP]` 입력 포맷, CLS 풀링 로직을 이름 붙은 private 메서드로 뽑았다. 다른 모델로 교체할 때 정확히 이 두 함수만 보면 된다.
+- **차원 불일치 에러 메시지 명확화**: `poolEmbedding()`이 `hiddenSize !== LOCAL_MODEL_DIM`이면 "LOCAL_MODEL_DIM 설정과 실제 모델 출력이 다릅니다. 모델을 교체했다면 이 상수도 함께 갱신해야 합니다"라고 명시한다. 여전히 baseline 폴백 + 서킷브레이커를 거치는 흐름 자체는 그대로다(런타임 장애와 구분되는 문구가 붙었을 뿐).
+- **상수 섹션 병합**: 기존 "GitHub Release/에셋 레이아웃"과 "SPECTER2" 두 섹션을 "로컬 모델 설정 — 다른 모델로 교체할 때 이 블록 전체를 같이 갱신할 것" 하나로 합쳤다.
+- 리팩터링이라 동작은 안 바꿨다 — 기존 mock-obsidian 동작 테스트 21개가 이름 변경 없이 그대로 재통과(테스트는 `computeBaselineEmbedding`/서킷브레이커 필드/`embed()`만 참조하고 이번에 바뀐 이름은 안 씀).
+
+### 로컬 모델 교체 조건 (2026-08-04)
+
+다른 로컬 모델로 바꾸려는 개발자가 지켜야 하는 조건. 하나라도 안 맞으면 다운로드는 성공해도 로드/추론이 실패해 baseline 폴백으로 조용히 빠질 수 있다.
+
+1. **HF 포맷 필수**: `@huggingface/transformers`의 `AutoTokenizer`/`AutoModel.from_pretrained`로 로드 가능해야 한다 — `config.json`/`tokenizer.json`/`tokenizer_config.json`/`special_tokens_map.json` + ONNX 가중치 파일 세트를 GitHub Release(또는 `releaseAssetUrl`이 가리키는 곳)에 flat 이름으로 올려야 한다.
+2. **인코더 전용, `[batch, sequence, hidden]` 출력 가정**: `last_hidden_state`를 반환하는 BERT류 인코더만 지금 구조 그대로 교체 가능하다. 인코더-디코더/디코더 전용 모델은 `runLocalModel`/`embedOnce` 자체를 다시 짜야 한다.
+3. **입력 포맷·풀링 전략이 다르면 `buildModelInput()`/`poolEmbedding()`만 고치면 된다** — SPECTER2 전용 가정(`[SEP]` 결합, CLS 풀링)이 이 두 함수에만 들어있다.
+4. **`LOCAL_MODEL_DIM`·`LOCAL_MODEL_DTYPE`·`MODEL_FILES`의 양자화 파일명 세트를 함께 갱신해야 한다.** 차원 불일치는 이제 명확한 에러 메시지로 구분되지만, dtype/파일명이 서로 안 맞는 경우(예: `LOCAL_MODEL_DTYPE`은 `'q8'`인데 실제로는 fp16 파일을 올린 경우)는 여전히 일반 실패로만 나타난다 — 이번 리팩터링 범위 밖.
+5. **재임베딩 경로는 여전히 없다.** 위 "모델 교체 용이성 평가"에서 이미 지적한 대로, 모델을 바꿔도 기존 코퍼스는 자동으로도 수동으로도 마이그레이션되지 않는다 — 이건 이름/구조 리팩터링으로 해결되는 문제가 아니라 별도 기능(취소된 provider 전환+재임베딩 설계)이 필요하다.
+
 ## 다음 담당자 참고
 
 - `CollectAndSave.run()`을 구현할 담당자는 `Embedding.embed(title, abstract)`를 루프 안에서 호출해 `Object.assign(paper, result)`로 붙이면 된다. `resetCircuitBreaker()`는 배치 시작 시 호출하면 좋지만 필수는 아니다(쿨다운이 자동으로 처리).
 - `installModel()`이 실패한다면 **더 이상 "릴리스에 에셋이 안 올라가 있어서"가 아니다** — 실제로 업로드·검증까지 끝났다(위 "모델 배포" 절 참고). 실패한다면 네트워크, Obsidian CSP, wasm 로딩 등 다른 원인을 봐야 한다.
 - `isDesktopOnly: true`는 팀 전체 영향 결정이므로, 모바일 지원 논의가 다시 나오면 이 문서를 먼저 참고할 것.
-- 모델을 다른 것으로 바꾸고 싶다면 위 "모델 교체 용이성 평가" 절을 먼저 읽을 것 — 특히 재임베딩 경로가 없다는 점.
+- 모델을 다른 것으로 바꾸고 싶다면 위 "모델 교체 용이성 평가" + "로컬 모델 교체 조건" 절을 먼저 읽을 것 — 손댈 지점은 `buildModelInput()`/`poolEmbedding()`/"로컬 모델 설정" 상수 블록 셋으로 좁혀뒀지만, 재임베딩 경로가 없다는 점은 여전하다.
