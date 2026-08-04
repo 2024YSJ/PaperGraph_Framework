@@ -97,6 +97,8 @@ export class VisualizationView extends ItemView {
 		new ButtonComponent(contentEl).setButtonText('실제 임베딩으로 실행 (21편)').onClick(() => {
 			void this.runPcaWithRealEmbedding();
 		});
+		// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체한다.
+		// runPcaWithRealArxiv() 정의부 참고.
 		new ButtonComponent(contentEl).setButtonText('실제 arXiv 수집으로 실행').onClick(() => {
 			new PipelineTestModal(
 				this.app,
@@ -207,7 +209,8 @@ export class VisualizationView extends ItemView {
 		}
 	}
 
-	// 004(수집) → 003(임베딩) → 005(PCA) 연결 확인용. CollectAndSave.run()이 아직
+	// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체한다.
+	// 004(수집) → 003(임베딩) → 005(PCA) 연결 확인용. run()이 아직
 	// 스텁이라 그 대신 세 클래스를 여기서 직접 이어 부른다("arXiv API 테스트" 버튼과
 	// 같은 성격 — run() 없이 단독 호출). 실제 ArxivAPI 결과를 넘긴다는 점에서
 	// runPcaWithRealEmbedding()의 makeRealisticPapers()(가짜 논문)와 다르다.

@@ -124,8 +124,10 @@ function isoDateInput(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
 }
 
-// "수집" 버튼 공용 실행기. CollectAndSave.run()이 스텁이라 그 대신 ArxivAPI를 직접
+// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체한다.
+// "수집" 버튼 공용 실행기. run()이 스텁이라 그 대신 ArxivAPI를 직접
 // 호출한다("arXiv API 테스트" 버튼과 같던 성격 — 이제 이 버튼들이 그 역할을 흡수했다).
+// (위 isoDateInput()도 이 임시 버튼의 날짜 기본값 계산 전용이라 같은 운명이다.)
 //
 // 결과는 CollectResultModal로 띄운다. 처음엔 console에만 남겼는데 두 가지가 문제였다:
 // obsidianmd 린트가 console.log를 막아 console.debug를 썼더니 DevTools 기본 필터
@@ -206,6 +208,8 @@ export class SettingTab extends PluginSettingTab {
 			)
 			.setHeading();
 
+		// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 이 버튼들은 그 경로로
+		// 교체하거나 지운다. runCollectTest() 정의부 참고.
 		new Setting(containerEl)
 			.setName('수집')
 			.setDesc(

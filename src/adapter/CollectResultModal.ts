@@ -2,6 +2,9 @@ import { App, Modal, Notice, Setting } from 'obsidian';
 import { Paper } from '../collect/Paper';
 import type { CollectionCoverage } from '../collect/API';
 
+// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체하거나 지운다.
+// SettingTab.ts의 runCollectTest()가 이 파일 전체의 유일한 호출부다.
+//
 // 수집 테스트 결과 창. 원시 JSON을 그대로 뿌리는 대신, "이번 수집이 제대로 동작했는가"를
 // 항목별로 판정해서 보여준다 — 편수만 봐서는 날짜 필터가 먹었는지, 페이지네이션이 실제로
 // 돌았는지 알 수 없기 때문이다(둘 다 예전에 조용히 깨져 있던 부분이라 눈으로 확인할
