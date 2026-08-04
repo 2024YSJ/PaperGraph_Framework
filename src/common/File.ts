@@ -129,7 +129,18 @@ export class File {
 	// .json(진실 원본)과 .md(Obsidian 뷰)를 함께 쓴다. 재작성 시 기존 createdAt / 사용자
 	// 자유 본문을 보존한다.
 	static async writePaper(paper: Paper): Promise<void> {
-		const base = File.resolvePaperPath(paper);
+		await File.writePaperAt(paper, File.resolvePaperPath(paper));
+	}
+
+	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
+	// 바로 아래에 저장한다. .json+.md 형식과 upsert(생성 또는 갱신) 동작은 writePaper와
+	// 동일 — readPapersByYear는 PaperGraph3D/<year>/ 접두사만 보므로 이 폴더 아래 파일은
+	// 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용 SettingTab 버튼에서 사용).
+	static async writeTestPaper(paper: Paper, folder: string): Promise<void> {
+		await File.writePaperAt(paper, `${folder}/${File.baseNoteName(paper.title, paper.sourceId)}`);
+	}
+
+	private static async writePaperAt(paper: Paper, base: string): Promise<void> {
 		const jsonPath = `${base}.json`;
 		const mdPath = `${base}.md`;
 

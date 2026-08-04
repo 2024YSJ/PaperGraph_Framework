@@ -58,7 +58,9 @@ export default class PaperGraph3D extends Plugin {
 
 	// 다이어그램의 PaperGraph3D.init() — collectflow/visualflow/eventListener/
 	// taskManager를 생성하고 연결한다. File은 static이라 인스턴스 없이 init()으로
-	// vault 참조만 등록한다. 등록 계열 함수만 호출하므로 안전하게 완료된다.
+	// vault 참조만 등록한다. Embedding은 인스턴스 필드지만 vault/플러그인 폴더 참조는
+	// 마찬가지로 init()에서 한 번만 등록한다 (동기 + I/O 없음 — 모델 확인은 지연 계산).
+	// 등록 계열 함수만 호출하므로 안전하게 완료된다.
 	init(): void {
 		this.collectflow = new CollectAndSave();
 		this.collectflow.embedding = new Embedding();
@@ -66,6 +68,7 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.pca = new PCA();
 		this.visualflow.visual = new Visualization();
 		File.init(this.app.vault, this.manifest.dir ?? '');
+		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
 
