@@ -2,6 +2,8 @@ import { ItemView, WorkspaceLeaf, Notice, ButtonComponent } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { PCAError, type PCAResult } from '../visualize/PCA';
 import { Paper } from '../collect/Paper';
+import { ArxivAPI } from '../collect/API';
+import { PipelineTestModal } from './PipelineTestModal';
 
 export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
 
@@ -93,6 +95,21 @@ export class VisualizationView extends ItemView {
 		});
 		new ButtonComponent(contentEl).setButtonText('실제 임베딩으로 실행 (21편)').onClick(() => {
 			void this.runPcaWithRealEmbedding();
+		});
+		new ButtonComponent(contentEl).setButtonText('실제 arXiv 수집으로 실행').onClick(() => {
+			new PipelineTestModal(
+				this.app,
+				'실제 arXiv 수집 → 임베딩 → PCA',
+				[{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' }],
+				async (values) => {
+					const keyword = values.keyword?.trim();
+					if (!keyword) {
+						new Notice('키워드를 입력하세요');
+						return;
+					}
+					await this.runPcaWithRealArxiv(keyword);
+				},
+			).open();
 		});
 		// 긴 줄이 잘리지 않도록 줄바꿈 — 스타일은 styles.css의 클래스로 둔다 (인라인 스타일은 린트가 막는다)
 		this.pcaResultEl = contentEl.createEl('pre', {
@@ -186,6 +203,82 @@ export class VisualizationView extends ItemView {
 			this.showPcaText(header + describePcaResult(result, elapsed) + '\n\n' + separation);
 		} catch (error) {
 			this.showPcaText(header + describePcaError(error));
+		}
+	}
+
+	// 004(수집) → 003(임베딩) → 005(PCA) 연결 확인용. CollectAndSave.run()이 아직
+	// 스텁이라 그 대신 세 클래스를 여기서 직접 이어 부른다("arXiv API 테스트" 버튼과
+	// 같은 성격 — run() 없이 단독 호출). 실제 ArxivAPI 결과를 넘긴다는 점에서
+	// runPcaWithRealEmbedding()의 makeRealisticPapers()(가짜 논문)와 다르다.
+	//
+	// 단계마다 Notice 팝업 한 줄 + 패널 상세 로그를 함께 남긴다 — 패널을 계속 보고
+	// 있지 않아도 어느 단계에서 멈췄는지 알 수 있게. 팝업은 단계당 1개로 제한한다
+	// (임베딩 루프처럼 반복되는 진행상황은 패널에만 표시 — 매 건마다 띄우면 스팸이 된다).
+	private async runPcaWithRealArxiv(keyword: string): Promise<void> {
+		// 다른 코퍼스이므로 이전 축을 버린다 (다른 버튼들과 동일 관례)
+		this.plugin.visualflow.pca.resetBasis();
+
+		// ── 1. 수집 (004) ──────────────────────────────────────────────
+		this.showPcaText(`arXiv 검색 중... (키워드: ${keyword})`);
+		let papers: Paper[];
+		try {
+			const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
+			papers = await api.SearchBase();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			new Notice(`arXiv 수집 실패: ${message}`);
+			this.showPcaText(`arXiv 수집 실패: ${message}`);
+			return;
+		}
+
+		const citationsKnown = papers.filter((p) => p.citationsKnown).length;
+		new Notice(`arXiv 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})`);
+		this.showPcaText(
+			`arXiv 수집 완료: ${papers.length}편 (키워드: ${keyword})\n` +
+				`인용수 확인: ${citationsKnown}/${papers.length}\n\n임베딩 준비 중...`,
+		);
+
+		// ── 2. 임베딩 (003) ────────────────────────────────────────────
+		const embedding = this.plugin.collectflow.embedding;
+		let installed = false;
+		try {
+			installed = await embedding.isModelInstalled();
+		} catch {
+			// 확인 자체가 실패해도 embed()는 폴백을 돌려주므로 계속 진행한다
+		}
+		const header = `arXiv 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})\n임베딩 모델: ${installed ? '설치됨' : '미설치 — 폴백 벡터가 생성되어 PCA에서 전부 제외됩니다'}\n`;
+
+		const embedStarted = performance.now();
+		for (let i = 0; i < papers.length; i++) {
+			const paper = papers[i]!;
+			// embed()는 절대 throw하지 않는다 — 실패해도 폴백 결과를 돌려준다
+			Object.assign(paper, await embedding.embed(paper.title, paper.abstract));
+			this.showPcaText(`${header}임베딩 중... ${i + 1}/${papers.length}편`);
+		}
+		const embedMs = performance.now() - embedStarted;
+
+		const embeddingSucceeded = papers.filter((p) => p.embeddingSucceeded).length;
+		new Notice(
+			`임베딩 완료: ${embeddingSucceeded}/${papers.length} (모델: ${installed ? '설치됨' : '미설치'})`,
+		);
+		const embedSummary = `${header}임베딩 완료: ${embeddingSucceeded}/${papers.length} 성공, ` +
+			`${(embedMs / 1000).toFixed(1)}초 (편당 ${(embedMs / papers.length).toFixed(0)}ms)\n\nPCA 실행 중...`;
+		this.showPcaText(embedSummary);
+
+		// ── 3. PCA (005) ───────────────────────────────────────────────
+		const pcaStarted = performance.now();
+		try {
+			const result = this.plugin.visualflow.pca.run(papers);
+			const elapsed = performance.now() - pcaStarted;
+			new Notice(`PCA 완료: 좌표 ${result.points.length}개 생성`);
+			this.showPcaText(`${embedSummary}\n\n${describePcaResult(result, elapsed)}`);
+		} catch (error) {
+			new Notice(
+				error instanceof PCAError
+					? `PCA 실패: 유효 논문 ${error.validCount}/${error.inputCount}편 (최소 15편 필요)`
+					: `PCA 실패: ${String(error)}`,
+			);
+			this.showPcaText(`${embedSummary}\n\n${describePcaError(error)}`);
 		}
 	}
 

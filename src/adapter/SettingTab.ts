@@ -3,7 +3,6 @@ import type PaperGraph3D from '../main';
 import { File } from '../common/File';
 import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
-import { ArxivResultModal } from './ArxivResultModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
@@ -113,12 +112,38 @@ function buildMockPaper(index: number): Paper {
 	return paper;
 }
 
-// 날짜 입력(YYYY-MM-DD)을 timestamp(ms)로 변환. 비어있거나 잘못된 값이면 undefined —
-// 어차피 아직 CollectAndSave.run()이 스텁이라 값 자체는 쓰이지 않지만, 구현되는 즉시
-// 그대로 넘길 수 있도록 형식만 맞춰둔다.
+// 날짜 입력(YYYY-MM-DD)을 timestamp(ms)로 변환. 비어있거나 잘못된 값이면 undefined.
 function parseDateInput(value: string): number | undefined {
 	const parsed = Date.parse(value);
 	return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+// "수집" 버튼 공용 실행기. CollectAndSave.run()이 스텁이라 그 대신 ArxivAPI를 직접
+// 호출한다("arXiv API 테스트" 버튼과 같던 성격 — 이제 이 버튼들이 그 역할을 흡수했다).
+// 결과는 Notice로 한 줄 요약(전체 목록은 안 보고 있어도 성공/실패를 알 수 있도록)하고,
+// 전체 Paper[]는 console.log로 남긴다 — 매번 모달을 새로 만드는 대신 개발자 도구에서
+// 펼쳐보는 쪽이 필드가 늘어날 때마다 UI를 고칠 필요가 없어 더 오래간다.
+async function runCollectTest(
+	label: string,
+	fetchPapers: () => Promise<Paper[]>,
+	api: ArxivAPI,
+): Promise<void> {
+	try {
+		const papers = await fetchPapers();
+		const citationsKnown = papers.filter((p) => p.citationsKnown).length;
+		const coverage = api.lastCoverage;
+		const coverageText = coverage
+			? ` / ${coverage.truncated ? '잘림, ' : ''}${new Date(coverage.coveredThrough).toISOString().slice(0, 10)}까지 확인`
+			: '';
+		new Notice(`${label} 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})${coverageText}`);
+		// obsidianmd 린트가 console.log를 금지한다(가이드라인 "Avoid unnecessary logging") —
+		// warn/error/debug만 허용되므로 debug를 쓴다. Notice가 요약이고 이건 전체 상세다.
+		console.debug(`[PaperGraph3D] ${label} 수집 결과`, { papers, coverage });
+	} catch (e) {
+		const message = e instanceof Error ? e.message : String(e);
+		new Notice(`${label} 수집 실패: ${message}`);
+		console.error(`[PaperGraph3D] ${label} 수집 실패`, e);
+	}
 }
 
 // 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들.
@@ -173,13 +198,17 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('수집')
-			.setDesc('입력창에서 값을 받아 CollectAndSave.run()을 모드별로 실행합니다.')
+			.setDesc(
+				'CollectAndSave.run() 없이 ArxivAPI.SearchRecentPaper()/Backfill()을 단독 호출합니다. ' +
+					'저장하지 않습니다. 결과 요약은 알림으로, 전체 내용은 개발자 도구 콘솔(console.log)로 확인하세요.',
+			)
 			.addButton((button) =>
 				button.setButtonText('최근 논문').onClick(() => {
 					new PipelineTestModal(
 						this.app,
 						'수집 테스트 — 최근 논문',
 						[
+							{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' },
 							{
 								key: 'hours',
 								label: '최근 몇 시간',
@@ -189,14 +218,18 @@ export class SettingTab extends PluginSettingTab {
 							},
 						],
 						async (values) => {
-							const hours = Number(values.hours);
-							try {
-								await this.plugin.collectflow.run('recent', {
-									hours: Number.isNaN(hours) ? undefined : hours,
-								});
-							} catch {
-								new Notice('아직 구현되지 않음: 수집(최근 논문)');
+							const keyword = values.keyword?.trim();
+							if (!keyword) {
+								new Notice('키워드를 입력하세요');
+								return;
 							}
+							const hours = Number(values.hours);
+							if (Number.isNaN(hours)) {
+								new Notice('시간을 숫자로 입력하세요');
+								return;
+							}
+							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
+							await runCollectTest('최근 논문', () => api.SearchRecentPaper(hours), api);
 						},
 					).open();
 				}),
@@ -207,48 +240,28 @@ export class SettingTab extends PluginSettingTab {
 						this.app,
 						'수집 테스트 — Backfill',
 						[
+							{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' },
 							{ key: 'from', label: '시작일', desc: 'API.Backfill(from, to)의 from', type: 'date' },
-							{ key: 'to', label: '종료일', desc: 'API.Backfill(from, to)의 to', type: 'date' },
+							{ key: 'to', label: '종료일 (당일 포함)', desc: 'API.Backfill(from, to)의 to', type: 'date' },
 						],
-						async (values) => {
-							try {
-								await this.plugin.collectflow.run('backfill', {
-									from: parseDateInput(values.from ?? ''),
-									to: parseDateInput(values.to ?? ''),
-								});
-							} catch {
-								new Notice('아직 구현되지 않음: 수집(Backfill)');
-							}
-						},
-					).open();
-				}),
-			);
-
-		new Setting(containerEl)
-			.setName('arXiv API 테스트')
-			.setDesc(
-				'CollectAndSave.run() 없이 ArxivAPI.SearchBase()만 단독 호출합니다. ' +
-					'저장하지 않고, 결과 요약을 창으로 띄웁니다(전체 JSON은 클립보드로 복사).',
-			)
-			.addButton((button) =>
-				button.setButtonText('키워드 검색').onClick(() => {
-					new PipelineTestModal(
-						this.app,
-						'arXiv 검색 테스트',
-						[{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' }],
 						async (values) => {
 							const keyword = values.keyword?.trim();
 							if (!keyword) {
 								new Notice('키워드를 입력하세요');
 								return;
 							}
-							try {
-								const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
-								const papers = await api.SearchBase();
-								new ArxivResultModal(this.app, keyword, papers).open();
-							} catch (e) {
-								new Notice(`arXiv 검색 실패: ${e instanceof Error ? e.message : String(e)}`);
+							const from = parseDateInput(values.from ?? '');
+							const toMidnight = parseDateInput(values.to ?? '');
+							if (from === undefined || toMidnight === undefined) {
+								new Notice('시작일/종료일을 올바르게 입력하세요');
+								return;
 							}
+							// 날짜 입력은 자정(00:00)으로 파싱되므로 그대로 넘기면 종료일 당일이
+							// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
+							// "종료일 당일 포함"으로 맞춘다.
+							const to = toMidnight + 24 * 60 * 60 * 1000;
+							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
+							await runCollectTest('Backfill', () => api.Backfill(from, to), api);
 						},
 					).open();
 				}),
