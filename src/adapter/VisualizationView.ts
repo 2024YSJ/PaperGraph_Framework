@@ -97,6 +97,9 @@ export class VisualizationView extends ItemView {
 		new ButtonComponent(contentEl).setButtonText('재사용 검증 (basis)').onClick(() => {
 			this.runPcaReuseCheck();
 		});
+		new ButtonComponent(contentEl).setButtonText('실제 임베딩으로 실행 (21편)').onClick(() => {
+			void this.runPcaWithRealEmbedding();
+		});
 		// 긴 줄이 잘리지 않도록 줄바꿈 — 스타일은 styles.css의 클래스로 둔다 (인라인 스타일은 린트가 막는다)
 		this.pcaResultEl = contentEl.createEl('pre', {
 			text: '아직 실행하지 않았습니다.',
@@ -158,6 +161,49 @@ export class VisualizationView extends ItemView {
 			this.showPcaText(lines.join('\n'));
 		} catch (error) {
 			this.showPcaText(describePcaError(error));
+		}
+	}
+
+	// 실제 임베딩 연결 확인: 제목·초록을 Embedding.embed()에 통과시킨 뒤 그 벡터로 PCA를 돌린다.
+	// 모델이 설치돼 있으면 768차원 SPECTER2 벡터가, 없으면 폴백(해시 2048차원, embeddingSucceeded=false)이
+	// 나오는데 후자는 PCA가 전부 걸러낸다 — 그 경로까지 여기서 확인된다 (스펙 8절 4번).
+	private async runPcaWithRealEmbedding(): Promise<void> {
+		const embedding = this.plugin.collectflow.embedding;
+		const papers = makeRealisticPapers(21, 3);
+
+		let installed = false;
+		try {
+			installed = await embedding.isModelInstalled();
+		} catch {
+			// 확인 자체가 실패해도 embed()는 폴백을 돌려주므로 계속 진행한다
+		}
+		this.showPcaText(
+			`임베딩 모델: ${installed ? '설치됨' : '미설치 — 폴백 벡터가 생성되어 PCA에서 전부 제외됩니다'}\n임베딩 중...`,
+		);
+
+		const embedStarted = performance.now();
+		for (let i = 0; i < papers.length; i++) {
+			const paper = papers[i]!;
+			// embed()는 절대 throw하지 않는다 — 실패해도 폴백 결과를 돌려준다
+			Object.assign(paper, await embedding.embed(paper.title, paper.abstract));
+			this.showPcaText(`임베딩 중... ${i + 1}/${papers.length}편`);
+		}
+		const embedMs = performance.now() - embedStarted;
+
+		const header = [
+			`임베딩 모델: ${installed ? '설치됨' : '미설치'}`,
+			`임베딩 소요: ${(embedMs / 1000).toFixed(1)}초 (${papers.length}편, 편당 ${(embedMs / papers.length).toFixed(0)}ms)`,
+			'',
+		].join('\n');
+
+		const pcaStarted = performance.now();
+		try {
+			const result = this.plugin.visualflow.pca.run(papers);
+			const elapsed = performance.now() - pcaStarted;
+			const separation = describeClusterSeparation(result);
+			this.showPcaText(header + describePcaResult(result, elapsed) + '\n\n' + separation);
+		} catch (error) {
+			this.showPcaText(header + describePcaError(error));
 		}
 	}
 
@@ -288,7 +334,85 @@ function makeSyntheticPapers(
 	return papers;
 }
 
-// 덩어리 분리 확인: sourceId에 심어둔 정답 라벨(syn-c0-…)로 안/밖 거리를 비교한다
+// 실제 임베딩 테스트용 논문. 벡터 대신 제목·초록을 만들고, 임베딩 필드는 비워 둔다
+// (Embedding.embed()의 결과로 채워진다). 주제가 뚜렷이 다른 세 덩어리로 구성해
+// 실제 모델이 내용 차이를 좌표로 반영하는지 확인할 수 있게 한다.
+function makeRealisticPapers(count: number, clusterCount: number): Paper[] {
+	// 주제별 어휘 — 서로 겹치지 않게 골라야 덩어리 분리를 확인할 수 있다
+	const topics = [
+		{
+			name: '언어모델',
+			titles: [
+				'Attention-based Transformers for Multilingual Text Generation',
+				'Scaling Laws in Large Language Model Pretraining',
+				'Instruction Tuning Improves Zero-shot Reasoning in Language Models',
+				'Efficient Tokenization Strategies for Neural Machine Translation',
+				'Retrieval-Augmented Generation for Open-domain Question Answering',
+				'Sparse Attention Reduces Inference Cost in Long-context Transformers',
+				'Cross-lingual Transfer in Multilingual Sentence Encoders',
+			],
+			abstract:
+				'We study transformer language models trained on large text corpora. Our approach improves perplexity and downstream accuracy on natural language understanding benchmarks, including question answering and summarization. We analyze attention patterns, tokenization, and the effect of instruction tuning on zero-shot generalization.',
+		},
+		{
+			name: '컴퓨터비전',
+			titles: [
+				'Convolutional Architectures for Fine-grained Image Classification',
+				'Self-supervised Pretraining for Semantic Segmentation of Satellite Imagery',
+				'Diffusion Models for High-resolution Image Synthesis',
+				'Robust Object Detection under Adverse Weather Conditions',
+				'Vision Transformers with Hierarchical Feature Pyramids',
+				'Depth Estimation from Monocular Video Sequences',
+				'Neural Radiance Fields for Novel View Synthesis of Indoor Scenes',
+			],
+			abstract:
+				'We present a computer vision method for recognizing objects in images and video. The model uses convolutional and vision transformer backbones trained with self-supervised objectives on large image datasets. Experiments on segmentation, detection, and depth estimation benchmarks show improved pixel accuracy and mean intersection over union.',
+		},
+		{
+			name: '강화학습',
+			titles: [
+				'Off-policy Reinforcement Learning for Robotic Manipulation',
+				'Sample-efficient Exploration in Sparse-reward Environments',
+				'Model-based Planning with Learned World Dynamics',
+				'Multi-agent Reinforcement Learning for Cooperative Navigation',
+				'Offline Reinforcement Learning from Suboptimal Demonstrations',
+				'Reward Shaping Accelerates Policy Convergence in Continuous Control',
+				'Sim-to-real Transfer of Locomotion Policies for Legged Robots',
+			],
+			abstract:
+				'We propose a reinforcement learning algorithm for continuous control and robotic manipulation. The agent learns a policy through interaction with the environment, using reward signals and a learned dynamics model for planning. We evaluate sample efficiency, exploration behavior, and sim-to-real transfer on locomotion and manipulation tasks.',
+		},
+	];
+
+	const papers: Paper[] = [];
+	for (let i = 0; i < count; i++) {
+		const cluster = i % clusterCount;
+		const topic = topics[cluster % topics.length]!;
+		const titleIndex = Math.floor(i / clusterCount) % topic.titles.length;
+
+		const paper = new Paper();
+		// describeClusterSeparation이 라벨을 sourceId의 두 번째 조각에서 읽으므로 형식을 맞춘다
+		paper.sourceId = `real-c${cluster}-${String(i).padStart(3, '0')}`;
+		paper.title = topic.titles[titleIndex] ?? topic.titles[0]!;
+		paper.abstract = topic.abstract;
+		paper.authors = [];
+		paper.references = [];
+		paper.publicationDate = `2025-0${(i % 9) + 1}-15`;
+		paper.citationCount = 0;
+		paper.citationsKnown = false;
+		paper.collectedApi = 'synthetic';
+		paper.collectedQuery = { searchType: 'keyword', query: topic.name };
+		// 임베딩 필드는 Embedding.embed()의 결과로 덮어쓴다
+		paper.embedding = [];
+		paper.embeddingModel = '';
+		paper.embeddingSource = '';
+		paper.embeddingSucceeded = false;
+		papers.push(paper);
+	}
+	return papers;
+}
+
+// 덩어리 분리 확인: sourceId에 심어둔 정답 라벨(syn-c0-… / real-c0-…)로 안/밖 거리를 비교한다
 function describeClusterSeparation(result: PCAResult): string {
 	// 덩어리별 중심 좌표
 	const sums = new Map<string, { x: number; y: number; count: number }>();
