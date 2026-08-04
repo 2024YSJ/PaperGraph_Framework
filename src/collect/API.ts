@@ -1,5 +1,5 @@
 import { requestUrl } from 'obsidian';
-import { SearchQuery } from './SearchQuery';
+import { SearchQuery, combineQueries } from './SearchQuery';
 import { Paper } from './Paper';
 
 // 빈 껍데기 — 나머지 필요한 함수는 신빈이 채운다.
@@ -54,16 +54,6 @@ function formatTerm(query: SearchQuery): string {
 // 여러 조건을 AND로 묶은 arXiv search_query 문자열로 변환.
 function buildSearchQuery(querys: SearchQuery[]): string {
 	return querys.map(formatTerm).join(' AND ');
-}
-
-// Paper.collectedQuery는 단일 값이라, AND로 묶인 여러 조건을 하나의 대표 SearchQuery로
-// 합성해 기록한다 (개별 조건 중 어느 것에 "매칭됐는지"를 구분할 필요가 없는 AND 결합이라
-// 이 표현으로 충분하다).
-function buildCollectedQuery(querys: SearchQuery[]): SearchQuery {
-	return {
-		searchType: 'combined',
-		query: querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
-	};
 }
 
 function text(el: Element | null): string {
@@ -137,18 +127,18 @@ export class ArxivAPI implements API {
 	}
 
 	SearchBase(): Promise<Paper[]> {
-		return fetchAndParse(this.buildUrl(), buildCollectedQuery(this.querys));
+		return fetchAndParse(this.buildUrl(), combineQueries(this.querys));
 	}
 
 	SearchRecentPaper(hours: number): Promise<Paper[]> {
 		const to = Date.now();
 		const from = to - hours * 60 * 60 * 1000;
 		const dateFilter = `submittedDate:[${formatArxivDate(from)}+TO+${formatArxivDate(to)}]`;
-		return fetchAndParse(this.buildUrl(dateFilter), buildCollectedQuery(this.querys));
+		return fetchAndParse(this.buildUrl(dateFilter), combineQueries(this.querys));
 	}
 
 	Backfill(from: number, to: number): Promise<Paper[]> {
 		const dateFilter = `submittedDate:[${formatArxivDate(from)}+TO+${formatArxivDate(to)}]`;
-		return fetchAndParse(this.buildUrl(dateFilter), buildCollectedQuery(this.querys));
+		return fetchAndParse(this.buildUrl(dateFilter), combineQueries(this.querys));
 	}
 }
