@@ -1,8 +1,8 @@
-/*
+/* PaperGraph3D 플러그인 스타일 */
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
-
-If your plugin does not need CSS, delete this file.
-
-*/
+/* 시각화 뷰의 PCA 테스트 결과 상자.
+   제외 사유처럼 긴 줄이 오른쪽으로 잘리지 않도록 줄바꿈시킨다. */
+.papergraph3d-pca-result {
+	white-space: pre-wrap;
+	word-break: break-word;
+}
