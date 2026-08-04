@@ -65,7 +65,7 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow = new VisualizationFlow();
 		this.visualflow.pca = new PCA();
 		this.visualflow.visual = new Visualization();
-		File.init(this.app.vault);
+		File.init(this.app.vault, this.manifest.dir ?? '');
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
 
