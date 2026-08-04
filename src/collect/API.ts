@@ -1,5 +1,6 @@
 import { SearchQuery, combineQueries } from './SearchQuery';
 import { Paper } from './Paper';
+import type { Secret } from './Secret';
 import {
 	delay,
 	enrichQuietly,
@@ -259,6 +260,11 @@ const S2_BATCH_CHUNK_SIZE = 500; // S2 배치 엔드포인트의 요청당 최�
 // externalIds를 함께 받는 이유는 아래 fetchCitationBatch의 정렬 검증 때문이다.
 // 이게 없으면 응답이 자기 arXiv id를 안 알려줘서 검증 자체가 불가능하다.
 const S2_BATCH_FIELDS = 'externalIds,citationCount';
+// Secret.json에 등록할 때 쓰는 provider 키. File.ts의 PAPER_URL_BUILDERS가 sourceId
+// prefix로 쓰는 'semanticScholar'와 일부러 맞췄다 — 이 코드베이스에서 S2를 가리키는
+// 이름을 하나로 통일해두면 나중에 헷갈릴 일이 없다. export하는 이유는 호출부(UI)가
+// "키가 등록돼 있는지" 표시할 때 이 문자열을 다시 손으로 안 적게 하기 위함.
+export const S2_SECRET_PROVIDER = 'semanticScholar';
 
 // "arxiv:2501.12345" -> "2501.12345". S2가 못 다루는 출처(arxiv가 아님)면 null.
 function toArxivLocalId(sourceId: string): string | null {
@@ -289,8 +295,13 @@ interface S2BatchElement {
 // 틀리는 종류의 사고다. 그래서 응답이 자기 arXiv id를 밝히면 우리가 물어본 id와 같은지
 // 확인하고, 다르면 그 항목을 버린다. 버려진 논문은 citationsKnown=false로 남아 다음
 // 수집에서 다시 시도된다([3] 정책) — 틀린 값을 넣는 것보다 낫다.
-async function fetchCitationBatch(arxivIds: string[]): Promise<Map<string, number>> {
+//
+// secret에 S2 키가 등록돼 있으면 x-api-key 헤더로 실어 보낸다 — 익명 호출은 S2의 공용
+// rate limit을 다른 모든 익명 사용자와 나눠 쓰므로 429가 잦다. 키가 없으면 지금까지처럼
+// 익명으로 호출한다(throw하지 않음 — 키는 선택 사항).
+async function fetchCitationBatch(arxivIds: string[], secret?: Secret): Promise<Map<string, number>> {
 	const result = new Map<string, number>();
+	const apiKey = secret?.getKey(S2_SECRET_PROVIDER);
 
 	for (const ids of chunk(arxivIds, S2_BATCH_CHUNK_SIZE)) {
 		await enrichQuietly(async () => {
@@ -298,6 +309,7 @@ async function fetchCitationBatch(arxivIds: string[]): Promise<Map<string, numbe
 				url: `${S2_BATCH_ENDPOINT}?fields=${S2_BATCH_FIELDS}`,
 				method: 'POST',
 				contentType: 'application/json',
+				headers: apiKey ? { 'x-api-key': apiKey } : undefined,
 				body: JSON.stringify({ ids: ids.map((id) => `ARXIV:${id}`) }),
 			});
 			const parsed: unknown = response.json;
@@ -324,7 +336,7 @@ async function fetchCitationBatch(arxivIds: string[]): Promise<Map<string, numbe
 
 // [3] 정책 — citationsKnown=false인 논문만 골라 S2에서 citationCount를 채운다. 실패해도
 // 예외를 던지지 않고 citationsKnown=false로 남겨 다음 수집에서 다시 시도되게 한다.
-async function enrichCitations(papers: Paper[]): Promise<void> {
+async function enrichCitations(papers: Paper[], secret?: Secret): Promise<void> {
 	const idToPapers = new Map<string, Paper[]>();
 	for (const paper of papers) {
 		if (paper.citationsKnown) {
@@ -342,7 +354,7 @@ async function enrichCitations(papers: Paper[]): Promise<void> {
 		return;
 	}
 
-	const citations = await fetchCitationBatch(Array.from(idToPapers.keys()));
+	const citations = await fetchCitationBatch(Array.from(idToPapers.keys()), secret);
 	for (const [localId, count] of citations) {
 		for (const paper of idToPapers.get(localId) ?? []) {
 			paper.citationCount = count;
@@ -371,8 +383,13 @@ export class ArxivAPI implements API {
 	// 수집하지 않았으면 undefined. 커서 저장은 run()의 책임이라 여기서는 노출만 한다.
 	lastCoverage: CollectionCoverage | undefined;
 
-	constructor(querys: SearchQuery[] = []) {
+	// S2 인용수 보강에 쓸 API 키 보관소. arXiv 자체 조회는 인증이 필요 없어 안 쓰인다.
+	// 없어도(undefined) 익명 호출로 동작한다 — 키는 선택 사항이지 필수가 아니다.
+	private readonly secret?: Secret;
+
+	constructor(querys: SearchQuery[] = [], secret?: Secret) {
 		this.querys = querys;
+		this.secret = secret;
 	}
 
 	private buildUrl(
@@ -485,7 +502,7 @@ export class ArxivAPI implements API {
 		const papers = window
 			? await this.collectPaged(buildDateFilter(window.from, window.to), window.from, window.to)
 			: await this.collectOnce();
-		await enrichQuietly(() => enrichCitations(papers));
+		await enrichQuietly(() => enrichCitations(papers, this.secret));
 		return papers;
 	}
 

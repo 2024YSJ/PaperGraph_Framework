@@ -2,7 +2,8 @@ import { ItemView, WorkspaceLeaf, Notice, ButtonComponent } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { PCAError, type PCAResult } from '../visualize/PCA';
 import { Paper } from '../collect/Paper';
-import { ArxivAPI } from '../collect/API';
+import { ArxivAPI, S2_SECRET_PROVIDER } from '../collect/API';
+import { File } from '../common/File';
 import { PipelineTestModal } from './PipelineTestModal';
 
 export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
@@ -220,9 +221,10 @@ export class VisualizationView extends ItemView {
 
 		// ── 1. 수집 (004) ──────────────────────────────────────────────
 		this.showPcaText(`arXiv 검색 중... (키워드: ${keyword})`);
+		const secret = await File.readSecret();
 		let papers: Paper[];
 		try {
-			const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
+			const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
 			papers = await api.SearchBase();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -232,7 +234,8 @@ export class VisualizationView extends ItemView {
 		}
 
 		const citationsKnown = papers.filter((p) => p.citationsKnown).length;
-		new Notice(`arXiv 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})`);
+		const s2Text = secret.hasKey(S2_SECRET_PROVIDER) ? ' (S2 키 사용)' : '';
+		new Notice(`arXiv 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})${s2Text}`);
 		this.showPcaText(
 			`arXiv 수집 완료: ${papers.length}편 (키워드: ${keyword})\n` +
 				`인용수 확인: ${citationsKnown}/${papers.length}\n\n임베딩 준비 중...`,

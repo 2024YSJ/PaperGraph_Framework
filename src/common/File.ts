@@ -67,7 +67,12 @@ export class File {
 		return File.writeConfig('Secret.json', secret.toJSON(), (text) => File.obfuscate(text));
 	}
 
-	static readSubscriptions(): Promise<Subscriptions> {
+	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json
+	// 자체엔 secret이 없다(writeSubscriptions가 의도적으로 제외, 아래 참고). readConfig의
+	// revive 콜백은 동기 함수라 그 안에서 await할 수 없으므로, secret은 미리 읽어 클로저로
+	// 넘긴다.
+	static async readSubscriptions(): Promise<Subscriptions> {
+		const secret = await File.readSecret();
 		return File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
@@ -79,15 +84,21 @@ export class File {
 				};
 				const subscriptions = new Subscriptions();
 				subscriptions.updateTime = data.updateTime ?? 0;
+				subscriptions.secret = secret;
 				subscriptions.apis = (data.apis ?? []).map((api) =>
 					File.createApi(
 						api.apiName,
 						(api.querys ?? []).map((query) => File.migrateSearchType(query)),
+						secret,
 					),
 				);
 				return subscriptions;
 			},
-			() => new Subscriptions(),
+			() => {
+				const subscriptions = new Subscriptions();
+				subscriptions.secret = secret;
+				return subscriptions;
+			},
 		);
 	}
 
@@ -118,10 +129,11 @@ export class File {
 	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
 	// 평범한 객체({ apiName, querys })를 메서드가 살아있는 API 인스턴스로 복원할 때 쓴다
 	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md). 새 API는 case를 한 줄 추가한다.
-	static createApi(apiName: string, querys: SearchQuery[] = []): API {
+	// secret은 선택 사항 — 없으면 각 API 구현체가 알아서 익명으로 동작한다.
+	static createApi(apiName: string, querys: SearchQuery[] = [], secret?: Secret): API {
 		switch (apiName) {
 			case 'arxiv':
-				return new ArxivAPI(querys);
+				return new ArxivAPI(querys, secret);
 			default:
 				throw new Error(`Unknown apiName: ${apiName}`);
 		}

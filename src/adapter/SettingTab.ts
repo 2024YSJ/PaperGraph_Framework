@@ -6,7 +6,7 @@ import { FileTestModal } from './FileTestModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
-import { ArxivAPI } from '../collect/API';
+import { ArxivAPI, S2_SECRET_PROVIDER } from '../collect/API';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
 // 단어 수 분포(실측: 최소 63, 최대 302, 평균 193단어)를 참고해 문서마다 문장 수를
@@ -127,6 +127,7 @@ async function runCollectTest(
 	label: string,
 	fetchPapers: () => Promise<Paper[]>,
 	api: ArxivAPI,
+	usedS2Key: boolean,
 ): Promise<void> {
 	try {
 		const papers = await fetchPapers();
@@ -135,7 +136,8 @@ async function runCollectTest(
 		const coverageText = coverage
 			? ` / ${coverage.truncated ? '잘림, ' : ''}${new Date(coverage.coveredThrough).toISOString().slice(0, 10)}까지 확인`
 			: '';
-		new Notice(`${label} 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})${coverageText}`);
+		const s2Text = usedS2Key ? ' (S2 키 사용)' : '';
+		new Notice(`${label} 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})${coverageText}${s2Text}`);
 		// obsidianmd 린트가 console.log를 금지한다(가이드라인 "Avoid unnecessary logging") —
 		// warn/error/debug만 허용되므로 debug를 쓴다. Notice가 요약이고 이건 전체 상세다.
 		console.debug(`[PaperGraph3D] ${label} 수집 결과`, { papers, coverage });
@@ -228,8 +230,14 @@ export class SettingTab extends PluginSettingTab {
 								new Notice('시간을 숫자로 입력하세요');
 								return;
 							}
-							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
-							await runCollectTest('최근 논문', () => api.SearchRecentPaper(hours), api);
+							const secret = await File.readSecret();
+							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
+							await runCollectTest(
+								'최근 논문',
+								() => api.SearchRecentPaper(hours),
+								api,
+								secret.hasKey(S2_SECRET_PROVIDER),
+							);
 						},
 					).open();
 				}),
@@ -260,8 +268,14 @@ export class SettingTab extends PluginSettingTab {
 							// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 							// "종료일 당일 포함"으로 맞춘다.
 							const to = toMidnight + 24 * 60 * 60 * 1000;
-							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
-							await runCollectTest('Backfill', () => api.Backfill(from, to), api);
+							const secret = await File.readSecret();
+							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
+							await runCollectTest(
+								'Backfill',
+								() => api.Backfill(from, to),
+								api,
+								secret.hasKey(S2_SECRET_PROVIDER),
+							);
 						},
 					).open();
 				}),
