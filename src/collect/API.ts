@@ -25,7 +25,7 @@ const ARXIV_FIELD_PREFIX: Record<string, string> = {
 	category: 'cat',
 };
 
-const ARXIV_ENDPOINT = 'http://export.arxiv.org/api/query';
+const ARXIV_ENDPOINT = 'https://export.arxiv.org/api/query';
 const MAX_RESULTS = 50;
 
 // timestamp(ms) -> arXiv submittedDate 필터가 요구하는 "YYYYMMDDHHMM"(UTC) 포맷.
