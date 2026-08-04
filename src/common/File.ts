@@ -120,9 +120,15 @@ export class File {
 	static writeSubscriptions(subscriptions: Subscriptions): Promise<void> {
 		// secret은 별도 Secret.json(난독화)에만 저장한다. Subscriptions.json에 함께 넣으면
 		// API 키가 평문으로 중복 저장되므로 제외한다.
+		//
+		// ⚠️ apis를 그대로 넘기면 안 된다. API 구현체는 Secret 참조나 캐시(lastCoverage 등)를
+		// 인스턴스 필드로 들고 있을 수 있고, TypeScript의 private은 컴파일 타임 표시일 뿐이라
+		// JSON.stringify가 전부 직렬화한다 — 실제로 ArxivAPI에 secret을 넘기기 시작하자
+		// 이 파일에 API 키가 평문으로 찍혔다. 저장할 필드를 여기서 명시적으로 골라내
+		// 구현체가 어떤 필드를 갖든 새지 않게 한다(복원에 필요한 건 apiName과 querys뿐이다).
 		return File.writeConfig('Subscriptions.json', {
 			updateTime: subscriptions.updateTime,
-			apis: subscriptions.apis,
+			apis: subscriptions.apis.map((api) => ({ apiName: api.apiName, querys: api.querys })),
 		});
 	}
 

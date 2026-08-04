@@ -506,6 +506,16 @@ export class ArxivAPI implements API {
 	private async collect(window?: { from: number; to: number }): Promise<Paper[]> {
 		this.lastCoverage = undefined;
 
+		// [1] 정책 — 숫자가 아닌 구간은 여기서 끊는다. NaN을 그냥 흘려보내면
+		// `from >= to` 비교가 false로 통과하고(NaN 비교는 항상 false) formatArxivDate가
+		// "NaNNaNNaNNaNNaN"을 만들어, 깨진 쿼리가 arXiv까지 나간 뒤 "arXiv rejected the
+		// query"라는 엉뚱한 메시지로 실패한다. 원인을 호출부에서 바로 알 수 있게 한다.
+		if (window && (!Number.isFinite(window.from) || !Number.isFinite(window.to))) {
+			throw new Error(
+				`ArxivAPI: invalid date window (from=${window.from}, to=${window.to})`,
+			);
+		}
+
 		// 빈/역전 구간(시계 되돌림, 잘못 준 Backfill 인자 등)은 요청할 게 없다. 굳이 호출해
 		// arXiv에 빈 범위를 물어보는 대신 즉시 끝내고, 커서는 요청한 끝까지 인정한다.
 		if (window && window.from >= window.to) {
