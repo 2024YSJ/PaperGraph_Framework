@@ -14,7 +14,11 @@
 - 모델 파일(양자화 ONNX ~108MB + WASM 런타임 ~21MB, 합쳐서 ~130MB급)은 플러그인 본체(`main.js`)에 번들하지 않는다. Obsidian은 릴리스에서 `main.js`/`manifest.json`/`styles.css`만 설치하므로, 이 크기를 번들에 넣으면 매 시작마다 파싱해야 하는 130MB+ 파일이 된다.
 - 대신 **이 저장소(`2024YSJ/PaperGraph_Framework`)의 새 GitHub Release**에서 사용자가 설정 탭의 "설치" 버튼을 눌러야만 다운로드한다(자동 다운로드 없음 — `AGENTS.md`의 "로컬/오프라인 우선, 필수적일 때만 네트워크 요청, 사용자에게 무엇이 왜 필요한지 공개" 원칙). 예전 프로젝트(`2024YSJ/PaperGraph3D`)의 릴리스를 재사용하지 않고 소유권을 이 저장소로 옮긴다.
 - **태그**: `model-specter2-q8-v1`. 에셋 6개(flat 이름, GitHub Release 에셋은 `/`를 못 씀): `config.json`, `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `model_quantized.onnx`(로컬 저장 경로만 `onnx/` 하위), `ort-wasm-simd-threaded.jsep.wasm`.
-- ⚠️ **모델 변환·양자화·업로드는 코딩 작업 범위 밖의 수동 작업이다.** `specter2_base`+adapter를 ONNX로 병합·변환하고 8bit 양자화해서 fast-tokenizer JSON과 함께 위 6개 파일을 실제로 이 태그에 업로드하는 건 사람이 별도로 해야 한다. 코드는 이 상수들을 가리키도록 먼저 작성하지만, 릴리스가 실제로 올라가기 전까지 `installModel()`은 당연히 실패한다.
+- **(2026-08-04 갱신) 실제로 변환·양자화해서 업로드 완료함.** 처음 이 문서를 쓸 때는 "코딩 작업 범위 밖의 수동 작업"으로 남겨뒀지만, 이후 세션에서 Python(torch/transformers/adapters/optimum/onnxruntime)으로 `allenai/specter2_base` + `allenai/specter2`(proximity adapter, load_as="proximity")를 로드·병합해 ONNX로 export하고, `onnxruntime.quantization.quantize_dynamic`(QInt8, per_channel+reduce_range)로 8bit 양자화한 뒤, `config.json`/`tokenizer.json`/`tokenizer_config.json`/`special_tokens_map.json`(전부 `allenai/specter2_base`에서 그대로 가져옴, 변환 불필요)과 함께 실제로 `model-specter2-q8-v1` 태그에 업로드했다. WASM은 프로젝트의 `node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm`(package.json이 고정한 버전과 정확히 동일본)을 그대로 사용.
+  - 검증: fp32 ONNX ↔ PyTorch 원본 코사인 유사도 1.0000(오차 ~2e-6), int8 양자화 ↔ fp32 코사인 유사도 0.9972, 서로 다른 두 논문이 실제로 다른 벡터를 내는지(0.926, 동일하지 않음)까지 확인. 릴리스 다운로드 URL도 실제로 302→200 정상 응답하는 것 확인함.
+  - ⚠️ **모델 변환 파이프라인 자체는 저장소에 스크립트로 커밋돼 있지 않다** — 그때그때 스크래치패드에서 실행하고 지웠다. 나중에 모델을 다시 바꾸거나 재양자화해야 하면 이 문서에 적힌 절차(라이브러리 목록, 로딩 방법, 검증 지표)를 참고해 같은 과정을 새로 짜야 한다. 재현 가능한 스크립트로 저장소에 남겨두는 게 다음 개선 과제.
+  - ⚠️ Python 3.14 + Windows 환경에서 스크래치패드처럼 경로가 깊은 곳에 venv를 만들면 `ml_dtypes`/`onnx` 로딩이 `WinError 206`(MAX_PATH 초과)로 실패한다 — 짧은 경로(`C:\...`)에 venv를 만들 것.
+- ⚠️ **지금은 릴리스가 올라가 있으므로**, `installModel()`이 실패한다면 "에셋이 안 올라가 있어서"가 아니라 다른 원인(네트워크, Obsidian CSP, wasm 로딩 등)이다 — 아래 "다음 담당자 참고" 갱신본 참고.
 - ⚠️ WASM 바이너리는 `package.json`에 고정한 `@huggingface/transformers` 버전과 정확히 짝이 맞아야 한다 — 버전이 바뀌면 WASM도 재검증/재업로드해야 한다.
 
 ### 파일 구조: `src/collect/Embedding.ts` 단일 파일
@@ -38,6 +42,7 @@
 
 - `installModel()`의 진행률 콜백을 기존의 단순 `0~1` 숫자에서 **`AssetProgress{fileIndex, fileCount, fileName, bytesWritten}`**로 업그레이드한다. 파일 6개를 순차 다운로드하는데, "몇 번째 파일을 받고 있는지"를 보여주는 게 사용자에게 더 유용하다.
 - `SettingTab.ts`의 UI는 기존 "확인"/"설치" 2버튼 구조를 그대로 유지한다(예전 프로젝트의 "설치 상태에 따라 버튼 하나가 바뀌는" 방식으로 통합하지 않기로 함 — 이번 세션에서 논의 후 결정). "확인" 버튼은 `isModelInstalled()` 결과를 Notice로 보여주도록 실동작화하고, "설치" 버튼은 클릭 시 비활성화 후 하나의 지속 Notice에 파일별 진행률을 갱신하며, 완료/실패 후 재활성화한다.
+- **(2026-08-04 추가) "테스트 (100개)" 버튼**: 같은 "임베딩 모델" 섹션에 세 번째 버튼으로 추가. 초록 길이가 1~20배로 달라지는 모의 논문 100편(`LENGTH_BUCKETS`의 세 버킷을 전부 밟고, `INFERENCES_PER_SESSION`(64)을 넘겨 세션 재생성까지 exercise하도록 의도적으로 설계)을 만들어 각각 `embed()`를 호출하고, 성공/실패 카운트를 진행률 Notice로 보여준다. 문서는 `embedding_test/` 폴더(Vault 루트, `PaperGraph3D/` 트리 밖)에 `.md`+`.json`(Paper 형식)으로 저장한다 — `File.writePaper`가 쓰는 날짜 기반 경로 대신 임의 폴더에 저장하는 `File.writeTestPaper(paper, folder)`를 새로 추가해서 씀(`readPapersByYear`는 `PaperGraph3D/<year>/`만 보므로 이 테스트 파일은 정식 수집 데이터와 섞이지 않는다).
 
 ### Paper 필드 매핑: `EmbeddingResult`가 4필드에 정확히 대응
 
@@ -62,8 +67,35 @@
 - **5차 방어 — 서킷브레이커 + 60초 쿨다운**: 그래도 계속 실패하면(런타임 자체가 죽었을 가능성) 남은 문서마다 매번 세션을 재구성하며 헛돌지 않고 즉시 폴백으로 전환한다. 위에서 정한 쿨다운 덕분에 일정 시간 뒤 자동으로 회복을 재시도한다.
 - **최후 보증**: 5단계가 전부 실패해도 `embed()`는 절대 throw하지 않고 baseline 해시 임베딩(FNV-1a 기반, 2048차원, 항상 계산 가능)을 반환한다. 즉 메모리 문제가 아무리 심해도 수집/저장 자체가 멈추거나 이후 문서가 통째로 스킵되는 일은 없다 — 그 문서들은 `embeddingSucceeded: false`로만 표시되고, 나중에 재임베딩(이번 범위 밖, 향후 기능으로 고려)으로 복구할 여지를 남긴다.
 
+## 버그 수정 (2026-08-04, "테스트 (100개)" 버튼 작업 중 발견)
+
+100편 연속 임베딩을 실제로 돌려보면서 발견해 고친 것 2건:
+
+1. **`Embedding.specter2Embedding()`: 재시도 세션 미해제.** 첫 시도가 실패해 새 세션으로 한 번 더 재시도했는데 그 재시도마저 실패하면, 그 "재시도용" 세션이 `this.session`에 캐시된 채로 예외가 그대로 던져졌다. 실패한 세션이 즉시 해제되지 않고, 다음 `embed()` 호출이 또 실패해야만(그 안의 `resetPipeline()`이 실행돼야만) 정리되는 구조 — 무한정 쌓이는 누수는 아니지만 "실패 시 즉시 메모리 반납"이라는 5단계 방어 설계 의도에 어긋났다. 재시도마저 실패하면 그 자리에서 바로 `resetPipeline()`을 호출하도록 수정.
+2. **`SettingTab.ts` 테스트 버튼: 문서 이중 저장.** 임베딩 전에 한 번, 후에 한 번 같은 문서를 저장하고 있었다. `.md`는 애초에 임베딩 벡터를 담지 않으므로(frontmatter에 안 들어감) 첫 저장은 무의미했고, 같은 sourceId로 재실행하면 "임베딩 전" 저장이 이전 실행의 정상 임베딩 결과를 일시적으로 빈 값으로 덮어썼다가 두 번째 저장에서야 복구하는 구조라, 그 사이 중단되면(Obsidian 종료 등) 이전에 잘 저장돼 있던 임베딩이 빈 값으로 남을 위험이 있었다. 임베딩 완료 후 한 번만 저장하도록 수정.
+
+두 수정 모두 기존 mock-obsidian 기반 동작 테스트(21개) 재통과 확인 후 커밋(`46996fc`).
+
+## 모델 교체 용이성 평가 (2026-08-04)
+
+"이후 다른 개발자가 이 모델을 쉽게 다른 걸로 바꿀 수 있는가"를 판단해 기록해둔다. **결론: 상수 몇 개만 바꾸는 수준은 아니고, 부분적으로만 쉽다.**
+
+**쉬운 부분:**
+- 모델 식별 관련 상수(`RELEASE_OWNER`/`RELEASE_REPO`/`MODEL_RELEASE_TAG`/`MODEL_ID`/`MODEL_FILES`/`SPECTER2_EMBEDDING_MODEL`/`SPECTER2_EMBEDDING_DIM`/`dtype:'q8'`)가 전부 `Embedding.ts` 한 파일 상단에 모여 있다 — 다른 파일을 뒤질 필요는 없다.
+- `Paper.embeddingModel`은 자유 문자열이라 어떤 모델 id를 넣든 스키마가 안 깨진다. 세션 관리/버킷팅/재시도/서킷브레이커/baseline 폴백 같은 범용 로직은 모델이 뭐든 그대로 재사용된다 — 이 부분은 이미 모델 비의존적으로 짜여 있다.
+
+**쉽지 않은 부분:**
+1. **재임베딩(마이그레이션) 경로가 아예 없다.** 모델을 바꾸면 이미 수집된 논문들의 `embeddingModel`이 새 canonical id와 안 맞게 되는데, 이걸 감지하거나 다시 임베딩해주는 코드가 지금 저장소엔 없다(정확히 이 기능이 이번 대화 초반에 설계까지 했다가 "당장은 specter2 하나로 고정" 결정으로 취소된 부분이다). 상수만 바꿔서 배포하면 기존 코퍼스는 조용히 옛 벡터를 낀 채로 방치된다 — 이게 가장 큰 구조적 공백이다.
+2. **입력 포맷/풀링 전략이 SPECTER2 전용으로 하드코딩돼 있다.** `` `${title}[SEP]${abstract}` `` 포맷과 CLS 토큰(첫 768개 값) 풀링은 BERT류 인코더+SPECTER2 학습 방식을 전제한 것 — mean pooling을 쓰거나 다른 입력 템플릿이 필요한 모델로 바꾸면 상수 변경이 아니라 `embedOnce`/`specter2Embedding` 내부 로직을 실제로 고쳐야 한다.
+3. **함수/상수 이름 자체가 "specter2"로 박혀 있다** (`specter2Embedding`, `SPECTER2_EMBEDDING_MODEL` 등). 값만 바꾸면 이름과 실제 내용이 어긋나므로, 제대로 하려면 리네임까지 같이 해야 한다 — 작지만 실수하기 쉬운 지점(호출부 여러 곳).
+4. **`SPECTER2_EMBEDDING_DIM` assert가 안전장치이자 함정이다.** `embedOnce`가 `hiddenSize !== SPECTER2_EMBEDDING_DIM`이면 throw하므로 차원이 다른 새 모델을 넣고 이 상수를 안 바꾸면 명확한 에러 대신 **매 논문이 조용히 baseline 폴백으로 빠지고 Notice 하나만 뜬다** — 놓치기 쉬운 실패 모드.
+5. **모델 변환 파이프라인이 재현 가능한 스크립트로 저장소에 없다.** 위 "모델 배포" 절에 적었듯 이번에 쓴 변환 절차는 스크래치패드에서 실행하고 버렸다 — 다음 모델 교체 때 이 문서를 보고 처음부터 다시 짜야 한다.
+
+**요약**: "어떤 모델을 쓸지" 자체를 바꾸는 건(상수 몇 개 + 로직 일부) 몇 시간짜리 작업이지만, "바꾼 뒤 기존 코퍼스를 정합성 있게 유지하는" 재임베딩 기능이 없다는 게 진짜 병목이다. 나중에 모델을 다시 바꿀 계획이 생기면, 이번에 취소했던 provider 전환+재임베딩 설계(대화 로그에 남아있음)를 다시 꺼내 구현하는 게 순서상 맞다.
+
 ## 다음 담당자 참고
 
 - `CollectAndSave.run()`을 구현할 담당자는 `Embedding.embed(title, abstract)`를 루프 안에서 호출해 `Object.assign(paper, result)`로 붙이면 된다. `resetCircuitBreaker()`는 배치 시작 시 호출하면 좋지만 필수는 아니다(쿨다운이 자동으로 처리).
-- `installModel()`이 실패한다면 십중팔구 GitHub Release(`model-specter2-q8-v1`)에 아직 에셋이 안 올라가 있는 것이다 — 위 "모델 배포" 절 참고.
+- `installModel()`이 실패한다면 **더 이상 "릴리스에 에셋이 안 올라가 있어서"가 아니다** — 실제로 업로드·검증까지 끝났다(위 "모델 배포" 절 참고). 실패한다면 네트워크, Obsidian CSP, wasm 로딩 등 다른 원인을 봐야 한다.
 - `isDesktopOnly: true`는 팀 전체 영향 결정이므로, 모바일 지원 논의가 다시 나오면 이 문서를 먼저 참고할 것.
+- 모델을 다른 것으로 바꾸고 싶다면 위 "모델 교체 용이성 평가" 절을 먼저 읽을 것 — 특히 재임베딩 경로가 없다는 점.
