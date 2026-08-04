@@ -3,9 +3,11 @@ import type PaperGraph3D from '../main';
 import { File } from '../common/File';
 import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
+import { ArxivResultModal } from './ArxivResultModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
+import { ArxivAPI } from '../collect/API';
 
 // 날짜 입력(YYYY-MM-DD)을 timestamp(ms)로 변환. 비어있거나 잘못된 값이면 undefined —
 // 어차피 아직 CollectAndSave.run()이 스텁이라 값 자체는 쓰이지 않지만, 구현되는 즉시
@@ -111,6 +113,36 @@ export class SettingTab extends PluginSettingTab {
 								});
 							} catch {
 								new Notice('아직 구현되지 않음: 수집(Backfill)');
+							}
+						},
+					).open();
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName('arXiv API 테스트')
+			.setDesc(
+				'CollectAndSave.run() 없이 ArxivAPI.SearchBase()만 단독 호출합니다. ' +
+					'저장하지 않고, 결과 요약을 창으로 띄웁니다(전체 JSON은 클립보드로 복사).',
+			)
+			.addButton((button) =>
+				button.setButtonText('키워드 검색').onClick(() => {
+					new PipelineTestModal(
+						this.app,
+						'arXiv 검색 테스트',
+						[{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' }],
+						async (values) => {
+							const keyword = values.keyword?.trim();
+							if (!keyword) {
+								new Notice('키워드를 입력하세요');
+								return;
+							}
+							try {
+								const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }]);
+								const papers = await api.SearchBase();
+								new ArxivResultModal(this.app, keyword, papers).open();
+							} catch (e) {
+								new Notice(`arXiv 검색 실패: ${e instanceof Error ? e.message : String(e)}`);
 							}
 						},
 					).open();
