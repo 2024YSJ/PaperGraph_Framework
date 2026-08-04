@@ -7,23 +7,96 @@ import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
 
-// 임베딩 스트레스 테스트용 모의 논문 생성. 초록 길이를 문서마다 1~20배로 바꿔서
-// LENGTH_BUCKETS([128,256,512]) 세 버킷을 전부 실제로 밟아보게 한다 — 100편은
-// INFERENCES_PER_SESSION(64)을 넘겨 세션 재생성 경로까지 exercise한다
+// 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
+// 단어 수 분포(실측: 최소 63, 최대 302, 평균 193단어)를 참고해 문서마다 문장 수를
+// 크게 흔들어서 그 범위를 폭넓게 커버한다. 고정 문장을 반복하는 대신 어휘/문형을 섞어
+// 실제 논문처럼 매번 다른 텍스트가 나오게 한다 — 반복 문자열은 토큰 분포가 지나치게
+// 단조로워 LENGTH_BUCKETS([128,256,512])는 밟아도 어휘 다양성은 검증하지 못했다.
+// 100편은 INFERENCES_PER_SESSION(64)도 넘겨 세션 재생성 경로까지 exercise한다
 // (docs/devLog/003-embedding-model.md의 메모리 방어 5단계 검증 목적).
-const MOCK_SENTENCE =
-	'This mock abstract paragraph discusses neural embeddings, citation graphs, and retrieval benchmarks in scientific literature. ';
 const EMBEDDING_TEST_FOLDER = 'embedding_test';
+
+const MOCK_TOPIC_WORDS = [
+	'neural', 'network', 'transformer', 'attention', 'embedding', 'representation',
+	'optimization', 'gradient', 'encoder', 'decoder', 'convolutional', 'recurrent',
+	'graph', 'citation', 'retrieval', 'benchmark', 'dataset', 'evaluation', 'inference',
+	'generalization', 'regularization', 'pretraining', 'tokenization', 'multimodal',
+	'reasoning', 'alignment', 'robustness', 'scalability', 'efficiency', 'clustering',
+	'classification', 'segmentation', 'detection', 'generation', 'sampling',
+	'distillation', 'quantization', 'sparsity', 'latent', 'variational', 'adversarial',
+	'contrastive', 'zero-shot', 'few-shot', 'transfer', 'domain', 'language', 'vision',
+	'speech', 'reinforcement', 'policy', 'reward', 'agent', 'planning', 'memory',
+	'context', 'sequence', 'prediction', 'uncertainty', 'scaling', 'architecture',
+	'annotation', 'supervision', 'curriculum', 'augmentation', 'interpretability',
+] as const;
+
+const MOCK_SENTENCE_TEMPLATES = [
+	'We propose a novel {a} approach for {b} that improves {c} across multiple {d} tasks.',
+	'This work investigates the relationship between {a} and {b} in large-scale {c} systems.',
+	'Recent advances in {a} have enabled significant progress on {b}, yet {c} remains challenging.',
+	'Our method combines {a} with {b} to achieve state-of-the-art {c} on standard {d} benchmarks.',
+	'We introduce a {a} framework that jointly optimizes {b} and {c} without additional {d}.',
+	'Experiments on {a} and {b} datasets demonstrate consistent improvements in {c} and {d}.',
+	'We analyze how {a} affects {b} under varying levels of {c}, revealing new insights into {d}.',
+	'Unlike prior {a} methods, our approach leverages {b} to better capture {c} in {d} settings.',
+] as const;
+
+const MOCK_TITLE_TEMPLATES = [
+	'{a} {b}: A {c} Approach to {d}',
+	'Towards {a} {b} via {c} {d}',
+	'Rethinking {a} for {b} with {c} {d}',
+	'{a}-{b}: Scalable {c} for {d}',
+] as const;
+
+function pickMockWord(seed: number): string {
+	const index = Math.abs(seed) % MOCK_TOPIC_WORDS.length;
+	const word = MOCK_TOPIC_WORDS[index];
+	if (word === undefined) {
+		throw new Error('unreachable: MOCK_TOPIC_WORDS index out of range');
+	}
+	return word;
+}
+
+function fillTemplate(template: string, seed: number): string {
+	let slot = 0;
+	return template.replace(/\{[a-d]\}/g, () => {
+		slot += 1;
+		return pickMockWord(seed * 7 + slot * 131);
+	});
+}
+
+function buildMockAbstract(index: number): string {
+	// 4~18문장(템플릿당 대략 15~20단어) -> 대략 60~330단어, 실측 분포(63~302, 평균 193)를
+	// 넉넉히 덮는다. index마다 다른 시드를 써서 같은 문서라도 문장마다 다른 어휘가 나온다.
+	const sentenceCount = 4 + (index % 15);
+	const sentences: string[] = [];
+	for (let s = 0; s < sentenceCount; s += 1) {
+		const template = MOCK_SENTENCE_TEMPLATES[(index * 13 + s) % MOCK_SENTENCE_TEMPLATES.length];
+		if (template === undefined) {
+			throw new Error('unreachable: MOCK_SENTENCE_TEMPLATES index out of range');
+		}
+		sentences.push(fillTemplate(template, index * 97 + s * 29));
+	}
+	return sentences.join(' ');
+}
+
+function buildMockTitle(index: number): string {
+	const template = MOCK_TITLE_TEMPLATES[index % MOCK_TITLE_TEMPLATES.length];
+	if (template === undefined) {
+		throw new Error('unreachable: MOCK_TITLE_TEMPLATES index out of range');
+	}
+	const filled = fillTemplate(template, index * 11);
+	return filled.replace(/(^|[\s-])([a-z])/g, (_match, sep: string, ch: string) => sep + ch.toUpperCase());
+}
 
 // Paper 필드를 전부 채운 완전한 객체로 만든다 — File.writeTestPaper가 그대로
 // .json(원본)+.md(뷰)로 저장할 수 있어야 하므로 FileTestModal의 테스트 Paper 생성
 // 방식과 동일하게 맞춘다.
 function buildMockPaper(index: number): Paper {
-	const repeats = 1 + (index % 20);
 	const paper = new Paper();
-	paper.title = `Mock Paper ${index + 1}: A Study of Embedding Stability`;
+	paper.title = `Mock Paper ${index + 1}: ${buildMockTitle(index)}`;
 	paper.authors = [];
-	paper.abstract = MOCK_SENTENCE.repeat(repeats);
+	paper.abstract = buildMockAbstract(index);
 	paper.sourceId = `test:embedding-mock-${index + 1}`;
 	paper.references = [];
 	paper.publicationDate = '';
