@@ -18,21 +18,54 @@ import { requestUrl, type RequestUrlParam, type RequestUrlResponse } from 'obsid
 
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 3_000; // arXiv가 권장하는 호출 간격이자 S2 재시도 간격
+const MAX_RETRY_AFTER_MS = 30_000; // 서버가 비상식적으로 긴 Retry-After를 줘도 여기서 자른다
+
+// 일시적 장애로 보고 재시도할 상태코드.
+// - 429: rate limit (주로 Semantic Scholar)
+// - 503: arXiv가 과부하/스로틀 시 쓰는 코드. 429만 재시도하면 arXiv 스로틀이 곧바로
+//        "수집 실패"가 되어버린다.
+// - 502/504: 게이트웨이 계열 일시 장애
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 
 export function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// [1] 정책. 429(rate limit)만 재시도하고, 그 외 실패는 전부 throw한다.
-// requestUrl은 기본적으로 비-2xx에서 예외를 던져 429까지 즉시 실패로 만들기 때문에
+// 서버가 Retry-After로 대기 시간을 알려주면 그걸 따른다(초 단위 또는 HTTP-date).
+// 해석할 수 없거나 범위를 벗어나면 undefined를 반환해 호출자가 기본 간격을 쓰게 한다.
+function parseRetryAfter(headers: Record<string, string> | undefined): number | undefined {
+	if (!headers) {
+		return undefined;
+	}
+	// 헤더 키의 대소문자는 구현마다 다르므로 소문자로 맞춰 조회한다.
+	const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === 'retry-after');
+	const raw = entry?.[1]?.trim();
+	if (!raw) {
+		return undefined;
+	}
+
+	const seconds = Number(raw);
+	const ms = Number.isFinite(seconds) ? seconds * 1_000 : new Date(raw).getTime() - Date.now();
+	if (!Number.isFinite(ms) || ms <= 0) {
+		return undefined;
+	}
+	return Math.min(ms, MAX_RETRY_AFTER_MS);
+}
+
+// [1] 정책. 일시적 장애(RETRYABLE_STATUS)만 재시도하고, 그 외 실패는 전부 throw한다.
+// requestUrl은 기본적으로 비-2xx에서 예외를 던져 429/503까지 즉시 실패로 만들기 때문에
 // throw:false로 받아 상태코드를 직접 판정한다.
 export async function requestWithRetry(param: RequestUrlParam): Promise<RequestUrlResponse> {
+	let lastStatus = 0;
+
 	for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
-		if (attempt > 0) {
-			await delay(RETRY_DELAY_MS);
-		}
 		const response = await requestUrl({ ...param, throw: false });
-		if (response.status === 429) {
+		if (RETRYABLE_STATUS.has(response.status)) {
+			lastStatus = response.status;
+			// 마지막 시도였다면 더 기다릴 필요 없이 루프를 빠져나간다.
+			if (attempt < MAX_ATTEMPTS - 1) {
+				await delay(parseRetryAfter(response.headers) ?? RETRY_DELAY_MS);
+			}
 			continue;
 		}
 		if (response.status >= 400) {
@@ -40,7 +73,10 @@ export async function requestWithRetry(param: RequestUrlParam): Promise<RequestU
 		}
 		return response;
 	}
-	throw new Error(`${param.url} -> rate-limited (429) after ${MAX_ATTEMPTS} attempts`);
+
+	throw new Error(
+		`${param.url} -> HTTP ${lastStatus} (temporary) after ${MAX_ATTEMPTS} attempts`,
+	);
 }
 
 // [1] 정책. 응답이 정상 XML인지 확인한다. 차단 페이지나 잘린 응답을 파싱하면 entry가

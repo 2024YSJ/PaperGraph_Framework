@@ -67,7 +67,12 @@ export class File {
 		return File.writeConfig('Secret.json', secret.toJSON(), (text) => File.obfuscate(text));
 	}
 
-	static readSubscriptions(): Promise<Subscriptions> {
+	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json
+	// 자체엔 secret이 없다(writeSubscriptions가 의도적으로 제외, 아래 참고). readConfig의
+	// revive 콜백은 동기 함수라 그 안에서 await할 수 없으므로, secret은 미리 읽어 클로저로
+	// 넘긴다.
+	static async readSubscriptions(): Promise<Subscriptions> {
+		const secret = await File.readSecret();
 		return File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
@@ -79,13 +84,37 @@ export class File {
 				};
 				const subscriptions = new Subscriptions();
 				subscriptions.updateTime = data.updateTime ?? 0;
+				subscriptions.secret = secret;
 				subscriptions.apis = (data.apis ?? []).map((api) =>
-					File.createApi(api.apiName, api.querys ?? []),
+					File.createApi(
+						api.apiName,
+						(api.querys ?? []).map((query) => File.migrateSearchType(query)),
+						secret,
+					),
 				);
 				return subscriptions;
 			},
-			() => new Subscriptions(),
+			() => {
+				const subscriptions = new Subscriptions();
+				subscriptions.secret = secret;
+				return subscriptions;
+			},
 		);
+	}
+
+	// 이름이 바뀐 searchType을 현재 값으로 옮긴다. 설정탭이 'domain'을 저장하던 시절의
+	// Subscriptions.json이 그대로 남아 있으면, 복원된 구독으로 수집할 때 arXiv 쪽에서
+	// "Unknown searchType"으로 throw해 해당 구독 전체가 실패한다. 읽는 시점에 한 번
+	// 정규화해 두면 저장 파일이 다음 writeSubscriptions에서 자연스럽게 갱신된다.
+	private static readonly SEARCH_TYPE_ALIASES: Record<string, string> = {
+		domain: 'category',
+	};
+
+	// typeof 검사는 프로토타입 체인 방어다. searchType이 'toString' 같은 값이면 맵에서
+	// 함수가 잡히는데, truthy라서 그대로 searchType에 대입돼버린다.
+	private static migrateSearchType(query: SearchQuery): SearchQuery {
+		const renamed = File.SEARCH_TYPE_ALIASES[query.searchType];
+		return typeof renamed === 'string' ? { ...query, searchType: renamed } : query;
 	}
 
 	static writeSubscriptions(subscriptions: Subscriptions): Promise<void> {
@@ -100,10 +129,11 @@ export class File {
 	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
 	// 평범한 객체({ apiName, querys })를 메서드가 살아있는 API 인스턴스로 복원할 때 쓴다
 	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md). 새 API는 case를 한 줄 추가한다.
-	static createApi(apiName: string, querys: SearchQuery[] = []): API {
+	// secret은 선택 사항 — 없으면 각 API 구현체가 알아서 익명으로 동작한다.
+	static createApi(apiName: string, querys: SearchQuery[] = [], secret?: Secret): API {
 		switch (apiName) {
 			case 'arxiv':
-				return new ArxivAPI(querys);
+				return new ArxivAPI(querys, secret);
 			default:
 				throw new Error(`Unknown apiName: ${apiName}`);
 		}
@@ -129,7 +159,18 @@ export class File {
 	// .json(진실 원본)과 .md(Obsidian 뷰)를 함께 쓴다. 재작성 시 기존 createdAt / 사용자
 	// 자유 본문을 보존한다.
 	static async writePaper(paper: Paper): Promise<void> {
-		const base = File.resolvePaperPath(paper);
+		await File.writePaperAt(paper, File.resolvePaperPath(paper));
+	}
+
+	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
+	// 바로 아래에 저장한다. .json+.md 형식과 upsert(생성 또는 갱신) 동작은 writePaper와
+	// 동일 — readPapersByYear는 PaperGraph3D/<year>/ 접두사만 보므로 이 폴더 아래 파일은
+	// 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용 SettingTab 버튼에서 사용).
+	static async writeTestPaper(paper: Paper, folder: string): Promise<void> {
+		await File.writePaperAt(paper, `${folder}/${File.baseNoteName(paper.title, paper.sourceId)}`);
+	}
+
+	private static async writePaperAt(paper: Paper, base: string): Promise<void> {
 		const jsonPath = `${base}.json`;
 		const mdPath = `${base}.md`;
 
