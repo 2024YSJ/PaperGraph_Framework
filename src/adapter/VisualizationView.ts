@@ -97,7 +97,11 @@ export class VisualizationView extends ItemView {
 		new ButtonComponent(contentEl).setButtonText('재사용 검증 (basis)').onClick(() => {
 			this.runPcaReuseCheck();
 		});
-		this.pcaResultEl = contentEl.createEl('pre', { text: '아직 실행하지 않았습니다.' });
+		// 긴 줄이 잘리지 않도록 줄바꿈 — 스타일은 styles.css의 클래스로 둔다 (인라인 스타일은 린트가 막는다)
+		this.pcaResultEl = contentEl.createEl('pre', {
+			text: '아직 실행하지 않았습니다.',
+			cls: 'papergraph3d-pca-result',
+		});
 	}
 
 	// 기본 실행: 합성 60편으로 fit — 지표가 정상 범위인지 본다
@@ -176,28 +180,52 @@ function describePcaResult(result: PCAResult, elapsedMs: number): string {
 		.slice(0, 3)
 		.map((p) => `  ${p.sourceId}: (${p.x.toFixed(3)}, ${p.y.toFixed(3)})`)
 		.join('\n');
+	// 평균은 fit 실행에서만 0에 가까워야 한다. 재사용 실행은 fit 당시의 평균으로 중심을 잡으므로,
+	// 그 뒤 논문이 늘거나 줄면 0에서 벗어나는 것이 정상이다 (스펙 5절). 안내를 안 붙이면 버그로 오해받는다
+	const meanNote = result.didFit
+		? '(0에 가까워야 정상)'
+		: '(재사용 실행이라 0에서 벗어나는 것이 정상 — 데이터가 fit 시점에서 이동한 정도)';
 	return [
 		`입력 ${validCount + excludedTotal}편 → 유효 ${validCount}편`,
 		`제외: malformed ${ex.malformed} · embeddingFailed ${ex.embeddingFailed} · modelMismatch ${ex.modelMismatch} · invalidVector ${ex.invalidVector} · duplicateId ${ex.duplicateId}`,
 		`기준 모델: ${result.usedModel} (${result.dimension}차원)`,
 		`설명 분산: 1축 ${percent(m.explainedAxis1)} + 2축 ${percent(m.explainedAxis2)} = ${percent(m.explainedTotal)}`,
 		`직교성: ${m.orthogonality.toExponential(2)} (0에 가까워야 정상)`,
-		`결과 평균: x ${m.meanX.toExponential(2)} · y ${m.meanY.toExponential(2)}`,
-		`수렴: ${m.converged ? '완료' : '상한 도달'} (${m.iterations}회 반복)`,
-		`basis: ${result.didFit ? 'fit 수행' : '재사용'} (${result.fitReason})`,
+		`결과 평균: x ${m.meanX.toExponential(2)} · y ${m.meanY.toExponential(2)} ${meanNote}`,
+		`수렴: ${describeConvergence(m.converged, m.iterations, result.didFit)}`,
+		`basis: ${result.didFit ? `fit 수행 (${result.fitReason})` : '재사용 — 기존 좌표 고정'}`,
 		`좌표 앞 3건:\n${samples}`,
 		`실행 시간: ${elapsedMs.toFixed(1)}ms`,
 	].join('\n');
 }
 
+// 재사용 실행은 멱반복을 돌지 않으므로 "0회 반복"이 정상이다 — 그대로 보여주면 수렴 실패로 읽힌다
+function describeConvergence(converged: boolean, iterations: number, didFit: boolean): string {
+	if (!didFit) {
+		return '해당 없음 (재사용이라 반복 계산을 하지 않음)';
+	}
+	return converged ? `완료 (${iterations}회 반복)` : `상한 도달 (${iterations}회) — 축이 덜 안정적일 수 있음`;
+}
+
 function describePcaError(error: unknown): string {
 	if (error instanceof PCAError) {
 		const ex = error.excluded;
-		return [
+		const lines = [
 			`PCA 에러: ${error.message}`,
 			`입력 ${error.inputCount}편 → 유효 ${error.validCount}편 (기준 모델: ${error.usedModel || '없음'})`,
 			`제외: malformed ${ex.malformed} · embeddingFailed ${ex.embeddingFailed} · modelMismatch ${ex.modelMismatch} · invalidVector ${ex.invalidVector} · duplicateId ${ex.duplicateId}`,
-		].join('\n');
+		];
+		// 임베딩이 실패한 논문이 제외의 대부분이면 원인은 대개 "모델 미설치"다.
+		// Embedding.embed()는 모델이 없을 때 throw 대신 폴백 벡터(embeddingSucceeded=false)를
+		// 돌려주므로, 그 상태로 수집하면 모든 논문이 여기서 걸러진다. 숫자만 보면 원인을 알 수 없어 안내한다.
+		if (ex.embeddingFailed > 0 && ex.embeddingFailed >= error.inputCount / 2) {
+			lines.push(
+				'',
+				'대부분이 임베딩 실패로 제외됐습니다. 설정 탭에서 임베딩 모델이 설치돼 있는지 확인해 주세요 — ' +
+					'모델이 없으면 논문이 임시 임베딩으로 저장되고, 그 벡터는 그래프에 쓸 수 없습니다.',
+			);
+		}
+		return lines.join('\n');
 	}
 	return `예상하지 못한 오류: ${String(error)}`;
 }
