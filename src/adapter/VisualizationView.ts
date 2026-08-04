@@ -1,6 +1,6 @@
 import { ItemView, WorkspaceLeaf, Notice, ButtonComponent } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { PCAError, type PCABasis, type PCAResult } from '../visualize/PCA';
+import { PCAError, type PCAResult } from '../visualize/PCA';
 import { Paper } from '../collect/Paper';
 
 export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
@@ -80,16 +80,10 @@ export class VisualizationView extends ItemView {
 	// ─────────────────────────────────────────────────────────────
 
 	private pcaResultEl: HTMLElement | null = null;
-	private lastPcaPapers: Paper[] = []; // 임시 — 재사용 검증에서 기존 코퍼스로 쓴다
-	private lastPcaResult: PCAResult | null = null;
-	private lastPcaBasis: PCABasis | null = null;
 
 	private renderPcaSection(contentEl: HTMLElement): void {
 		contentEl.createEl('p', {
-			text: '합성 벡터로 PCA를 실행하고 검증 지표를 확인합니다. (임시 — 임베딩 구현 전까지)',
-		});
-		new ButtonComponent(contentEl).setButtonText('합성 데이터로 실행 (60편)').onClick(() => {
-			this.runPcaSynthetic();
+			text: 'PCA를 실행하고 검증 지표를 확인합니다. 합성 데이터 관련 항목은 임시입니다.',
 		});
 		new ButtonComponent(contentEl).setButtonText('덩어리 검증 (3덩어리)').onClick(() => {
 			this.runPcaClusterCheck();
@@ -107,26 +101,11 @@ export class VisualizationView extends ItemView {
 		});
 	}
 
-	// 기본 실행: 합성 60편으로 fit — 지표가 정상 범위인지 본다
-	private runPcaSynthetic(): void {
-		const papers = makeSyntheticPapers(60, 3, 1);
-		const started = performance.now();
-		try {
-			const result = this.plugin.visualflow.pca.run(papers);
-			const elapsed = performance.now() - started;
-			// 재사용 검증이 이어서 쓸 수 있게 보관해 둔다
-			this.lastPcaPapers = papers;
-			this.lastPcaResult = result;
-			this.lastPcaBasis = result.basis;
-			this.showPcaText(describePcaResult(result, elapsed));
-		} catch (error) {
-			this.showPcaText(describePcaError(error));
-		}
-	}
-
 	// 덩어리 검증: 정답(3덩어리)을 아는 입력을 넣고 결과도 3덩어리로 갈라지는지 수치로 확인 (스펙 7절)
 	private runPcaClusterCheck(): void {
 		const papers = makeSyntheticPapers(60, 3, 2);
+		// 다른 코퍼스다 — 이전 축을 물려받으면 "PCA가 덩어리를 가르는가"를 확인하는 게 아니게 된다
+		this.plugin.visualflow.pca.resetBasis();
 		const started = performance.now();
 		try {
 			const result = this.plugin.visualflow.pca.run(papers);
@@ -138,25 +117,26 @@ export class VisualizationView extends ItemView {
 		}
 	}
 
-	// 재사용 검증: 논문을 20% 미만으로 추가하고 basis를 넘겨, 기존 좌표가 고정되는지 확인 (스펙 9절)
+	// 재사용 검증: 같은 코퍼스로 fit한 뒤 논문을 20% 미만으로 추가해 다시 돌려,
+	// 기존 좌표가 그대로인지 확인한다 (스펙 9절). 축은 PCA가 내부 캐시로 들고 있으므로
+	// 넘길 것이 없다. 앞서 어떤 버튼을 눌렀든 결과가 같도록 기준을 여기서 직접 만든다.
 	private runPcaReuseCheck(): void {
-		if (this.lastPcaResult === null || this.lastPcaBasis === null) {
-			new Notice("먼저 '합성 데이터로 실행'을 눌러 basis를 만들어 주세요");
-			return;
-		}
+		const pca = this.plugin.visualflow.pca;
+		const base = makeSyntheticPapers(60, 3, 1);
 		// 5편 추가 = 60편 대비 8.3% 증가 → 재사용 경로를 탄다 (20% 이상이면 refit이 정상)
-		const extra = makeSyntheticPapers(5, 3, 3, this.lastPcaPapers.length);
-		const combined = [...this.lastPcaPapers, ...extra];
-		const started = performance.now();
+		const extra = makeSyntheticPapers(5, 3, 3, base.length);
 		try {
-			const result = this.plugin.visualflow.pca.run(combined, this.lastPcaBasis);
+			pca.resetBasis();
+			const before = pca.run(base);
+			const started = performance.now();
+			const after = pca.run([...base, ...extra]);
 			const elapsed = performance.now() - started;
-			const shift = maxCoordinateShift(this.lastPcaResult, result);
+			const shift = maxCoordinateShift(before, after);
 			const lines = [
-				describePcaResult(result, elapsed),
+				describePcaResult(after, elapsed),
 				'',
 				`재사용 검증: 논문 ${extra.length}편 추가 후 기존 좌표 최대 이동 = ${shift.toExponential(2)}`,
-				shift < 1e-9 ? '→ 기존 점 고정 확인 ✅' : '→ 좌표가 움직였습니다 — basis 재사용 경로 확인 필요 ❌',
+				shift < 1e-9 ? '→ 기존 점 고정 확인 ✅' : '→ 좌표가 움직였습니다 — 재사용 경로 확인 필요 ❌',
 			];
 			this.showPcaText(lines.join('\n'));
 		} catch (error) {
@@ -170,6 +150,8 @@ export class VisualizationView extends ItemView {
 	private async runPcaWithRealEmbedding(): Promise<void> {
 		const embedding = this.plugin.collectflow.embedding;
 		const papers = makeRealisticPapers(21, 3);
+		// 합성 데이터와는 다른 코퍼스이므로 이전 축을 버린다
+		this.plugin.visualflow.pca.resetBasis();
 
 		let installed = false;
 		try {

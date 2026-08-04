@@ -36,8 +36,8 @@ export interface PCAExcluded {
 	duplicateId: number;
 }
 
-// fit이 찾은 축 일체. 다음 호출에 그대로 넘기면 fit을 건너뛰어
-// 기존 논문의 좌표가 고정된다 (스펙 9절)
+// fit이 찾은 축 일체. PCA가 내부에 보관했다가 다음 호출에서 재사용하며,
+// 그 덕에 논문이 추가돼도 기존 점이 제자리에 남는다 (스펙 9절)
 export interface PCABasis {
 	mean: number[]; // 중심화에 쓴 평균 벡터 — 빠지면 같은 축으로도 투영이 어긋난다
 	axis1: number[]; // 제1주성분
@@ -54,9 +54,9 @@ export interface PCAResult {
 	excluded: PCAExcluded;
 	usedModel: string; // 기준으로 삼은 임베딩 모델
 	dimension: number; // 사용한 벡터 차원 수
-	basis: PCABasis; // 이번 실행에 쓰인(또는 새로 만든) 축 — 호출 측이 보관했다가 다음 호출에 넘긴다
+	basis: PCABasis; // 이번 실행에 쓰인(또는 새로 만든) 축 — 무엇으로 그렸는지 확인용
 	didFit: boolean; // 이번 실행에서 축을 새로 계산했는가
-	fitReason: 'basis 없음' | 'basis 손상' | '모델 변경' | '편수 20% 이상 변동' | '재사용';
+	fitReason: 'basis 없음' | '모델 변경' | '편수 20% 이상 변동' | '재사용';
 }
 
 // 좌표를 만들 수 없을 때 던지는 에러. 수치를 필드로 들고 있어
@@ -95,10 +95,8 @@ const MAX_ITERATIONS = 1000;
 const CONVERGENCE_EPS = 1e-10;
 // 직교화 후 벡터가 사실상 영벡터인지(rank-1) 판정하는 임계값
 const DEGENERATE_EPS = 1e-12;
-// basis 축 검증(단위길이·직교) 허용오차 (스펙 9절)
-const AXIS_TOLERANCE = 1e-6;
-// fit 당시 대비 유효 편수가 이 비율 이상 증감하면 자동 refit (스펙 9절)
-const REFIT_GROWTH_RATIO = 0.2;
+// fit 당시 대비 유효 편수가 이 비율 이상 증감하면 자동 refit — 늘어날 때와 줄어들 때 모두 (스펙 9절)
+const REFIT_COUNT_CHANGE_RATIO = 0.2;
 // "전체 분산 0" 판정용 상대 임계값. 완전히 같은 벡터들도 부동소수점 때문에
 // (같은 값 n개의 평균조차 1ulp 어긋난다) 분산이 정확한 0이 아니라 ~1e-29로 나오므로,
 // 데이터 크기(평균 제곱 노름) 대비 상대 비교로 판정한다
@@ -109,8 +107,15 @@ const RELATIVE_ZERO_VARIANCE = 1e-24;
 // ─────────────────────────────────────────────────────────────
 
 export class PCA {
-	// 동기·무상태. 입력 배열과 Paper 객체는 읽기만 하고 변형하지 않는다 (스펙 3절).
-	run(papers: Paper[], basis?: PCABasis): PCAResult {
+	// 세션 캐시 — 직전 실행에서 얻은 축을 보관했다가 다음 호출에 재사용한다.
+	// 덕분에 호출 측이 아무것도 하지 않아도 논문이 추가될 때 기존 점이 제자리에 남는다.
+	// 플러그인이 꺼지면 사라지는 메모리 전용이며, 재시작 후 좌표까지 유지하는 것은
+	// 지금 범위가 아니다(파일 저장이 필요하고 그건 PCA가 할 수 없는 일이다).
+	private cachedBasis?: PCABasis;
+
+	// 동기 실행. 입력 배열과 Paper 객체는 읽기만 하고 변형하지 않는다 (스펙 3절).
+	// 축은 내부 캐시에서만 가져온다 — 호출 측은 그냥 부르기만 하면 좌표가 고정된다.
+	run(papers: Paper[]): PCAResult {
 		// 1. 복사본을 sourceId 사전순으로 정렬 — 입력 순서에서 결과를 분리한다 (스펙 4절 결정성).
 		//    localeCompare는 로케일에 따라 순서가 달라지므로 코드포인트 비교를 쓴다.
 		const sorted = [...papers].sort((a, b) => {
@@ -195,8 +200,10 @@ export class PCA {
 			throw new PCAError('모든 논문의 임베딩이 동일해 주성분을 정의할 수 없습니다', errorInfo);
 		}
 
-		// 4. basis 판정 — 재사용할지 새로 fit할지는 PCA가 스스로 정한다 (스펙 9절)
-		const decision = decideFit(basis, usedModel, dimension, valid.length);
+		// 4. basis 판정 — 재사용할지 새로 fit할지는 PCA가 스스로 정한다 (스펙 9절).
+		//    재사용으로 판정됐을 때만 값이 있다 (캐시가 비어 있으면 판정이 fit이므로).
+		const decision = decideFit(this.cachedBasis, usedModel, dimension, valid.length);
+		const reuseBasis = decision.fit ? undefined : this.cachedBasis;
 
 		let mean: Float64Array;
 		let axis1: Float64Array;
@@ -205,7 +212,7 @@ export class PCA {
 		let converged = true;
 		let resultBasis: PCABasis;
 
-		if (decision.fit || basis === undefined) {
+		if (reuseBasis === undefined) {
 			// fit: 멱반복으로 두 주성분을 새로 계산한다
 			mean = currentMean;
 			const centered = rows.map((row) => subtract(row, mean));
@@ -224,11 +231,11 @@ export class PCA {
 				fittedExplainedTotal: 0, // 아래에서 지표 계산 후 채운다
 			};
 		} else {
-			// 재사용: 저장된 평균·축으로 투영만 한다 — 기존 논문의 좌표가 고정된다
-			mean = Float64Array.from(basis.mean);
-			axis1 = Float64Array.from(basis.axis1);
-			axis2 = Float64Array.from(basis.axis2);
-			resultBasis = basis;
+			// 재사용: 캐시된 평균·축으로 투영만 한다 — 기존 논문의 좌표가 고정된다
+			mean = Float64Array.from(reuseBasis.mean);
+			axis1 = Float64Array.from(reuseBasis.axis1);
+			axis2 = Float64Array.from(reuseBasis.axis2);
+			resultBasis = reuseBasis;
 		}
 
 		// 5. 투영 → (x, y)
@@ -269,6 +276,9 @@ export class PCA {
 			resultBasis.fittedExplainedTotal = metrics.explainedTotal;
 		}
 
+		// 이번에 쓴 축을 세션 캐시에 남긴다 — 다음 호출에서 좌표가 고정된다
+		this.cachedBasis = resultBasis;
+
 		return {
 			points,
 			metrics,
@@ -279,6 +289,15 @@ export class PCA {
 			didFit: decision.fit,
 			fitReason: decision.reason,
 		};
+	}
+
+	// 세션 캐시를 비운다. 다음 실행은 반드시 새로 fit한다.
+	//
+	// 코퍼스를 바꿔서 볼 때 쓴다 — 예를 들어 "최근 5년"과 "전체"를 오가는 경우, 캐시가 하나뿐이라
+	// 앞서 본 코퍼스의 축이 남아 있다. 편수가 크게 달라지면 decideFit()이 알아서 refit하지만,
+	// 편수가 비슷한 다른 코퍼스라면 판별할 단서가 없으므로 호출 측이 명시적으로 비워줘야 한다.
+	resetBasis(): void {
+		this.cachedBasis = undefined;
 	}
 }
 
@@ -343,63 +362,15 @@ function decideFit(
 	if (basis === undefined) {
 		return { fit: true, reason: 'basis 없음' };
 	}
-	if (!isBasisIntact(basis)) {
-		return { fit: true, reason: 'basis 손상' };
-	}
 	if (basis.usedModel !== usedModel || basis.dimension !== dimension) {
 		return { fit: true, reason: '모델 변경' };
 	}
-	if (Math.abs(validCount - basis.fittedCount) / basis.fittedCount >= REFIT_GROWTH_RATIO) {
+	// 기준은 fit 당시 편수다 — 재사용할 때 갱신하지 않으므로 기준선이 조금씩 밀리지 않는다.
+	// fittedCount는 최소 편수 검사를 통과한 뒤에만 설정되므로 0이 될 수 없다.
+	if (Math.abs(validCount - basis.fittedCount) / basis.fittedCount >= REFIT_COUNT_CHANGE_RATIO) {
 		return { fit: true, reason: '편수 20% 이상 변동' };
 	}
 	return { fit: false, reason: '재사용' };
-}
-
-// basis가 온전한지 검사한다. 파일 저장이 연결되면 손상된 basis는 반드시 온다 (스펙 9절).
-// 예외: axis2가 전부 0이면 rank-1 basis(일직선 데이터의 fit 결과)로 정상 취급한다.
-function isBasisIntact(basis: PCABasis): boolean {
-	if (!Number.isInteger(basis.dimension) || basis.dimension < 1) {
-		return false;
-	}
-	if (!Number.isFinite(basis.fittedCount) || basis.fittedCount < 1) {
-		return false;
-	}
-	if (typeof basis.usedModel !== 'string' || !Number.isFinite(basis.fittedExplainedTotal)) {
-		return false;
-	}
-	if (
-		!isFiniteNumberArray(basis.mean, basis.dimension) ||
-		!isFiniteNumberArray(basis.axis1, basis.dimension) ||
-		!isFiniteNumberArray(basis.axis2, basis.dimension)
-	) {
-		return false;
-	}
-	const axis1 = Float64Array.from(basis.axis1);
-	const axis2 = Float64Array.from(basis.axis2);
-	if (Math.abs(norm(axis1) - 1) > AXIS_TOLERANCE) {
-		return false;
-	}
-	if (!isAllZero(axis2)) {
-		if (Math.abs(norm(axis2) - 1) > AXIS_TOLERANCE) {
-			return false;
-		}
-		if (Math.abs(dot(axis1, axis2)) > AXIS_TOLERANCE) {
-			return false;
-		}
-	}
-	return true;
-}
-
-function isFiniteNumberArray(values: number[], length: number): boolean {
-	if (!Array.isArray(values) || values.length !== length) {
-		return false;
-	}
-	for (const value of values) {
-		if (typeof value !== 'number' || !Number.isFinite(value)) {
-			return false;
-		}
-	}
-	return true;
 }
 
 // ─────────────────────────────────────────────────────────────
