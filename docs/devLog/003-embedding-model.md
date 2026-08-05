@@ -113,9 +113,52 @@
 4. **`LOCAL_MODEL_DIM`·`LOCAL_MODEL_DTYPE`·`MODEL_FILES`의 양자화 파일명 세트를 함께 갱신해야 한다.** 차원 불일치는 이제 명확한 에러 메시지로 구분되지만, dtype/파일명이 서로 안 맞는 경우(예: `LOCAL_MODEL_DTYPE`은 `'q8'`인데 실제로는 fp16 파일을 올린 경우)는 여전히 일반 실패로만 나타난다 — 이번 리팩터링 범위 밖.
 5. **재임베딩 경로는 여전히 없다.** 위 "모델 교체 용이성 평가"에서 이미 지적한 대로, 모델을 바꿔도 기존 코퍼스는 자동으로도 수동으로도 마이그레이션되지 않는다 — 이건 이름/구조 리팩터링으로 해결되는 문제가 아니라 별도 기능(취소된 provider 전환+재임베딩 설계)이 필요하다.
 
+## 2026-08-05 변경: baseline 폴백 제거 — 모델 없으면 임베딩 진행 안 함
+
+기존 설계는 모델이 설치 안 됐거나 추론이 실패하면 해시 기반 baseline(FNV-1a TF, 2048차원,
+`local-hashtf-v1-d2048`)으로 조용히 폴백해서 `embed()`가 절대 throw하지 않도록 했다. 사용자
+요구로 이 설계를 뒤집었다: **가짜 벡터가 실제 임베딩 공간(SPECTER2, 768차원)과 뒤섞여
+저장되는 것 자체를 막아야 하므로, baseline은 코드에서 완전히 제거하고 모델이 없으면
+임베딩이 아예 진행되지 않아야 한다.**
+
+- **`Embedding.embed()`는 이제 항상 throw로 실패를 알린다.** 모델 미설치, 서킷브레이커
+  쿨다운 중, 추론 실패(재시도까지 실패) 세 경우 모두 baseline을 계산하는 대신 `Error`를
+  던진다. `computeBaselineEmbedding()`/`tokenize()`/`fnv1a()`와 `BASELINE_EMBEDDING_DIM`/
+  `BASELINE_EMBEDDING_MODEL` 상수는 전부 삭제했다.
+- **`EmbeddingResult`는 이제 항상 성공만 표현한다** — `embed()`가 정상 반환하면
+  `embeddingSucceeded`는 항상 `true`다(기존에도 `runLocalModel()`은 항상 `true`를 세팅했고,
+  `false`는 baseline 경로에서만 나왔다).
+- **"임베딩 실패를 Paper에 어떻게 반영할지"는 Embedding 클래스가 아니라 호출자(수집
+  플로우) 책임으로 옮겼다.** `Paper.embeddingSucceeded`/`embeddingSource` 필드 자체는
+  스키마에서 제거하지 않았다(schemaVersion 변경 없음) — 다만 값을 채우는 주체가 바뀌었을
+  뿐이다. 실패 시 호출자는 `embed()`가 던진 에러를 catch해서 (a) 그 논문의 저장을
+  건너뛰거나 (b) `embedding=[]`, `embeddingModel=''`, `embeddingSource=''`,
+  `embeddingSucceeded=false`로 명시적으로 채워 저장하는 두 선택지 중 골라야 한다. 이건
+  `FileTestModal.ts`가 이미 쓰던 "빈 값으로 직접 채우는" 패턴과 같다 — 새로운 개념이
+  아니라 Embedding 클래스가 대신 해주던 걸 호출자로 옮긴 것뿐이다.
+- **`SettingTab.ts`의 "테스트 (100개)" 버튼에 반영 완료 (선택지 (b) 채택, 2026-08-05
+  중간에 (a)→(b)로 정정)**: 처음엔 클릭 전 `isModelInstalled()`로 게이팅하고 개별 실패는
+  저장을 건너뛰는(a) 방식으로 구현했으나, 두 가지 이유로 최종적으로 (b)로 바꿨다.
+  1. 사전 게이팅을 없애 모델이 없어도 루프를 실제로 돌려 `embed()`가 진짜 throw하고
+     그 자리의 `try/catch`가 이를 실제로 catch하는지 눈으로 확인할 수 있게 했다(처음 실패
+     시에만 실제 에러 메시지를 Notice로 띄움 — 스팸 방지).
+  2. 실패한 논문을 저장 자체에서 빼면(스킵) "이 논문이 임베딩에 실패했다"는 사실이 어디에도
+     안 남는다. 대신 `buildMockPaper()`가 미리 채워둔 빈 값(`embedding=[]`,
+     `embeddingModel=''`, `embeddingSource=''`, `embeddingSucceeded=false`)을 그대로
+     `File.writeTestPaper`로 저장한다 — 가짜 벡터(baseline)는 여전히 만들지 않지만, 실패
+     사실 자체는 디스크에 명시적으로 남아 나중에 재임베딩 대상을 찾을 수 있다. 이건
+     `FileTestModal.ts`가 이미 쓰던 "빈 값으로 직접 채우는" 패턴과 동일하다.
+- **`CollectAndSave.run()`은 여전히 스텁이라 동작 변경은 없지만**, 실제 구현 시에도 이
+  원칙(baseline 계산 금지, 위 (a)/(b) 중 선택 — `SettingTab`은 (b) 채택)을 지켜야 한다.
+- **재임베딩 경로는 여전히 없다.** `embeddingSucceeded=false` + `embedding=[]`로 저장된
+  논문을 감지해 모델이 다시 정상화됐을 때 자동/수동으로 재시도해주는 기능은 아직 없다
+  (위 "모델 교체 용이성 평가"에서 지적한 공백과 같은 종류) — 다음 우선순위 후보로 남겨둔다.
+- 저장소에 `Embedding` 관련 자동 테스트가 없어(확인함) 이번 변경은 수동 검증(빌드 통과 +
+  설정 탭에서 모델 미설치/설치 두 상태로 테스트 버튼 실행)으로만 확인했다.
+
 ## 다음 담당자 참고
 
-- `CollectAndSave.run()`을 구현할 담당자는 `Embedding.embed(title, abstract)`를 루프 안에서 호출해 `Object.assign(paper, result)`로 붙이면 된다. `resetCircuitBreaker()`는 배치 시작 시 호출하면 좋지만 필수는 아니다(쿨다운이 자동으로 처리).
+- `CollectAndSave.run()`을 구현할 담당자는 `Embedding.embed(title, abstract)`를 루프 안에서 `try/catch`로 감싸 호출해야 한다 — 성공하면 `Object.assign(paper, result)`로 붙이고, 실패(throw)하면 위 "baseline 폴백 제거" 절의 (a)/(b) 중 하나를 선택해 처리한다(baseline 계산 금지). `resetCircuitBreaker()`는 배치 시작 시 호출하면 좋지만 필수는 아니다(쿨다운이 자동으로 처리).
 - `installModel()`이 실패한다면 **더 이상 "릴리스에 에셋이 안 올라가 있어서"가 아니다** — 실제로 업로드·검증까지 끝났다(위 "모델 배포" 절 참고). 실패한다면 네트워크, Obsidian CSP, wasm 로딩 등 다른 원인을 봐야 한다.
 - `isDesktopOnly: true`는 팀 전체 영향 결정이므로, 모바일 지원 논의가 다시 나오면 이 문서를 먼저 참고할 것.
 - 모델을 다른 것으로 바꾸고 싶다면 위 "모델 교체 용이성 평가" + "로컬 모델 교체 조건" 절을 먼저 읽을 것 — 손댈 지점은 `buildModelInput()`/`poolEmbedding()`/"로컬 모델 설정" 상수 블록 셋으로 좁혀뒀지만, 재임베딩 경로가 없다는 점은 여전하다.
