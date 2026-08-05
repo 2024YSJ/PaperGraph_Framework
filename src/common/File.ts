@@ -157,7 +157,11 @@ export class File {
 		const papers: Paper[] = [];
 		for (const file of files) {
 			const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
-			papers.push(Object.assign(new Paper(), wrapper.paper));
+			const paper = Object.assign(new Paper(), wrapper.paper);
+			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
+			paper.collectedApis ??= [];
+			paper.collectedQueries ??= [];
+			papers.push(paper);
 		}
 		return papers;
 	}
@@ -181,9 +185,14 @@ export class File {
 		const mdPath = `${base}.md`;
 
 		const existingJson = await File.readVaultText(jsonPath);
-		const createdAt = existingJson
-			? (JSON.parse(existingJson) as StoredPaperFile).createdAt
-			: Date.now();
+		const existing = existingJson ? (JSON.parse(existingJson) as StoredPaperFile) : null;
+		const createdAt = existing ? existing.createdAt : Date.now();
+
+		// 같은 sourceId(같은 파일 경로)로 다른 구독이 다시 써도, 먼저 저장된 구독의
+		// collectedApis/collectedQueries가 이번 값으로 덮이지 않도록 병합한다. 병합 없이
+		// 그대로 덮으면 "이 논문이 어느 구독들에 걸렸는가"라는 정보가 매번 마지막에 쓴
+		// 구독 하나로 조용히 줄어든다.
+		File.mergeCollectionSources(paper, existing?.paper);
 
 		const existingMd = await File.readVaultText(mdPath);
 		const userBody = existingMd ? File.parseUserBody(existingMd) : '';
@@ -196,6 +205,39 @@ export class File {
 		};
 		await File.writeVaultText(jsonPath, JSON.stringify(wrapper, null, 2));
 		await File.writeVaultText(mdPath, File.renderNote(paper, userBody));
+	}
+
+	// paper.collectedApis/collectedQueries에 existingPaper가 이미 가지고 있던 (api, query)
+	// 쌍을 합친다(paper를 직접 수정). 두 배열은 같은 인덱스가 한 쌍이라는 불변식을 유지해야
+	// 하므로, 항상 이 함수를 통해서만 합친다 — 각자 밀거나 당기면 인덱스가 어긋난다.
+	// 중복 판정은 (apiName, searchType, query) 조합 — 같은 구독이 다시 써도 항목이
+	// 늘어나지 않는다. 예전 스키마 파일(collectedApis 없음)은 빈 배열로 취급한다.
+	private static mergeCollectionSources(paper: Paper, existingPaper: Paper | undefined): void {
+		const existingApis = existingPaper?.collectedApis ?? [];
+		const existingQueries = existingPaper?.collectedQueries ?? [];
+		if (existingApis.length === 0) {
+			return;
+		}
+
+		const seen = new Set(
+			paper.collectedApis.map(
+				(api, i) => `${api}:${paper.collectedQueries[i]?.searchType}:${paper.collectedQueries[i]?.query}`,
+			),
+		);
+		for (let i = 0; i < existingApis.length; i += 1) {
+			const api = existingApis[i];
+			const query = existingQueries[i];
+			if (!api || !query) {
+				continue;
+			}
+			const key = `${api}:${query.searchType}:${query.query}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			paper.collectedApis.push(api);
+			paper.collectedQueries.push(query);
+		}
 	}
 
 	// ── config 공통: encode/decode는 옵션(기본=평문 통과). Secret만 난독화 변환을 넘긴다.

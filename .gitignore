@@ -19,6 +19,9 @@ main.js
 /models/
 /wasm/
 
+# npm test가 esbuild로 만드는 테스트 번들. 매번 재생성된다.
+.test-build/
+
 # Exclude sourcemaps
 *.map
 

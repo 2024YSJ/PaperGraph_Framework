@@ -105,8 +105,8 @@ function buildMockPaper(index: number): Paper {
 	paper.publicationDate = '';
 	paper.citationCount = 0;
 	paper.citationsKnown = false;
-	paper.collectedApi = '';
-	paper.collectedQuery = { searchType: '', query: '' };
+	paper.collectedApis = [];
+	paper.collectedQueries = [];
 	paper.embedding = [];
 	paper.embeddingModel = '';
 	paper.embeddingSource = '';
@@ -448,8 +448,8 @@ export class SettingTab extends PluginSettingTab {
 								paper.publicationDate = '';
 								paper.citationCount = 0;
 								paper.citationsKnown = false;
-								paper.collectedApi = '';
-								paper.collectedQuery = { searchType: '', query: '' };
+								paper.collectedApis = [];
+								paper.collectedQueries = [];
 								paper.embedding = [];
 								paper.embeddingModel = '';
 								paper.embeddingSource = '';

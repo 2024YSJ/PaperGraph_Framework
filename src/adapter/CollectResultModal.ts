@@ -108,6 +108,18 @@ function buildChecks(
 				? 'run()이 구현되면 이 값을 커서로 저장해 다음 패스가 이어받아야 한다.'
 				: undefined,
 		});
+
+		// ── 개별 논문 스킵([2] 정책) ────────────────────────────────────
+		// entry는 받았지만 필수 필드 누락 등으로 Paper가 못 된 항목. 조용히 사라지면
+		// 확인할 방법이 없으므로 몇 건이 빠졌는지 보여준다.
+		checks.push({
+			label: '개별 논문 스킵',
+			detail:
+				coverage.skippedEntries === 0
+					? '스킵된 항목 없음'
+					: `${coverage.skippedEntries}건 스킵됨 (필수 필드 누락 또는 id 해석 실패)`,
+			ok: coverage.skippedEntries === 0,
+		});
 	}
 
 	// ── 인용수 보강(S2) ───────────────────────────────────────────────
