@@ -1,12 +1,13 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { File } from '../common/File';
-import { PipelineTestModal } from './PipelineTestModal';
+import { PipelineTestModal, type PipelineTestField } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
 import { CollectResultModal } from './CollectResultModal';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
+import { SearchQuery } from '../collect/SearchQuery';
 import { ArxivAPI, S2_SECRET_PROVIDER } from '../collect/API';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
@@ -179,6 +180,48 @@ interface ApiDraft {
 	newConditionQuery: string;
 }
 
+// ⚠️ 임시(삭제 예정) — "커스텀 검색" 버튼 전용. CollectAndSave.run()이 구현되면
+// 구독 UI가 그 역할을 대신한다.
+//
+// 조건 3개(최대치, 004의 AND 결합 규칙)를 입력받는 필드를 만든다. 다른 수집 테스트
+// 버튼들이 전부 keyword 조건 1개만 넘겨서 category/author 경로와 AND 결합이 실기기에서
+// 한 번도 실행된 적이 없어, 그 셋을 직접 조립해볼 수 있게 하는 게 목적이다.
+const CONDITION_SLOTS = [1, 2, 3] as const;
+
+function buildConditionFields(): PipelineTestField[] {
+	return CONDITION_SLOTS.flatMap((slot) => [
+		{
+			key: `type${slot}`,
+			label: `조건 ${slot} 타입`,
+			type: 'select' as const,
+			// ARXIV_FIELD_PREFIX 키와 일치해야 하는 값이라 기존 라벨 맵을 그대로 쓴다.
+			options: CONDITION_TYPE_LABEL,
+			defaultValue: slot === 2 ? 'category' : 'keyword',
+		},
+		{
+			key: `query${slot}`,
+			label: `조건 ${slot} 검색어`,
+			desc: slot === 1 ? '비워두면 그 조건은 제외된다' : '',
+			type: 'text' as const,
+			// 첫 조건만 기본값을 주고 나머지는 비워둔다 — 조건 1개짜리 검색이 기본 동작이 되게.
+			defaultValue: slot === 1 ? 'transformer' : '',
+		},
+	]);
+}
+
+// 입력값에서 검색어가 채워진 조건만 SearchQuery로 뽑는다.
+function collectConditions(values: Record<string, string>): SearchQuery[] {
+	const querys: SearchQuery[] = [];
+	for (const slot of CONDITION_SLOTS) {
+		const query = values[`query${slot}`]?.trim();
+		if (!query) {
+			continue;
+		}
+		querys.push({ searchType: values[`type${slot}`] ?? 'keyword', query });
+	}
+	return querys;
+}
+
 // 임시 UI. Secret/Subscriptions/API/SearchQuery 클래스의 실제 필드는 아직 우빈/신빈이
 // 정하지 않았으므로, 여기서는 SettingTab 자체의 로컬 상태에만 바인딩한다 (담당자들의
 // 설계를 선점하지 않기 위함). 다만 구조(API 하나 : 조건 여러 개)는 다이어그램의
@@ -310,6 +353,34 @@ export class SettingTab extends PluginSettingTab {
 								api,
 								secret.hasKey(S2_SECRET_PROVIDER),
 								{ from, to },
+							);
+						},
+					).open();
+				}),
+			)
+			.addButton((button) =>
+				button.setButtonText('커스텀 검색').onClick(() => {
+					new PipelineTestModal(
+						this.app,
+						'수집 테스트 — 커스텀 검색 (조건 최대 3개, AND)',
+						buildConditionFields(),
+						async (values) => {
+							// 검색어가 빈 조건은 없는 것으로 친다 — 조건 1개만 쓰고 싶을 때
+							// 나머지 칸을 비워두면 되도록.
+							const querys = collectConditions(values);
+							if (querys.length === 0) {
+								new Notice('조건을 하나 이상 입력하세요');
+								return;
+							}
+							const secret = await File.readSecret();
+							const api = new ArxivAPI(querys, secret);
+							await runCollectTest(
+								this.app,
+								'커스텀 검색',
+								querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
+								() => api.SearchBase(),
+								api,
+								secret.hasKey(S2_SECRET_PROVIDER),
 							);
 						},
 					).open();
