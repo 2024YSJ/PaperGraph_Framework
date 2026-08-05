@@ -12,6 +12,13 @@ node_modules
 # They should be uploaded to GitHub releases instead.
 main.js
 
+# 임베딩 모델 자산(ONNX ~108MB + WASM ~21MB). main.js와 같은 이유로 repo에 넣지 않고
+# GitHub Release에서 런타임에 다운로드한다 (docs/devLog/003-embedding-model.md).
+# Obsidian "설치" 버튼이 vault 플러그인 폴더에 떨어뜨리는데, 그 폴더가 이 repo를
+# 가리키고 있으면 작업 트리에 섞여 들어온다 — 실제로 wasm이 한 번 커밋됐다.
+/models/
+/wasm/
+
 # Exclude sourcemaps
 *.map
 
