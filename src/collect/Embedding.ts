@@ -540,6 +540,13 @@ export class Embedding {
 	// 반환하지 않는다. Paper의 embedding 필드가 non-nullable이라 "임베딩 안 됨" 상태를
 	// Paper에 어떻게 반영할지는(저장을 건너뛸지, embedding=[] 등으로 명시적으로 채울지)
 	// 호출자(수집 플로우)의 책임이다.
+	//
+	// ⚠️ 동시 호출 안전하지 않음: session/서킷브레이커/modelLocationChecked 상태가
+	// 락 없이 공유된다. 호출자는 반드시 순차(await 완료 후 다음 호출)로만 embed()를
+	// 불러야 한다 — 병렬로 부르면 (a) 설치 확인 중인 다른 호출이 아직 안 끝난
+	// modelLocation을 보고 "설치 안 됨"으로 오판하거나 (b) 한 호출의 실패로 세션이
+	// dispose되는 도중 다른 호출이 같은 세션으로 추론 중일 수 있다(docs/devLog/
+	// 003-embedding-model.md "동시성 가정" 참고).
 	async embed(title: string, abstract: string): Promise<EmbeddingResult> {
 		if (this.breakerBlocksAttempt()) {
 			throw new Error(

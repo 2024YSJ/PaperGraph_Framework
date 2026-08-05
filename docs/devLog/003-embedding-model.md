@@ -220,9 +220,56 @@ baseline 제거 작업의 목표("가짜 벡터가 저장되지 않게 하기")�
 모델 파일 해시나 `config.json` 내용과 연동해 자동 검증, 혹은 알려진 두 논문 쌍의 유사도를
 확인하는 스모크 테스트 등)가 필요한데, 이번 범위 밖이며 향후 개선 과제로 남긴다.
 
+## 2026-08-06 수정: non-finite 체크가 재시도/세션 반납 경로를 안 타던 버그
+
+메모리 관리 점검 중 발견: `runLocalModel()`에서 `embedOnce()`가 반환한 임베딩의
+non-finite(NaN/Infinity) 검사가 재시도용 `try/catch` **바깥**에 있었다. 그 결과 이
+검사에 걸려 throw될 때는 (a) 이미 `uses`가 증가한 세션이 `resetPipeline()`으로
+반납되지 않고 캐시에 그대로 남고, (b) 4차 방어(새 세션으로 1회 재시도)도 적용되지
+않았다 — "실패 시 즉시 반납" 원칙(위 "버그 수정 (2026-08-04)" 절에서 이미 한 번
+고친 것과 같은 종류) 위반. non-finite 체크를 `embedOnce()` 내부로 옮겨 다른 추론
+실패와 동일하게 재시도+세션 반납 경로를 타도록 수정했다(커밋 `342c934`).
+
+검증: 저장소에 committed 테스트가 없어(기존 관례대로) `@huggingface/transformers`를
+쓰지 않고 `createSession()`만 교체한 일회성 Node 스크립트로 두 시나리오를 확인—
+(1) 첫 시도만 non-finite → 그 세션이 `dispose()`되고 새 세션으로 재시도해 성공,
+(2) 두 시도 모두 non-finite → 두 세션 모두 `dispose()`되고 에러가 전파됨. 둘 다
+통과 후 스크립트는 삭제(커밋 안 함). 이후 `tsc -noEmit`/`eslint` 통과 확인.
+
+## 동시성 가정: `embed()`는 순차 호출만 안전함 (2026-08-06 점검, 코드 변경 없음)
+
+메모리 관리 점검 중, `Embedding`이 `session`/`consecutiveFailures`/
+`breakerTrippedAt`/`modelLocationChecked`·`modelLocation`을 락 없는 인스턴스
+상태로 관리한다는 점을 재확인했다. `CollectAndSave.run()`이 아직 스텁이고
+현재 유일한 실사용처(`SettingTab.ts`의 "테스트 (100개)" 버튼)도 `for` +
+`await`로 순차 호출하므로 지금 당장 문제는 없지만, `run()`을 구현할 때 속도를
+위해 `Promise.all` 등으로 병렬 호출하고 싶어질 수 있어 미리 점검해 기록해둔다.
+
+- **레이스 1 (오늘도 재현 가능): `ensureModelLocation()`.** `modelLocationChecked`를
+  디스크 확인(`await areAssetsPresent`)보다 먼저 동기적으로 `true`로 세팅한다.
+  `embed()`를 동시에 두 번 부르면, 첫 호출이 디스크 확인 중일 때 두 번째 호출은
+  `modelLocationChecked === true`만 보고 아직 `undefined`인 `modelLocation`을
+  그대로 반환해 "모델 설치 안 됨"으로 오판하고 그 논문 하나를 잘못 실패 처리한다.
+  이후 호출부턴 정상화되므로 자기치유되지만, 놓친 논문은 복구되지 않는다.
+- **레이스 2 (더 심각할 수 있음): 세션 dispose 중 사용.** 호출 A가 실패해
+  `resetPipeline()`으로 세션을 `dispose()`하는 동안, 호출 B가 같은 세션 객체로
+  `session.model(inputs)`를 아직 await 중일 수 있다. 진행 중인 추론 아래에서
+  세션이 해제되는 상황이라 ORT/WASM이 어떻게 반응할지 보장이 없다.
+- **경미한 항목**: `uses` 카운터·서킷브레이커 카운터도 동시 호출 시 임계값을
+  살짝 넘기거나 집계 순서가 뒤섞일 수 있지만 자체 회복되는 수준.
+
+**결정**: 위 레이스를 막는 락/큐를 `Embedding` 내부에 추가하지 않기로 했다.
+WASM 기반 단일 ONNX 세션은 JS 싱글스레드 위에서 어차피 동시 호출로 처리량이
+늘지 않으므로(진짜 병렬 연산 이득이 없음), 지금 필요 없는 복잡도를 미리
+추가하는 것보다 **`CollectAndSave.run()`이 논문을 순차(`for...of` + `await`)로만
+처리한다는 계약을 문서(이 절 + `Embedding.embed()` 위 주석)로 못 박는 쪽**을
+택했다. `run()`을 구현할 담당자는 이 제약을 지켜야 하며, 병렬 처리가 꼭
+필요해지면 그때 가서 이 절을 다시 참고해 락/큐 도입을 재검토할 것.
+
 ## 다음 담당자 참고
 
 - `CollectAndSave.run()`을 구현할 담당자는 `Embedding.embed(title, abstract)`를 루프 안에서 `try/catch`로 감싸 호출해야 한다 — 성공하면 `Object.assign(paper, result)`로 붙이고, 실패(throw)하면 위 "baseline 폴백 제거" 절의 (a)/(b) 중 하나를 선택해 처리한다(baseline 계산 금지). `resetCircuitBreaker()`는 배치 시작 시 호출하면 좋지만 필수는 아니다(쿨다운이 자동으로 처리).
+- **`embed()`는 반드시 순차 호출할 것 — `Promise.all` 등으로 병렬 호출 금지.** 위 "동시성 가정" 절 참고. 논문마다 `for...of` + `await`로 하나씩 처리해야 한다(속도를 위해 병렬화하고 싶어져도 세션 상태 레이스가 있어 안전하지 않다).
 - `installModel()`이 실패한다면 **더 이상 "릴리스에 에셋이 안 올라가 있어서"가 아니다** — 실제로 업로드·검증까지 끝났다(위 "모델 배포" 절 참고). 실패한다면 네트워크, Obsidian CSP, wasm 로딩 등 다른 원인을 봐야 한다.
 - `isDesktopOnly: true`는 팀 전체 영향 결정이므로, 모바일 지원 논의가 다시 나오면 이 문서를 먼저 참고할 것.
 - 모델을 다른 것으로 바꾸고 싶다면 위 "모델 교체 용이성 평가" + "로컬 모델 교체 조건" 절을 먼저 읽을 것 — 손댈 지점은 `buildModelInput()`/`poolEmbedding()`/"로컬 모델 설정" 상수 블록 셋으로 좁혀뒀지만, 재임베딩 경로가 없다는 점은 여전하다.
