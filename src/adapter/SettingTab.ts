@@ -409,7 +409,7 @@ export class SettingTab extends PluginSettingTab {
 								// (스팸 방지).
 								if (failed === 0) {
 									new Notice(
-										`임베딩 실패가 정상적으로 catch됨: ${error instanceof Error ? error.message : String(error)}`,
+										`임베딩 실패 확인됨: ${error instanceof Error ? error.message : String(error)}`,
 									);
 								}
 								await File.writeTestPaper(paper, EMBEDDING_TEST_FOLDER);

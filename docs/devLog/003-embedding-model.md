@@ -153,8 +153,14 @@
 - **재임베딩 경로는 여전히 없다.** `embeddingSucceeded=false` + `embedding=[]`로 저장된
   논문을 감지해 모델이 다시 정상화됐을 때 자동/수동으로 재시도해주는 기능은 아직 없다
   (위 "모델 교체 용이성 평가"에서 지적한 공백과 같은 종류) — 다음 우선순위 후보로 남겨둔다.
-- 저장소에 `Embedding` 관련 자동 테스트가 없어(확인함) 이번 변경은 수동 검증(빌드 통과 +
-  설정 탭에서 모델 미설치/설치 두 상태로 테스트 버튼 실행)으로만 확인했다.
+- 저장소에 `Embedding` 관련 자동 테스트가 없어(확인함) 이번 변경은 다음으로 확인했다:
+  빌드/lint 통과, 그리고 실제 Obsidian 없이 `obsidian` 모듈만 최소 mock(Notice/Vault/
+  DataAdapter)으로 갈아끼운 일회성 Node 스크립트로 `src/collect/Embedding.ts`와
+  `src/common/File.ts`를 그대로 실행 — 모델 미설치 상태에서 `embed()`가 실제로 throw하고,
+  `SettingTab.ts`와 동일한 catch 경로를 거쳐 `embedding=[]`/`embeddingModel=''`/
+  `embeddingSource=''`/`embeddingSucceeded=false`가 저장된 JSON에 실제로 기록됨을 확인했다
+  (스크립트는 일회성이라 커밋하지 않고 검증 후 삭제). Obsidian 앱을 직접 열어 UI를 수동
+  클릭하는 검증은 하지 않았다.
 
 ## 다음 담당자 참고
 
