@@ -427,7 +427,13 @@ export class Embedding {
 		const { last_hidden_state: hidden } = await session.model(inputs);
 		session.uses += 1;
 
-		return this.poolEmbedding(hidden);
+		const embedding = this.poolEmbedding(hidden);
+		// 여기서 던져야 runLocalModel()의 재시도/세션 반납 로직을 그대로 탄다 — 이 체크가
+		// try 블록 밖에 있으면 이미 uses가 증가한, 문제 있는 세션이 반납 없이 캐시에 남는다.
+		if (embedding.some((value) => !Number.isFinite(value))) {
+			throw new Error('로컬 모델이 non-finite 임베딩을 반환했습니다.');
+		}
+		return embedding;
 	}
 
 	private async runLocalModel(
@@ -460,10 +466,6 @@ export class Embedding {
 				await this.resetPipeline();
 				throw retryError;
 			}
-		}
-
-		if (embedding.some((value) => !Number.isFinite(value))) {
-			throw new Error('로컬 모델이 non-finite 임베딩을 반환했습니다.');
 		}
 
 		return {
