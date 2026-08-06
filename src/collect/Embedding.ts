@@ -2,9 +2,11 @@ import { Notice, requestUrl, type DataAdapter, type Vault } from 'obsidian';
 
 // 온디바이스 로컬 모델(현재 설정: SPECTER2, 8bit 양자화) 임베딩. 설계 근거는
 // docs/devLog/003-embedding-model.md 참고 — 모델 파일은 번들에 넣지 않고 GitHub
-// Release에서 사용자가 설치 버튼으로만 받는다. 설치 전/실패 시에는 항상 해시 기반
-// 베이스라인으로 폴백해서 embed()는 절대 throw하지 않는다 (Paper의 embedding 계열
-// 필드가 전부 non-nullable이기 때문).
+// Release에서 사용자가 설치 버튼으로만 받는다. 모델이 설치되어 있지 않거나 추론이
+// 실패하면 embed()는 항상 throw한다 — 가짜 벡터(해시 기반 baseline)를 계산해 실제
+// 임베딩 공간과 섞어 저장하지 않는다(2026-08-05 결정). 실패 시 Paper를 어떻게 채울지
+// (저장을 건너뛸지, embedding=[] + embeddingSucceeded=false로 명시적으로 채울지)는
+// 호출자(수집 플로우) 책임이다.
 //
 // 다른 로컬 모델로 교체하려면: 아래 "로컬 모델 설정" 상수 블록 + buildModelInput()
 // (입력 포맷) + poolEmbedding()(풀링 전략) 세 곳만 보면 된다. 교체 조건은
@@ -85,7 +87,7 @@ export class Embedding {
 
 	// ═══ 로컬 모델 설정 — 다른 모델로 교체할 때 이 블록 전체를 같이 갱신할 것 ═══
 	// 파일명·차원·dtype·canonical id가 서로 어긋나면 다운로드는 성공해도 로드/추론이
-	// 조용히 실패해 baseline 폴백으로 빠진다 (docs/devLog/003-embedding-model.md
+	// 실패해 embed()가 throw한다 (docs/devLog/003-embedding-model.md
 	// "로컬 모델 교체 조건" 참고).
 	private static readonly RELEASE_OWNER = '2024YSJ';
 	private static readonly RELEASE_REPO = 'PaperGraph_Framework';
@@ -115,10 +117,6 @@ export class Embedding {
 	// 기대 hidden 차원. poolEmbedding()이 실제 모델 출력과 이 값을 대조해서, 다르면
 	// "런타임 장애"가 아니라 "이 상수를 안 갱신한 설정 실수"라고 알 수 있는 에러를 낸다.
 	private static readonly LOCAL_MODEL_DIM = 768;
-
-	// ── 상수: 베이스라인 (해시 TF, 항상 계산 가능한 폴백) — 모델 비의존적 ──────
-	private static readonly BASELINE_EMBEDDING_DIM = 2048;
-	private static readonly BASELINE_EMBEDDING_MODEL = 'local-hashtf-v1-d2048';
 
 	// ── 상수: 세션/메모리 관리 — 모델 비의존적 ─────────────────────────────
 	private static readonly MAX_SEQUENCE_LENGTH = 512;
@@ -305,50 +303,7 @@ export class Embedding {
 		return bytes.byteLength;
 	}
 
-	// ── 베이스라인 해시 TF 임베딩 (폴백, 항상 계산 가능) ───────────────────
-
-	private computeBaselineEmbedding(title: string, abstract: string): EmbeddingResult {
-		const text = abstract.length > 0 ? `${title} ${abstract}` : title;
-		const tokens = Embedding.tokenize(text);
-
-		const termFrequencies = new Map<string, number>();
-		for (const token of tokens) {
-			termFrequencies.set(token, (termFrequencies.get(token) ?? 0) + 1);
-		}
-
-		const vector = new Float64Array(Embedding.BASELINE_EMBEDDING_DIM);
-		for (const [token, count] of termFrequencies) {
-			const hash = Embedding.fnv1a(token);
-			const bucket = hash % Embedding.BASELINE_EMBEDDING_DIM;
-			// 해시 비트 하나로 부호를 정해서, 충돌한 토큰들이 서로 상쇄되는 쪽으로 유도한다.
-			const sign = ((hash >>> 16) & 1) === 0 ? 1 : -1;
-			vector[bucket] = (vector[bucket] ?? 0) + sign * (1 + Math.log(count));
-		}
-
-		return {
-			embedding: Embedding.l2Normalize(Array.from(vector)),
-			embeddingModel: Embedding.BASELINE_EMBEDDING_MODEL,
-			embeddingSource: 'local',
-			embeddingSucceeded: false,
-		};
-	}
-
-	private static tokenize(text: string): string[] {
-		return text
-			.normalize('NFKC')
-			.toLowerCase()
-			.split(/[^\p{L}\p{N}]+/u)
-			.filter((token) => token.length > 0);
-	}
-
-	private static fnv1a(token: string): number {
-		let hash = 0x811c9dc5;
-		for (let i = 0; i < token.length; i += 1) {
-			hash ^= token.charCodeAt(i);
-			hash = Math.imul(hash, 0x01000193);
-		}
-		return hash >>> 0;
-	}
+	// ── 벡터 유틸 ────────────────────────────────────────────────────────
 
 	private static l2Normalize(vector: number[]): number[] {
 		let sumOfSquares = 0;
@@ -472,7 +427,13 @@ export class Embedding {
 		const { last_hidden_state: hidden } = await session.model(inputs);
 		session.uses += 1;
 
-		return this.poolEmbedding(hidden);
+		const embedding = this.poolEmbedding(hidden);
+		// 여기서 던져야 runLocalModel()의 재시도/세션 반납 로직을 그대로 탄다 — 이 체크가
+		// try 블록 밖에 있으면 이미 uses가 증가한, 문제 있는 세션이 반납 없이 캐시에 남는다.
+		if (embedding.some((value) => !Number.isFinite(value))) {
+			throw new Error('로컬 모델이 non-finite 임베딩을 반환했습니다.');
+		}
+		return embedding;
 	}
 
 	private async runLocalModel(
@@ -507,10 +468,6 @@ export class Embedding {
 			}
 		}
 
-		if (embedding.some((value) => !Number.isFinite(value))) {
-			throw new Error('로컬 모델이 non-finite 임베딩을 반환했습니다.');
-		}
-
 		return {
 			embedding,
 			embeddingModel: Embedding.LOCAL_MODEL_EMBEDDING_ID,
@@ -537,10 +494,10 @@ export class Embedding {
 		this.breakerTrippedAt = undefined;
 	}
 
-	// 트립 상태(연속 3회 실패)이고 쿨다운이 아직 안 지났으면 시도 자체를 막는다. 쿨다운이
-	// 지나면 false를 반환해 한 번의 재시도를 허용 — CollectAndSave.run()이 아직 없어
-	// 아무도 resetCircuitBreaker()를 호출해주지 않아도, 이 쿨다운이 없으면 한 번 트립된
-	// 뒤로 영구히 폴백만 반환하게 된다 (003-embedding-model.md 참고).
+	// 트립 상태(연속 3회 실패)이고 쿨다운이 아직 안 지났으면 시도 자체를 막는다(embed()가
+	// throw). 쿨다운이 지나면 false를 반환해 한 번의 재시도를 허용 — CollectAndSave.run()이
+	// 아직 없어 아무도 resetCircuitBreaker()를 호출해주지 않아도, 이 쿨다운이 없으면 한 번
+	// 트립된 뒤로 영구히 실패만 반환하게 된다 (003-embedding-model.md 참고).
 	private breakerBlocksAttempt(): boolean {
 		if (this.consecutiveFailures < Embedding.FAILURE_LIMIT || this.breakerTrippedAt === undefined) {
 			return false;
@@ -561,8 +518,8 @@ export class Embedding {
 			const reason = Embedding.classifyInferenceError(error);
 			new Notice(
 				reason === 'out-of-memory'
-					? 'PaperGraph3D: 온디바이스 임베딩 모델이 메모리 부족으로 실패했습니다. 나머지 논문은 임시 임베딩으로 저장됩니다.'
-					: `PaperGraph3D: 온디바이스 임베딩 모델이 실패했습니다 (${error instanceof Error ? error.message : String(error)}). 나머지 논문은 임시 임베딩으로 저장됩니다.`,
+					? 'PaperGraph3D: 온디바이스 임베딩 모델이 메모리 부족으로 실패했습니다. 해당 논문의 임베딩은 건너뜁니다.'
+					: `PaperGraph3D: 온디바이스 임베딩 모델이 실패했습니다 (${error instanceof Error ? error.message : String(error)}). 해당 논문의 임베딩은 건너뜁니다.`,
 			);
 		}
 
@@ -579,19 +536,29 @@ export class Embedding {
 
 	// ── 논문 단위 오케스트레이션 (공개 API) ─────────────────────────────
 
-	// 절대 throw하지 않는다 — Paper의 embedding 필드가 non-nullable이라 "임베딩 안 됨"
-	// 상태를 표현할 방법이 없다. 항상 사용 가능한 벡터(성공 시 로컬 모델, 그 외엔 해시
-	// 폴백)를 반환하고 embeddingSucceeded로만 구분한다.
+	// 실패(모델 미설치/서킷브레이커/추론 오류) 시 항상 throw한다 — 가짜 벡터를 계산해
+	// 반환하지 않는다. Paper의 embedding 필드가 non-nullable이라 "임베딩 안 됨" 상태를
+	// Paper에 어떻게 반영할지는(저장을 건너뛸지, embedding=[] 등으로 명시적으로 채울지)
+	// 호출자(수집 플로우)의 책임이다.
+	//
+	// ⚠️ 동시 호출 안전하지 않음: session/서킷브레이커/modelLocationChecked 상태가
+	// 락 없이 공유된다. 호출자는 반드시 순차(await 완료 후 다음 호출)로만 embed()를
+	// 불러야 한다 — 병렬로 부르면 (a) 설치 확인 중인 다른 호출이 아직 안 끝난
+	// modelLocation을 보고 "설치 안 됨"으로 오판하거나 (b) 한 호출의 실패로 세션이
+	// dispose되는 도중 다른 호출이 같은 세션으로 추론 중일 수 있다(docs/devLog/
+	// 003-embedding-model.md "동시성 가정" 참고).
 	async embed(title: string, abstract: string): Promise<EmbeddingResult> {
 		if (this.breakerBlocksAttempt()) {
-			return this.computeBaselineEmbedding(title, abstract);
+			throw new Error(
+				'PaperGraph3D: 임베딩이 반복 실패해 잠시 중단된 상태입니다. 1분 후 다시 시도하세요.',
+			);
 		}
 
 		const location = await this.ensureModelLocation();
 		if (location === undefined) {
 			// 모델이 아직 설치 안 된, 예상 가능한 상태 — 실패가 아니므로 서킷브레이커에
 			// 반영하지 않는다.
-			return this.computeBaselineEmbedding(title, abstract);
+			throw new Error('PaperGraph3D: 임베딩 모델이 설치되어 있지 않습니다. 설정 탭에서 먼저 설치하세요.');
 		}
 
 		try {
@@ -600,7 +567,7 @@ export class Embedding {
 			return result;
 		} catch (error) {
 			this.recordFailure(error);
-			return this.computeBaselineEmbedding(title, abstract);
+			throw error;
 		}
 	}
 }

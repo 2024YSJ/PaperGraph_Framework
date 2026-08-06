@@ -505,7 +505,7 @@ export class SettingTab extends PluginSettingTab {
 			.setName('임베딩 모델')
 			.setDesc(
 				'specter2(8bit 양자화) 모델을 GitHub Release에서 받아 온디바이스로 씁니다. ' +
-					'설치 전에는 임베딩이 임시(해시 기반) 벡터로 대체됩니다.',
+					'모델이 설치되어 있지 않으면 임베딩을 실행할 수 없습니다.',
 			)
 			.addButton((button) =>
 				button.setButtonText('확인').onClick(async () => {
@@ -553,31 +553,43 @@ export class SettingTab extends PluginSettingTab {
 					try {
 						for (let i = 0; i < total; i++) {
 							const paper = buildMockPaper(i);
-							const result = await this.plugin.collectflow.embedding.embed(
-								paper.title,
-								paper.abstract,
-							);
-							if (result.embeddingSucceeded) {
+							try {
+								const result = await this.plugin.collectflow.embedding.embed(
+									paper.title,
+									paper.abstract,
+								);
+								// .md(문서)와 .json(임베딩 포함 원본)을 한 번에 저장한다. .md는 임베딩
+								// 벡터를 담지 않으므로 임베딩 전/후로 두 번 나눠 쓸 이유가 없고, 두 번
+								// 쓰면 재실행 시 "임베딩 전" 저장이 이전 실행의 정상 결과를 일시적으로
+								// 지웠다가 복구하는 창이 생겨 중단 시 데이터가 빈 값으로 남을 수 있었다.
+								Object.assign(paper, result);
+								await File.writeTestPaper(paper, EMBEDDING_TEST_FOLDER);
 								succeeded += 1;
-							} else {
+							} catch (error) {
+								// baseline이 없으므로 가짜 벡터를 만들지 않는다 — 대신 paper는
+								// buildMockPaper()가 채워둔 빈 값(embedding=[], embeddingModel='',
+								// embeddingSource='', embeddingSucceeded=false) 그대로 저장해서, 이
+								// 논문이 "임베딩 실패로 재임베딩이 필요한 상태"임을 디스크에 남긴다.
+								// embed()가 실제로 throw하고 여기서 catch되는지 눈으로 확인할 수
+								// 있도록, 스트릭의 첫 실패에만 실제 에러 메시지를 Notice로 보여준다
+								// (스팸 방지).
+								if (failed === 0) {
+									new Notice(
+										`임베딩 실패 확인됨: ${error instanceof Error ? error.message : String(error)}`,
+									);
+								}
+								await File.writeTestPaper(paper, EMBEDDING_TEST_FOLDER);
 								failed += 1;
 							}
 
-							// .md(문서)와 .json(임베딩 포함 원본)을 한 번에 저장한다. .md는 임베딩
-							// 벡터를 담지 않으므로 임베딩 전/후로 두 번 나눠 쓸 이유가 없고, 두 번
-							// 쓰면 재실행 시 "임베딩 전" 저장이 이전 실행의 정상 결과를 일시적으로
-							// 지웠다가 복구하는 창이 생겨 중단 시 데이터가 빈 값으로 남을 수 있었다.
-							Object.assign(paper, result);
-							await File.writeTestPaper(paper, EMBEDDING_TEST_FOLDER);
-
 							notice.setMessage(
-								`임베딩 테스트 중... (${i + 1}/${total}) 성공 ${succeeded} / 실패 ${failed}`,
+								`임베딩 테스트 중... (${i + 1}/${total}) 성공 ${succeeded} / 실패(빈 임베딩으로 저장) ${failed}`,
 							);
 						}
 						const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
 						notice.hide();
 						new Notice(
-							`임베딩 테스트 완료: 성공 ${succeeded}개 / 실패(임시 벡터로 대체) ${failed}개 (${elapsedSec}초)`,
+							`임베딩 테스트 완료: 성공 ${succeeded}개 / 실패(빈 임베딩으로 저장) ${failed}개 (${elapsedSec}초)`,
 							0,
 						);
 					} catch (error) {
