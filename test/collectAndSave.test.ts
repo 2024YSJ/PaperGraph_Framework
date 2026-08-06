@@ -303,6 +303,27 @@ describe('CollectAndSave.run — 미들웨어', () => {
 		assert.equal(eachContexts.length, 3);
 	});
 
+	it("수집 결과가 0편이어도 'all'은 빈 배열로 호출된다", async () => {
+		// 설정탭이 "N편 수집" Notice를 이 호출 하나로 관측한다 — 0편일 때 'all'이 아예
+		// 안 불리면, 실패도 아닌데 성공 Notice에 건수가 안 붙어 사용자가 원인을 알 수 없다.
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([], 0));
+		const { embedding } = fakeEmbedding();
+
+		const allContexts: unknown[] = [];
+		const all: Middleware = {
+			type: 'all',
+			run: (context) => {
+				allContexts.push(context);
+			},
+		};
+
+		await collectFlow(embedding, [all]).run('recent', { hours: 24 });
+
+		assert.equal(allContexts.length, 1);
+		assert.deepEqual(allContexts[0], []);
+	});
+
 	it("'visual' 미들웨어는 수집 흐름에서 실행되지 않는다", async () => {
 		writeSubscriptionsFile(['graph']);
 		arxivOnly(feed([entry()], 1));

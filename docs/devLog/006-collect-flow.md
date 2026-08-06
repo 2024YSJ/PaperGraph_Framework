@@ -312,3 +312,42 @@ Obsidian 수동 검증은 하지 않았다.
   FileTestModal의 Secret 폼으로 가능해 이번 범위에서 뺐다. 확정 설정 UI 작업 때 함께.
 - **구독 UI의 확정 디자인**(라디오 등)은 시각화 클래스 이후 별도 작업 — 현재 배선은
   유지한 채 표현만 갈아끼우면 된다.
+
+## 5차 작업 (8월 7일): "성공 Notice는 뜨는데 파일이 없다" — 수집 건수 관측성 추가
+
+실기기(Obsidian)에서 처음 돌려본 팀원이 보고한 증상. 원인은 버그가 아니라 관측성
+부족이었다: `run()`은 다이어그램 계약상 `Promise<void>`라 몇 편을 수집했는지 자체적으로
+알려주지 않는데, `runCollectFlow()`가 에러만 없으면 무조건 "마쳤습니다"를 띄워서
+**구독 조건에 맞는 논문이 0편이라 정상 종료된 것**과 실제 성공을 구분할 방법이
+없었다 — 폴더 생성 로직(`Vault.createFolder`는 중첩 경로를 재귀 생성하므로 혐의
+없음 확인)이 아니라 이쪽이 원인이었다.
+
+### 수정
+
+`SettingTab`에 진단용 `'all'` 미들웨어를 등록해 직전 `run()` 호출이 실제로 넘긴
+`Paper[]`의 길이를 관측하고, "최근 논문"/"Backfill" 버튼의 성공 Notice에
+"(N편 수집)"으로 붙인다. 004의 "임베딩 실패 시 collectResultModal 대신 미들웨어로
+결과를 가로채는 방식이 자연스럽다"던 메모가 실제로 처음 쓰인 자리다.
+
+- 미들웨어는 `display()`가 열릴 때마다 다시 등록되면 안 되므로(같은 `collectflow`
+  인스턴스에 중복 누적) `diagnosticsRegistered` 플래그로 1회만 등록한다.
+- 건수는 호출 직전 `undefined`로 리셋하고 `run()` 완료 후 읽는다 — `run()`이 구독
+  없음/모델 미설치 등으로 미들웨어 도달 전에 throw하면 `undefined`로 남아 Notice에
+  건수가 안 붙는다(정상 — 그 경우는 실패 Notice로 별도 처리됨).
+- ⚠️ **tsc/eslint 함정**: `this.lastCollectedCount`를 `await` 너머에서 직접 읽으면
+  `restrict-template-expressions`가 `never`로 오판해 빌드가 깨졌다. `= undefined` 대입
+  시점의 좁혀진 타입을 정적 분석이 그 이후(비동기 콜백이 실제로 값을 바꿀 수 있는
+  구간)까지 그대로 밀어붙이기 때문 — 필드가 비동기적으로 바뀔 수 있다는 걸 컴파일러는
+  모른다. `readLastCollectedCount(): number | undefined` 메서드로 감싸 선언된 반환
+  타입만 보게 해서 피했다. 이후 같은 패턴(async 콜백이 바꾸는 필드를 await 뒤에서
+  읽는 것)을 쓸 때 재현될 수 있다.
+
+### 검증
+
+`'all'` 미들웨어가 수집 결과 0편일 때도 **빈 배열로 호출되는지**(호출 자체가 스킵되면
+관측 자체가 안 됨) 테스트로 추가했다(63 → 64건). UI 레이어(`SettingTab`)의 Notice
+문자열 자체는 이 하네스로 검증하지 않았다 — 옵시디언 `Setting`/`PluginSettingTab` DOM
+스텁이 없어 이번 수정 규모 대비 과하다고 판단, 그 대신 의존하는 계약(빈 배열 호출)만
+고정했다.
+
+`npm run build` / `npm test`(64/64) / `eslint`(0 errors) 통과.

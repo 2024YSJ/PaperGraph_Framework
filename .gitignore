@@ -28,6 +28,14 @@ main.js
 # obsidian
 data.json
 
+# 이 저장소를 vault의 플러그인 폴더로 가리켜 실기기에서 테스트하면, 플러그인이 만드는
+# 런타임 데이터(구독/키/수집된 논문)가 작업 트리에 그대로 섞여 들어온다 — 실제로
+# Subscriptions.json이 한 번 이렇게 커밋될 뻔했다. 위 models//wasm/과 같은 이유.
+/Subscriptions.json
+/Secret.json
+/PaperGraph3D/
+/embedding_test/
+
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
 

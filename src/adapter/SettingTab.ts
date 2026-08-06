@@ -5,6 +5,7 @@ import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
+import type { Middleware } from '../common/Middleware';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
 // 단어 수 분포(실측: 최소 63, 최대 302, 평균 193단어)를 참고해 문서마다 문장 수를
@@ -125,15 +126,21 @@ function isoDateInput(ms: number): string {
 // throw하므로(모델 미설치, 구독 없음 등) 그 메시지를 그대로 Notice로 보여준다.
 // 실행 중 버튼을 잠그는 이유: run()도 repair()도 embed()를 순차 호출한다는 계약 위에
 // 서 있는데, 버튼 연타로 두 실행이 겹치면 그 계약이 실행 단위에서 깨진다.
+//
+// action()이 문자열을 돌려주면 "N편 수집" 같은 요약을 Notice에 덧붙인다. run()은
+// void를 반환해 몇 편을 처리했는지 자체적으로 알려주지 않으므로(다이어그램 계약),
+// 호출부가 진단용 미들웨어로 건수를 따로 관측해 넘긴다 — 조건에 맞는 논문이 0편이라
+// 정상 종료된 것과 실제 오류를 구분하지 못하면 "성공 Notice는 떴는데 파일이 없다"는
+// 혼란이 생긴다.
 async function runCollectFlow(
 	label: string,
 	button: { setDisabled(disabled: boolean): unknown },
-	action: () => Promise<void>,
+	action: () => Promise<string | void>,
 ): Promise<void> {
 	button.setDisabled(true);
 	try {
-		await action();
-		new Notice(`${label}을(를) 마쳤습니다.`);
+		const detail = await action();
+		new Notice(`${label}을(를) 마쳤습니다.${detail ? ` (${detail})` : ''}`);
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
 		new Notice(`${label} 실패: ${message}`);
@@ -182,6 +189,10 @@ export class SettingTab extends PluginSettingTab {
 	// 저장된 구독을 읽지 못한 상태인가. 읽기에 실패했는데 저장을 허용하면, 화면의 빈
 	// 목록이 그대로 디스크를 덮어써 읽지 못했을 뿐 멀쩡히 있던 구독이 사라진다.
 	private subscriptionsUnreadable = false;
+	// 직전 run() 호출이 실제로 수집한 논문 수. run()은 다이어그램 계약상 void를
+	// 반환하므로, 'all' 미들웨어로 관측해 여기 담아둔다 — collectDiagnostics() 참고.
+	private lastCollectedCount: number | undefined;
+	private diagnosticsRegistered = false;
 
 	constructor(app: App, plugin: PaperGraph3D) {
 		super(app, plugin);
@@ -197,6 +208,11 @@ export class SettingTab extends PluginSettingTab {
 		if (!this.subscriptionsLoaded) {
 			void this.loadSubscriptions();
 		}
+
+		// SettingTab은 플러그인 수명 동안 재사용되지만 display()는 열 때마다 다시 불리므로,
+		// 미들웨어 등록은 한 번만 — 매번 등록하면 열 때마다 'all' 미들웨어가 쌓여 같은
+		// run() 호출에 대해 lastCollectedCount가 여러 번(마지막 값은 같아도) 덮어써진다.
+		this.ensureCollectDiagnostics();
 
 		new Setting(containerEl)
 			.setName('파이프라인 테스트')
@@ -219,9 +235,14 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('최근 논문')
 					.setCta()
 					.onClick(() => {
-						void runCollectFlow('최근 논문 수집', button, () =>
-							this.plugin.collectflow.run('recent'),
-						);
+						void runCollectFlow('최근 논문 수집', button, async () => {
+							this.lastCollectedCount = undefined;
+							await this.plugin.collectflow.run('recent');
+							// this.lastCollectedCount로 직접 좁히면 tsc가 await 너머까지 필드
+							// 타입을 밀어붙여 else 분기를 never로 오판한다 — 로컬로 한 번 받는다.
+							const count = this.readLastCollectedCount();
+							return count !== undefined ? `${count}편 수집` : undefined;
+						});
 					}),
 			)
 			.addButton((button) =>
@@ -256,9 +277,12 @@ export class SettingTab extends PluginSettingTab {
 							// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 							// "종료일 당일 포함"으로 맞춘다.
 							const to = toMidnight + 24 * 60 * 60 * 1000;
-							await runCollectFlow('Backfill', button, () =>
-								this.plugin.collectflow.run('backfill', { from, to }),
-							);
+							await runCollectFlow('Backfill', button, async () => {
+								this.lastCollectedCount = undefined;
+								await this.plugin.collectflow.run('backfill', { from, to });
+								const count = this.readLastCollectedCount();
+								return count !== undefined ? `${count}편 수집` : undefined;
+							});
 						},
 					).open();
 				}),
@@ -499,6 +523,31 @@ export class SettingTab extends PluginSettingTab {
 		for (const api of this.apiDrafts) {
 			this.renderApiDraft(containerEl, api);
 		}
+	}
+
+	// this.lastCollectedCount를 직접 읽으면 tsc가 `= undefined` 대입 이후 await로
+	// 넘어간 지점까지 그 좁혀진(undefined-only) 타입을 그대로 밀어붙여, 실제로는 미들웨어가
+	// 값을 채워도 이후 비교를 항상 never로 오판한다(필드가 비동기 콜백으로 바뀔 수 있다는
+	// 걸 정적 분석은 모른다). 함수 호출 뒤로 감싸면 선언된 반환 타입만 보고 좁히지 않는다.
+	private readLastCollectedCount(): number | undefined {
+		return this.lastCollectedCount;
+	}
+
+	// run()의 'all' 미들웨어로 수집 건수를 관측한다. 조건에 맞는 논문이 0편이라 정상
+	// 종료된 것과 실제 오류를 UI에서 구분하려면 이 값이 필요하다 — run() 자체는 다이어그램
+	// 계약상 void만 반환하므로 이 경로 말고는 건수를 알 방법이 없다.
+	private ensureCollectDiagnostics(): void {
+		if (this.diagnosticsRegistered) {
+			return;
+		}
+		this.diagnosticsRegistered = true;
+		const middleware: Middleware = {
+			type: 'all',
+			run: (context) => {
+				this.lastCollectedCount = (context as Paper[]).length;
+			},
+		};
+		this.plugin.collectflow.setMiddleware(middleware);
 	}
 
 	// Subscriptions.json -> apiDrafts. 설정탭을 열 때 한 번만 — 이후에는 UI가 진실이고
