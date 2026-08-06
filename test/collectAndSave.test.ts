@@ -183,16 +183,19 @@ describe('CollectAndSave.run — 사전 조건', () => {
 // 중복 제거는 run()의 책임이 아니라 'all' 미들웨어로 붙는다(별도 담당자). 여기서는
 // run()이 그 미들웨어가 기대는 계약을 실제로 지키는지만 검증한다.
 describe('CollectAndSave.run — 중복 제거 확장 지점', () => {
-	it('run()은 스스로 중복을 걸러내지 않는다 — 같은 논문이 두 번 들어오면 두 번 처리된다', async () => {
-		// 구독 2개가 같은 응답을 받는다 = 같은 sourceId가 두 번 들어온다.
+	it('run()은 스스로 목록에서 중복을 빼지 않는다 — 같은 논문이 두 번 들어오면 두 번 다 저장 경로를 탄다', async () => {
+		// 구독 2개가 같은 응답을 받는다 = 같은 sourceId가 두 번 들어온다. 이 목록 자체를
+		// 줄이는(splice) 건 미들웨어 몫이라, run()이 그걸 대신 하고 있지 않은지 확인한다.
+		// (embed() 호출 횟수는 검증하지 않는다 — 두 번째 논문은 B-2 재사용 경로로 인해
+		// 방금 이 실행에서 저장된 벡터를 그대로 쓰므로 embed()가 다시 불리지 않는 게 정상.)
 		writeSubscriptionsFile(['graph', 'network']);
 		arxivOnly(feed([entry()], 1));
-		const { spy, embedding } = fakeEmbedding();
+		const { embedding } = fakeEmbedding();
 
 		await collectFlow(embedding).run('recent', { hours: 24 });
 
-		assert.equal(spy.calls.length, 2, 'run()이 중복 제거를 하고 있다 — 미들웨어 몫이다');
-		// 같은 sourceId라 저장 경로가 같아 파일은 하나이고, 출처는 writePaper가 병합한다.
+		// 같은 sourceId라 저장 경로가 같아 파일은 하나이고, 출처는 writePaper가 병합한다 —
+		// 이 병합이 일어나려면 두 번째 논문도 writePaper까지 도달해야 한다(목록에서 안 빠짐).
 		assert.equal(vault.storedPapers().length, 1);
 		assert.deepEqual(vault.storedPapers()[0]?.paper.collectedApis, ['arxiv', 'arxiv']);
 	});
@@ -229,6 +232,115 @@ describe('CollectAndSave.run — 중복 제거 확장 지점', () => {
 
 		assert.equal(spy.calls.length, 3);
 		assert.equal(vault.storedPapers().length, 3);
+	});
+});
+
+// 4일 재스캔 창 때문에 recent 수집은 최근 논문을 매번 다시 훑는다. 이 두 문제는 실기기
+// 테스트에서 실제로 재현됐다: 임베딩 실패가 어제 성공한 벡터를 지우고(B-1), 같은 논문을
+// 실행마다 다시 임베딩해 낭비가 컸다(B-2). 둘 다 embedOrReuse()가 저장본을 먼저 확인해서
+// 해결한다 — B-1은 File.writePaperAt의 보존 규칙(백스톱)까지 이중으로 막는다.
+describe('CollectAndSave.run — 저장본 재사용/보존 (B-1, B-2)', () => {
+	it('이미 임베딩된 논문은 다시 임베딩하지 않고 기존 벡터를 재사용한다 (B-2)', async () => {
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([entry()], 1));
+		const { spy: spy1, embedding: embedding1 } = fakeEmbedding();
+		await collectFlow(embedding1).run('recent', { hours: 24 });
+		assert.equal(spy1.calls.length, 1, '첫 실행은 정상적으로 임베딩해야 한다');
+
+		// 같은 논문을 다시 수집 — 같은 sourceId라 저장본이 이미 있다.
+		arxivOnly(feed([entry()], 1));
+		const { spy: spy2, embedding: embedding2 } = fakeEmbedding();
+		await collectFlow(embedding2).run('recent', { hours: 24 });
+
+		assert.equal(spy2.calls.length, 0, '이미 성공한 논문을 또 임베딩했다 — 재작업 낭비');
+		assert.deepEqual(vault.storedPapers()[0]?.paper.embedding, [0.1, 0.2, 0.3]);
+		assert.equal(vault.storedPapers()[0]?.paper.embeddingSucceeded, true);
+	});
+
+	it('저장본이 실패 상태면 다시 임베딩한다', async () => {
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([entry()], 1));
+		const { embedding: failing } = fakeEmbedding({ failOn: () => true });
+		await collectFlow(failing).run('recent', { hours: 24 });
+		assert.equal(vault.storedPapers()[0]?.paper.embeddingSucceeded, false);
+
+		arxivOnly(feed([entry()], 1));
+		const { spy, embedding } = fakeEmbedding();
+		await collectFlow(embedding).run('recent', { hours: 24 });
+
+		assert.equal(spy.calls.length, 1, '실패 상태였던 논문은 재시도해야 한다');
+		assert.equal(vault.storedPapers()[0]?.paper.embeddingSucceeded, true);
+	});
+
+	it('임베딩이 실패해도 어제 성공했던 벡터를 지우지 않는다 (B-1)', async () => {
+		// 첫 실행: 정상 임베딩 성공.
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([entry()], 1));
+		const { embedding: ok } = fakeEmbedding();
+		await collectFlow(ok).run('recent', { hours: 24 });
+		assert.deepEqual(vault.storedPapers()[0]?.paper.embedding, [0.1, 0.2, 0.3]);
+
+		// 두 번째 실행에서 모델이 죽었다고 가정 — embedOrReuse가 저장본 확인 전에
+		// isModelInstalled() 사전 체크를 통과해야 여기까지 온다는 전제이므로, 모델은
+		// "설치됨"으로 두고 embed() 자체가 실패하는 시나리오로 재현한다.
+		arxivOnly(feed([entry()], 1));
+		const { embedding: failing } = fakeEmbedding({ installed: true, failOn: () => true });
+		// 저장본이 이미 성공 상태이므로 embedOrReuse는 애초에 embed()를 부르지 않는다 —
+		// 이 케이스는 File.writePaperAt의 보존 규칙(백스톱)이 아니라 재사용 경로가 막는다.
+		await collectFlow(failing).run('recent', { hours: 24 });
+
+		assert.deepEqual(
+			vault.storedPapers()[0]?.paper.embedding,
+			[0.1, 0.2, 0.3],
+			'성공했던 벡터가 실패로 덮였다',
+		);
+		assert.equal(vault.storedPapers()[0]?.paper.embeddingSucceeded, true);
+	});
+});
+
+describe('CollectAndSave.run — 미들웨어 실패 격리', () => {
+	it("'all' 미들웨어가 throw해도 이후 임베딩·저장·커서 갱신이 계속된다", async () => {
+		// testOptions.hours는 테스트 경로라 커서를 안 건드린다 — 커서 갱신까지 검증하려면
+		// 운영 경로(인자 없는 recent)로 불러야 한다.
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([entry()], 1));
+		const { spy, embedding } = fakeEmbedding();
+		const broken: Middleware = {
+			type: 'all',
+			run: () => {
+				throw new Error('중복 제거 버그');
+			},
+		};
+
+		const before = Date.now();
+		await collectFlow(embedding, [broken]).run('recent');
+		const after = Date.now();
+
+		assert.equal(spy.calls.length, 1, "'all' 실패로 이후 단계가 멈췄다");
+		assert.equal(vault.storedPapers().length, 1);
+		const updateTime = storedSubscriptions().updateTime;
+		assert.ok(
+			updateTime !== undefined && updateTime >= before && updateTime <= after,
+			'커서 갱신도 멈췄다',
+		);
+	});
+
+	it("'forEach' 미들웨어가 특정 논문에서 throw해도 나머지 논문은 계속 저장된다", async () => {
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed(entries(3), 3));
+		const { embedding } = fakeEmbedding();
+		const brokenOnSecond: Middleware = {
+			type: 'forEach',
+			run: (context) => {
+				if ((context as Paper).title === 'Paper 1') {
+					throw new Error('미들웨어 버그');
+				}
+			},
+		};
+
+		await collectFlow(embedding, [brokenOnSecond]).run('recent', { hours: 24 });
+
+		assert.equal(vault.storedPapers().length, 3, '실패한 논문 하나 때문에 나머지까지 저장이 안 됐다');
 	});
 });
 
@@ -455,6 +567,126 @@ describe('CollectAndSave.run — 커서', () => {
 			`잘렸는데 커서가 구간 끝으로 갔다: ${new Date(updateTime).toISOString()}`,
 		);
 		assert.equal(new Date(updateTime).getUTCFullYear(), 2025);
+	});
+});
+
+// ── File.writePaperAt 임베딩 보존 백스톱 ────────────────────────────
+// run()의 embedOrReuse()가 대부분의 경우를 먼저 막아주지만, File 계층의 이 규칙은
+// repair()나 앞으로 생길 다른 호출자까지 보호하는 안전망이라 run()을 거치지 않고
+// File.writePaper를 직접 두 번 불러 이 계층만 독립적으로 검증한다.
+describe('File.writePaper — 임베딩 보존 백스톱', () => {
+	it('기존이 성공 상태면, 실패 상태로 재저장해도 기존 벡터를 유지한다', async () => {
+		const paper = new Paper();
+		paper.title = 'T';
+		paper.authors = [];
+		paper.abstract = 'A';
+		paper.sourceId = 'arxiv:2501.00001';
+		paper.references = [];
+		paper.publicationDate = '2025-01-15';
+		paper.citationCount = 0;
+		paper.citationsKnown = true;
+		paper.collectedApis = ['arxiv'];
+		paper.collectedQueries = [{ searchType: 'keyword', query: 'q' }];
+		paper.embedding = [0.1, 0.2];
+		paper.embeddingModel = 'specter2';
+		paper.embeddingSource = 'local';
+		paper.embeddingSucceeded = true;
+		await File.writePaper(paper);
+
+		const retry = Object.assign(new Paper(), paper, {
+			embedding: [],
+			embeddingModel: '',
+			embeddingSource: '',
+			embeddingSucceeded: false,
+		});
+		await File.writePaper(retry);
+
+		const stored = (await File.readAllPapers())[0];
+		assert.deepEqual(stored?.embedding, [0.1, 0.2], '성공했던 벡터가 사라졌다');
+		assert.equal(stored?.embeddingSucceeded, true);
+	});
+
+	it('기존이 없으면 실패 상태를 그대로 저장한다 — 가짜 값을 지어내지 않는다', async () => {
+		const paper = new Paper();
+		paper.title = 'T2';
+		paper.authors = [];
+		paper.abstract = 'A';
+		paper.sourceId = 'arxiv:2501.00002';
+		paper.references = [];
+		paper.publicationDate = '2025-01-15';
+		paper.citationCount = 0;
+		paper.citationsKnown = false;
+		paper.collectedApis = ['arxiv'];
+		paper.collectedQueries = [{ searchType: 'keyword', query: 'q' }];
+		paper.embedding = [];
+		paper.embeddingModel = '';
+		paper.embeddingSource = '';
+		paper.embeddingSucceeded = false;
+		await File.writePaper(paper);
+
+		const stored = (await File.readAllPapers())[0];
+		assert.deepEqual(stored?.embedding, []);
+		assert.equal(stored?.embeddingSucceeded, false);
+	});
+});
+
+// 4일 재스캔 창이 같은 논문을 다시 저장 대상으로 올려도, 실제 값이 기존과 완전히 같으면
+// 디스크를 건드리지 않는다 — 안 그러면 내용이 똑같은데 파일 감시자/동기화가 매번
+// 깨어나고 updatedAt이 매번 지금 시각으로 갱신돼 "마지막으로 실제로 바뀐 시점"이 사라진다.
+describe('File.writePaper — 값이 같으면 재저장하지 않는다', () => {
+	function samplePaper(overrides: Partial<Paper> = {}): Paper {
+		const paper = new Paper();
+		paper.title = 'T';
+		paper.authors = ['Alice'];
+		paper.abstract = 'A';
+		paper.sourceId = 'arxiv:2501.00003';
+		paper.references = [];
+		paper.publicationDate = '2025-01-15';
+		paper.citationCount = 5;
+		paper.citationsKnown = true;
+		paper.collectedApis = ['arxiv'];
+		paper.collectedQueries = [{ searchType: 'keyword', query: 'q' }];
+		paper.embedding = [0.1, 0.2];
+		paper.embeddingModel = 'specter2';
+		paper.embeddingSource = 'local';
+		paper.embeddingSucceeded = true;
+		return Object.assign(paper, overrides);
+	}
+
+	it('완전히 같은 값으로 다시 저장하면 파일을 건드리지 않는다', async () => {
+		await File.writePaper(samplePaper());
+		const before = new Map(vault.files);
+
+		await File.writePaper(samplePaper());
+
+		assert.deepEqual(vault.files, before, '내용이 같은데 파일이 다시 써졌다(updatedAt 등)');
+	});
+
+	it('값이 하나라도 다르면(예: 인용수 보강) 정상적으로 다시 쓴다', async () => {
+		await File.writePaper(samplePaper({ citationCount: 5, citationsKnown: false }));
+		const before = new Map(vault.files);
+
+		await File.writePaper(samplePaper({ citationCount: 42, citationsKnown: true }));
+
+		assert.notDeepEqual(vault.files, before, '값이 바뀌었는데 파일이 그대로다');
+		const stored = (await File.readAllPapers())[0];
+		assert.equal(stored?.citationCount, 42);
+	});
+
+	it('새 구독이 출처를 추가하면(collectedApis 병합) 다시 쓴다', async () => {
+		await File.writePaper(samplePaper({ collectedApis: ['arxiv'], collectedQueries: [{ searchType: 'keyword', query: 'q' }] }));
+		const before = new Map(vault.files);
+
+		await File.writePaper(
+			samplePaper({
+				collectedApis: ['arxiv'],
+				collectedQueries: [{ searchType: 'keyword', query: 'other' }],
+			}),
+		);
+
+		assert.notDeepEqual(vault.files, before, '새 출처가 추가됐는데 파일이 그대로다');
+		const stored = (await File.readAllPapers())[0];
+		assert.equal(stored?.collectedApis.length, 2);
 	});
 });
 

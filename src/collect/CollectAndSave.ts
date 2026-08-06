@@ -77,22 +77,15 @@ export class CollectAndSave {
 		// 쓰는 바로 그 배열이라, 미들웨어가 in-place로 항목을 덜어내면(splice 등) 이후
 		// 임베딩·저장 단계가 줄어든 목록을 본다 — 중복 제거가 이 자리에 미들웨어로 붙는다.
 		// (Middleware.run은 void를 반환하므로 새 배열을 돌려주는 방식은 쓸 수 없다.)
-		for (const mw of this.middlewares) {
-			if (mw.type === 'all') {
-				await mw.run(papers);
-			}
-		}
+		await this.runMiddlewares('all', papers);
 
 		this.embedding.resetCircuitBreaker();
 		for (const paper of papers) {
-			// ⚠️ 반드시 순차 실행. embed()는 세션/서킷브레이커 상태를 락 없이 공유하므로
-			// Promise.all 등으로 병렬 호출하면 안 된다 (003 문서 "동시성 가정" 참고).
-			await this.embedOne(paper);
-			for (const mw of this.middlewares) {
-				if (mw.type === 'forEach') {
-					await mw.run(paper);
-				}
-			}
+			// ⚠️ 반드시 순차 실행. embedOrReuse()가 실제로 새 임베딩을 계산할 때
+			// embed()는 세션/서킷브레이커 상태를 락 없이 공유하므로 Promise.all 등으로
+			// 병렬 호출하면 안 된다 (003 문서 "동시성 가정" 참고).
+			await this.embedOrReuse(paper);
+			await this.runMiddlewares('forEach', paper);
 			await File.writePaper(paper);
 		}
 
@@ -211,7 +204,44 @@ export class CollectAndSave {
 		return collected;
 	}
 
+	// ── 미들웨어 ───────────────────────────────────────────────────
+
+	// 등록된 미들웨어 중 type이 일치하는 것만 순서대로 호출한다. 외부 개발자가 붙인
+	// 미들웨어의 버그(예외)가 수집 전체를 죽이면 확장 지점으로서 너무 위험하므로, 하나가
+	// 실패해도 나머지 미들웨어와 이후 단계(임베딩/저장/커서 갱신)는 계속 진행한다.
+	// Notice 등 UI를 여기서 띄우지 않는다 — CollectAndSave는 Obsidian을 몰라야 한다
+	// (다이어그램/001 합의). 실패 사실은 devtools 콘솔에만 남긴다.
+	private async runMiddlewares(type: Middleware['type'], context: unknown): Promise<void> {
+		for (const mw of this.middlewares) {
+			if (mw.type !== type) {
+				continue;
+			}
+			try {
+				await mw.run(context);
+			} catch (error) {
+				console.error(`[PaperGraph3D] '${type}' 미들웨어 실패 — 계속 진행합니다.`, error);
+			}
+		}
+	}
+
 	// ── 논문 한 편 ─────────────────────────────────────────────────
+
+	// 저장된 논문이 이미 임베딩에 성공했으면 그 벡터를 재사용하고, 아니면 새로 임베딩한다.
+	// 4일 재스캔 창(RESCAN_WINDOW_MS) 때문에 recent 수집은 매번 최근 논문을 다시 훑는데,
+	// 이 확인이 없으면 같은 논문을 실행마다 다시 임베딩하게 된다 — 파이프라인에서 가장
+	// 비싼 단계라 낭비가 크다. File.writePaperAt의 보존 규칙과 별개로(그건 안전망), 여기서
+	// 건너뛰어야 애초에 비용 자체가 안 든다.
+	private async embedOrReuse(paper: Paper): Promise<void> {
+		const stored = await File.readStoredPaper(paper);
+		if (stored?.embeddingSucceeded) {
+			paper.embedding = stored.embedding;
+			paper.embeddingModel = stored.embeddingModel;
+			paper.embeddingSource = stored.embeddingSource;
+			paper.embeddingSucceeded = true;
+			return;
+		}
+		await this.embedOne(paper);
+	}
 
 	private async embedOne(paper: Paper): Promise<void> {
 		try {

@@ -172,27 +172,19 @@ export class File {
 	// 해당 연도 폴더(PaperGraph3D/<year>/) 아래 모든 .json을 읽어 Paper 배열로 반환.
 	// 경로가 날짜로 결정되므로 연도만 있으면 sourceId 조회/인덱스 없이 일괄 로드된다.
 	static async readPapersByYear(year: number): Promise<Paper[]> {
-		const prefix = `${File.PAPER_ROOT}/${year}/`;
-		const files = File.vault
-			.getFiles()
-			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
-		const papers: Paper[] = [];
-		for (const file of files) {
-			const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
-			const paper = Object.assign(new Paper(), wrapper.paper);
-			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
-			paper.collectedApis ??= [];
-			paper.collectedQueries ??= [];
-			papers.push(paper);
-		}
-		return papers;
+		return File.readPapersUnder(`${File.PAPER_ROOT}/${year}/`);
 	}
 
 	// 콘텐츠 트리 전체(PaperGraph3D/ 아래 모든 연도)의 논문을 읽는다. 보정 패스
 	// (CollectAndSave.repair — 실패 플래그가 선 논문을 다시 시도)가 대상을 찾을 때 쓴다.
-	// vault.getFiles()가 이미 전체 목록을 주므로 연도를 열거할 필요가 없다.
 	static async readAllPapers(): Promise<Paper[]> {
-		const prefix = `${File.PAPER_ROOT}/`;
+		return File.readPapersUnder(`${File.PAPER_ROOT}/`);
+	}
+
+	// readPapersByYear/readAllPapers의 공통 몸통 — 둘 다 "이 prefix 아래 .json을 전부
+	// Paper로 읽는다"만 다르게 좁힌 것이라 한 곳에만 둔다. vault.getFiles()가 이미 전체
+	// 목록을 주므로 연도를 하나씩 열거할 필요가 없다.
+	private static async readPapersUnder(prefix: string): Promise<Paper[]> {
 		const files = File.vault
 			.getFiles()
 			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
@@ -212,6 +204,19 @@ export class File {
 	// 자유 본문을 보존한다.
 	static async writePaper(paper: Paper): Promise<void> {
 		await File.writePaperAt(paper, File.resolvePaperPath(paper));
+	}
+
+	// 이 Paper가 저장될 자리에 이미 저장돼 있는 논문을 읽는다. 없으면 null. 저장 경로가
+	// publicationDate/title/sourceId로 결정되므로, 넘긴 paper의 이 필드들이 실제 저장본과
+	// 같아야 같은 파일을 찾는다 — run()이 "이미 임베딩된 논문인가"를 판단할 때 쓴다.
+	static async readStoredPaper(paper: Paper): Promise<Paper | null> {
+		const jsonPath = `${File.resolvePaperPath(paper)}.json`;
+		const text = await File.readVaultText(jsonPath);
+		if (text === null) {
+			return null;
+		}
+		const wrapper = JSON.parse(text) as StoredPaperFile;
+		return Object.assign(new Paper(), wrapper.paper);
 	}
 
 	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
@@ -235,6 +240,27 @@ export class File {
 		// 그대로 덮으면 "이 논문이 어느 구독들에 걸렸는가"라는 정보가 매번 마지막에 쓴
 		// 구독 하나로 조용히 줄어든다.
 		File.mergeCollectionSources(paper, existing?.paper);
+
+		// 백스톱: run()이 이미 저장본을 확인해 성공한 임베딩은 재사용하지만(가장 흔한 경로),
+		// repair()나 앞으로 생길 다른 호출자가 그 확인을 건너뛰고 실패 상태로 다시 저장하면
+		// 멀쩡했던 벡터가 빈 값으로 덮인다 — 실제로 재현됨. 들어온 값이 실패인데 기존이
+		// 성공이면 기존 임베딩을 지키고, 그 외(기존도 실패/없음)는 003의 (b)대로 그대로 둔다.
+		if (!paper.embeddingSucceeded && existing?.paper.embeddingSucceeded) {
+			paper.embedding = existing.paper.embedding;
+			paper.embeddingModel = existing.paper.embeddingModel;
+			paper.embeddingSource = existing.paper.embeddingSource;
+			paper.embeddingSucceeded = true;
+		}
+
+		// 재스캔(4일 보정 창)이 같은 논문을 다시 저장 대상으로 올려도, 위 두 단계(출처
+		// 병합·임베딩 보존)를 거친 뒤 실제 값이 기존과 완전히 같으면 디스크에 다시 쓰지
+		// 않는다. 무조건 쓰면 (1) 내용이 똑같은데 파일 감시자/동기화가 매번 깨어나고,
+		// (2) updatedAt이 매번 지금 시각으로 갱신돼 "이 논문이 실제로 마지막으로 바뀐
+		// 시점"이라는 정보 자체가 사라진다. 인용수 보강이나 새 구독의 출처 추가처럼 값이
+		// 하나라도 실제로 다르면 정상적으로 다시 쓴다.
+		if (existing !== null && File.papersEqual(paper, existing.paper)) {
+			return;
+		}
 
 		const existingMd = await File.readVaultText(mdPath);
 		const userBody = existingMd ? File.parseUserBody(existingMd) : '';
@@ -280,6 +306,41 @@ export class File {
 			paper.collectedApis.push(api);
 			paper.collectedQueries.push(query);
 		}
+	}
+
+	// writePaperAt이 "다시 쓸 필요가 있는가"를 판단할 때 쓴다. JSON.stringify로 통째로
+	// 비교하지 않는 이유: 두 값의 프로퍼티 삽입 순서가 우연히 달라지면(예: 다른 생성
+	// 경로를 거친 Paper) 내용이 같아도 다르다고 오판할 수 있다. 필드별로 직접 비교하면
+	// 그 위험이 없다. collectedApis/collectedQueries는 인덱스가 한 쌍이라는 불변식이 있어
+	// 순서까지 같아야 진짜로 같은 것이다(정렬 없이 순차 비교).
+	private static papersEqual(a: Paper, b: Paper): boolean {
+		return (
+			a.title === b.title &&
+			a.abstract === b.abstract &&
+			a.sourceId === b.sourceId &&
+			a.publicationDate === b.publicationDate &&
+			a.citationCount === b.citationCount &&
+			a.citationsKnown === b.citationsKnown &&
+			a.embeddingModel === b.embeddingModel &&
+			a.embeddingSource === b.embeddingSource &&
+			a.embeddingSucceeded === b.embeddingSucceeded &&
+			File.arraysEqual(a.authors, b.authors) &&
+			File.arraysEqual(a.references, b.references) &&
+			File.arraysEqual(a.embedding, b.embedding) &&
+			File.arraysEqual(a.collectedApis, b.collectedApis) &&
+			File.searchQueriesEqual(a.collectedQueries, b.collectedQueries)
+		);
+	}
+
+	private static arraysEqual<T>(a: T[], b: T[]): boolean {
+		return a.length === b.length && a.every((v, i) => v === b[i]);
+	}
+
+	private static searchQueriesEqual(a: SearchQuery[], b: SearchQuery[]): boolean {
+		return (
+			a.length === b.length &&
+			a.every((q, i) => q.searchType === b[i]?.searchType && q.query === b[i]?.query)
+		);
 	}
 
 	// ── config 공통: encode/decode는 옵션(기본=평문 통과). Secret만 난독화 변환을 넘긴다.

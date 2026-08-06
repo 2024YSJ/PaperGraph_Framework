@@ -193,6 +193,13 @@ export class SettingTab extends PluginSettingTab {
 	// 반환하므로, 'all' 미들웨어로 관측해 여기 담아둔다 — collectDiagnostics() 참고.
 	private lastCollectedCount: number | undefined;
 	private diagnosticsRegistered = false;
+	// 진행률 표시용. Notice는 버튼 핸들러가 만들어 여기 보관하고, 미들웨어는 이 필드가
+	// 있을 때만 갱신한다 — run()/repair() 자체는 Notice를 전혀 모른다(아래
+	// ensureCollectDiagnostics 주석 참고). Backfill/보정처럼 이 필드를 안 쓰는 실행 중에는
+	// undefined로 남아 미들웨어가 아무 것도 하지 않는다.
+	private progressNotice: Notice | undefined;
+	private progressDone = 0;
+	private progressTotal = 0;
 
 	constructor(app: App, plugin: PaperGraph3D) {
 		super(app, plugin);
@@ -235,14 +242,9 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('최근 논문')
 					.setCta()
 					.onClick(() => {
-						void runCollectFlow('최근 논문 수집', button, async () => {
-							this.lastCollectedCount = undefined;
-							await this.plugin.collectflow.run('recent');
-							// this.lastCollectedCount로 직접 좁히면 tsc가 await 너머까지 필드
-							// 타입을 밀어붙여 else 분기를 never로 오판한다 — 로컬로 한 번 받는다.
-							const count = this.readLastCollectedCount();
-							return count !== undefined ? `${count}편 수집` : undefined;
-						});
+						void runCollectFlow('최근 논문 수집', button, () => this.runWithProgress(() =>
+							this.plugin.collectflow.run('recent'),
+						));
 					}),
 			)
 			.addButton((button) =>
@@ -277,12 +279,9 @@ export class SettingTab extends PluginSettingTab {
 							// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 							// "종료일 당일 포함"으로 맞춘다.
 							const to = toMidnight + 24 * 60 * 60 * 1000;
-							await runCollectFlow('Backfill', button, async () => {
-								this.lastCollectedCount = undefined;
-								await this.plugin.collectflow.run('backfill', { from, to });
-								const count = this.readLastCollectedCount();
-								return count !== undefined ? `${count}편 수집` : undefined;
-							});
+							await runCollectFlow('Backfill', button, () => this.runWithProgress(() =>
+								this.plugin.collectflow.run('backfill', { from, to }),
+							));
 						},
 					).open();
 				}),
@@ -525,6 +524,25 @@ export class SettingTab extends PluginSettingTab {
 		}
 	}
 
+	// run()을 진행률 로딩 바와 함께 실행한다. Notice 생성·표시·정리는 전부 여기(UI 계층)
+	// 안에 있고, run()에는 이 존재 자체가 전달되지 않는다 — 미들웨어가 채우는 필드
+	// (progressDone/progressTotal)를 폴링하듯 반영할 뿐이다. 실패해도(throw) 진행 중이던
+	// Notice는 반드시 치운다 — 안 그러면 다음 실행이 시작되기 전까지 화면에 남는다.
+	private async runWithProgress(action: () => Promise<void>): Promise<string | void> {
+		this.lastCollectedCount = undefined;
+		this.progressDone = 0;
+		this.progressTotal = 0;
+		this.progressNotice = new Notice(this.renderProgressFragment(), 0);
+		try {
+			await action();
+		} finally {
+			this.progressNotice?.hide();
+			this.progressNotice = undefined;
+		}
+		const count = this.readLastCollectedCount();
+		return count !== undefined ? `${count}편 수집` : undefined;
+	}
+
 	// this.lastCollectedCount를 직접 읽으면 tsc가 `= undefined` 대입 이후 await로
 	// 넘어간 지점까지 그 좁혀진(undefined-only) 타입을 그대로 밀어붙여, 실제로는 미들웨어가
 	// 값을 채워도 이후 비교를 항상 never로 오판한다(필드가 비동기 콜백으로 바뀔 수 있다는
@@ -533,21 +551,49 @@ export class SettingTab extends PluginSettingTab {
 		return this.lastCollectedCount;
 	}
 
-	// run()의 'all' 미들웨어로 수집 건수를 관측한다. 조건에 맞는 논문이 0편이라 정상
-	// 종료된 것과 실제 오류를 UI에서 구분하려면 이 값이 필요하다 — run() 자체는 다이어그램
-	// 계약상 void만 반환하므로 이 경로 말고는 건수를 알 방법이 없다.
+	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는
+	// 다이어그램 계약상 void만 반환하고 Notice/DOM을 전혀 모르므로(CollectAndSave는
+	// Obsidian을 몰라야 한다 — 001 합의), 관측은 항상 미들웨어를 경유한다. UI(Notice
+	// 생성·표시 문자열)는 이 안이 아니라 버튼 핸들러와 renderProgressFragment()에만 있다.
+	//
+	// ⚠️ 등록 순서 전제: 중복 제거 미들웨어가 나중에 'all'로 붙으면 이 진단보다 먼저
+	// 실행돼야 줄어든 개수가 총계로 잡힌다. 지금은 이 진단이 유일한 'all'이라 문제없다.
 	private ensureCollectDiagnostics(): void {
 		if (this.diagnosticsRegistered) {
 			return;
 		}
 		this.diagnosticsRegistered = true;
-		const middleware: Middleware = {
+		this.plugin.collectflow.setMiddleware({
 			type: 'all',
 			run: (context) => {
-				this.lastCollectedCount = (context as Paper[]).length;
+				const papers = context as Paper[];
+				this.lastCollectedCount = papers.length;
+				this.progressDone = 0;
+				this.progressTotal = papers.length;
+				this.updateProgressNotice();
 			},
-		};
-		this.plugin.collectflow.setMiddleware(middleware);
+		});
+		this.plugin.collectflow.setMiddleware({
+			type: 'forEach',
+			run: () => {
+				this.progressDone += 1;
+				this.updateProgressNotice();
+			},
+		});
+	}
+
+	// progressNotice가 있을 때만 갱신한다 — Backfill/보정처럼 진행률 Notice를 안 띄운
+	// 실행에서는 이 필드가 undefined라 미들웨어가 걸려도 아무 일도 하지 않는다.
+	private updateProgressNotice(): void {
+		this.progressNotice?.setMessage(this.renderProgressFragment());
+	}
+
+	private renderProgressFragment(): DocumentFragment {
+		const total = Math.max(this.progressTotal, 1); // <progress max="0">는 부정형(indeterminate)이 된다
+		return createFragment((el) => {
+			el.createDiv({ text: `수집한 논문 처리 중... (${this.progressDone}/${this.progressTotal}편)` });
+			el.createEl('progress', { attr: { value: this.progressDone, max: total } });
+		});
 	}
 
 	// Subscriptions.json -> apiDrafts. 설정탭을 열 때 한 번만 — 이후에는 UI가 진실이고

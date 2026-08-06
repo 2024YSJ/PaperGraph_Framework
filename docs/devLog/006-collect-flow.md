@@ -1,353 +1,220 @@
-# 8월 6일 작업 기록 (우빈 — CollectAndSave.run 구현)
+# 수집 클래스 완성 (우빈 — CollectAndSave.run/repair 구현)
 
-003(임베딩)·005(PCA)를 004에 병합한 뒤, 마지막까지 스텁으로 남아 있던
-`CollectAndSave.run()`을 구현했다. 이 함수가 없어서 `main.ts`의 수집 커맨드 두 개가
-"아직 구현되지 않음" Notice만 띄우고 있었고, 설정탭·시각화 뷰의 테스트 버튼들이
-`ArxivAPI`를 직접 호출하며 `run()`을 우회하고 있었다.
-
-003·004 devLog가 `run()` 구현자에게 남긴 계약을 하나씩 이행하는 것이 이번 작업의 목표다.
+`CollectAndSave.run()`/`repair()`을 구현하고, 그 위에서 실기기 테스트로 드러난 데이터
+유실·재작업·관측성 문제를 고쳤다. 003·004 devLog가 `run()` 구현자에게 남긴 계약을
+이행하는 것이 출발점이었고, 이후 실사용 중 발견한 결함들을 이어서 정리했다. 이 문서는
+그 과정에서 확정된 판단과 최종 코드 상태를 정리한다(중간에 만들었다 되돌린 것은 왜
+되돌렸는지만 남기고 본문에서는 뺐다).
 
 ## 흐름
 
-다이어그램 정의를 그대로 따랐다.
-
 ```
-구독 로드 -> 수집(모드별) -> 중복 제거 -> 미들웨어(all)
-  -> loop { 임베딩 -> 미들웨어(forEach) -> 저장 }
+구독 로드 -> 사전 확인(구독 존재/모델 설치) -> 수집(모드별)
+  -> 미들웨어(all) -> loop { 임베딩 또는 재사용 -> 미들웨어(forEach) -> 저장 }
   -> 커서 갱신
 ```
 
-세부 단계는 private 메서드로 쪼갰지만 **미들웨어 호출은 `run()` 본문에만 있다** —
-다이어그램이 "데이터 수집 함수에서 미들웨어 호출 ← 하면 안됨"으로 명시한 부분이다.
-수집 함수는 `Paper[]`를 반환하고 `run()`이 그 목록을 미들웨어에 인자로 넘긴다.
+미들웨어 호출은 `run()` 본문에서만 한다 — 다이어그램이 "데이터 수집 함수에서 미들웨어
+호출 ← 하면 안됨"으로 명시한 규칙. 수집 함수는 `Paper[]`를 반환하고 `run()`이 그
+목록을 미들웨어에 넘긴다. 순회·에러 격리만 담당하는 `runMiddlewares()` 헬퍼로 모아
+두었지만, 언제·무엇을 부를지 결정하는 흐름 제어는 여전히 `run()` 안에 있다.
+
+`repair()`는 `run()`과 별개 사이클이다. 저장된 논문 전체를 훑어(`File.readAllPapers()`)
+`embeddingSucceeded=false`는 재임베딩, `citationsKnown=false`는 S2 재보강을 시도한다.
+미들웨어는 돌리지 않는다 — 다이어그램의 미들웨어 흐름은 수집(run) 경로에 대한 정의이고,
+보정은 저장된 값 몇 개를 고치는 작업이라 범위 밖으로 뒀다.
 
 ## 확정 판단
 
-### 모델 미설치는 수집 시작 전에 끊는다 (문서에 없던 함정)
+### 모델 미설치는 수집 시작 전에 끊는다
 
-`Embedding.embed()` 코드를 읽다 발견한 것: **모델 미설치는 서킷브레이커를 트립시키지
-않는다.** `location === undefined`면 `recordFailure()`를 거치지 않고 곧장 throw하기
-때문이다("예상 가능한 상태 — 실패가 아니므로", `Embedding.ts` 주석). 그대로 진행하면:
+`Embedding.embed()`는 모델 미설치를 서킷브레이커에 반영하지 않는다
+(`recordFailure()`를 안 거치고 곧장 throw — "예상 가능한 상태"라는 이유). 그대로
+진행하면 논문 수만큼 조용히 throw만 반복하고 Notice 하나 없이 전부
+`embeddingSucceeded=false`로 저장된다. `run()`은 루프 진입 전, **네트워크를 쓰기
+전에** `isModelInstalled()`를 확인하고 미설치면 안내 메시지와 함께 throw한다.
 
-- 브레이커가 안 걸려 **논문 2000편이면 2000번 throw**하고,
-- `recordFailure()`를 안 타므로 **Notice가 한 번도 안 뜬다** — 왜 전부 실패했는지
-  사용자가 알 방법이 없다.
-- 재임베딩 경로가 아직 없어(003 문서), 그렇게 `embedding=[]`로 저장된 논문은 다음 수집
-  창에 다시 걸리지 않는 한 **영구히 빈 벡터로 남는다**.
+### 임베딩 실패 시 빈 값으로 저장 (스킵하지 않음)
 
-005 문서도 같은 시나리오를 다른 각도에서 경고한다 — 모델 미설치로 수집하면 전 논문이
-PCA에서 제외돼 "유효 0편" 에러가 나는데 화면엔 숫자만 보인다고.
+003이 남긴 두 선택지(저장 스킵 / 빈 값+`embeddingSucceeded=false`) 중 후자를 택했다.
+스킵하면 "이 논문이 임베딩에 실패했다"는 사실이 어디에도 안 남아 나중에 재임베딩
+대상을 찾을 수 없다. 가짜 벡터는 만들지 않는다.
 
-그래서 `run()`은 루프 진입 전이 아니라 **네트워크를 쓰기 전에** `isModelInstalled()`를
-확인하고, 미설치면 무엇을 해야 하는지 담아 throw한다. 조용히 코퍼스를 망치느니 아무것도
-하지 않는 쪽이 낫다는 판단이다.
+### 커서 정책
 
-### 임베딩 실패 시 (b) 선택 — 빈 값으로 저장
+- **첫 실행(커서 없음)**: `FIRST_RUN_HOURS`(24시간)로 시작한다. 커서 0에 재스캔 창을
+  그냥 빼면 음수 epoch이 돼 상한(MAX_PAGES=20)에 걸려 "가장 오래된 2000편"을 가져오는
+  엉뚱한 동작이 된다.
+- **재스캔 창**: `recent` 수집은 커서보다 `RESCAN_WINDOW_MS`(4일) 물러난 지점부터
+  다시 훑는다. arXiv는 제출과 색인 사이에 지연이 있어, 커서 시점부터만 훑으면
+  "커서를 지난 뒤에 색인된 논문"을 영영 못 본다. 이 창 자체는 커서에 반영하지 않는다.
+- **커서 갱신 경로 제한**: `advancesCursor` 플래그로 recent 운영 경로만 커서를
+  옮긴다. 범위를 직접 준 테스트 경로(`testOptions.hours`)와 `backfill`은 갱신하지
+  않는다 — 전자는 운영 커서 오염 방지, 후자는 "과거 구간을 메우는 작업"이라 최신
+  지점과 무관하기 때문.
+- **truncated 처리**: `lastCoverage.truncated`면 `coveredThrough`를 커서로 쓴다.
+  API가 여러 개면 가장 이른 지점(min)으로 보수적으로 맞춘다 — 요청 구간의 끝(`to`)을
+  그대로 쓰면 못 본 구간을 봤다고 기록해 영구 누락된다.
 
-003이 남긴 (a) 저장 스킵 / (b) 빈 값+`embeddingSucceeded=false` 중 (b). `SettingTab`의
-"테스트 (100개)" 버튼이 같은 이유로 (a)→(b)로 정정한 전례를 따랐다 — 스킵하면 "이 논문이
-임베딩에 실패했다"는 사실이 어디에도 안 남아 나중에 재임베딩 대상을 찾을 수 없다.
-가짜 벡터는 만들지 않는다(baseline 제거 원칙 유지).
+### Backfill은 구간 없이 거부한다
 
-### 커서가 없는 첫 실행은 24시간
+"어느 구간을 메울지"가 backfill의 본질이라 기본값을 지어내지 않고 명확한 에러를
+낸다. 범위 입력이 필요한 작업이라 커맨드 팔레트(인자를 못 받음)에는 두지 않았고,
+설정 탭의 Backfill 버튼(날짜 입력 모달)이 유일한 경로다.
 
-커서(`Subscriptions.updateTime`)가 0/undefined인 상태에서 보정 창을 그냥 빼면 음수
-epoch이 되어 1970년부터 훑게 된다. 그러면 상한(MAX_PAGES=20)에 걸려 **"조건에 맞는 가장
-오래된 2000편"**을 가져오는 엉뚱한 동작이 된다. 첫 실행은 `FIRST_RUN_HOURS`(24시간)
-구간으로 시작하고 커서를 거기서부터 전진시킨다.
+### API 호출·임베딩 모두 순차
 
-### 커서를 옮기는 경로를 하나로 제한
+API 순회, `embed()` 호출 둘 다 `for...of` + `await`다. API를 병렬로 부르면 arXiv의
+요청 간격 권고를 깨뜨리고, `embed()`는 세션/서킷브레이커 상태를 락 없이 공유해
+병렬 호출 시 레이스가 난다(003 문서 "동시성 가정").
 
-`advancesCursor` 플래그로 구분했다. 커서를 옮기는 건 **`recent` + 범위를 직접 주지 않은
-운영 경로** 뿐이다.
+### 중복 제거는 미들웨어 확장 지점이지 run()의 책임이 아니다
 
-- `testOptions.hours`를 준 테스트 경로: 운영 커서를 오염시키면 안 되므로 갱신 안 함.
-- `backfill`: 과거 구간을 메우는 작업이라 "어디까지 최신을 봤는가"와 무관 — 갱신 안 함.
+처음엔 `run()` 내부에 `sourceId` seen-set으로 중복을 걸러냈으나, 이후 논의로
+**미들웨어가 할 일**로 확정하고 `run()`에서 들어냈다. `run()`은 수집된 `Paper[]`를
+그대로 `'all'` 미들웨어에 넘기고, 그 미들웨어가 배열을 **in-place로** 줄이면(splice
+등) 이후 임베딩·저장 단계가 줄어든 목록을 본다 — `Middleware.run()`이 `void`를
+반환해 새 배열을 돌려주는 방식은 애초에 불가능하기 때문이다. 이 계약은 테스트로
+고정해뒀다(`test/collectAndSave.test.ts`의 "중복 제거 확장 지점" describe 블록).
 
-갱신할 때는 004가 경고한 대로 `lastCoverage.truncated`면 `coveredThrough`를 쓴다.
-API가 여러 개면 그중 가장 이른 지점(min)으로 보수적으로 맞춘다 — 하나라도 잘렸으면
-그 지점부터 다시 훑어야 한다.
+### 저장본 재사용/보존 — 왜 미들웨어가 아니라 run() 내부인가
 
-### backfill은 구간 없이 거부한다
+4일 재스캔 창 때문에 `recent` 수집은 최근 논문을 매번 다시 훑는데, 실기기 테스트에서
+두 문제가 실제로 나타났다.
 
-"어느 구간을 메울지"가 backfill의 본질이라 기본값을 지어내지 않고 명확한 에러를 낸다.
-⚠️ 그 결과 **`collect-backfill` 커맨드는 현재 항상 실패한다** — 아래 "열린 항목" 참고.
+- **재작업**: "이미 임베딩됐나" 확인이 없어 재스캔 창에 걸리는 논문마다 실행할
+  때마다 다시 임베딩했다(파이프라인에서 가장 비싼 단계).
+- **데이터 유실**: 임베딩이 이번엔 실패하면 `embedOne()`이 `embedding=[]`으로 채우고,
+  `File.writePaperAt`이 필드를 통째로 갈아끼워 **어제 성공한 벡터가 빈 값으로
+  파괴됐다**(재현 확인).
 
-### API 호출도 순차
+이걸 중복 제거처럼 미들웨어로 넘길 수 있는지 검토했으나 구조적으로 안 된다는
+결론이었다. `'all'`은 목록에서 항목을 **덜어내는** 것만 가능한데, 덜어내면
+`File.writePaper`에 도달하지 못해 출처 병합·인용수 갱신이 사라진다. `'forEach'`는
+임베딩이 **끝난 뒤** 호출돼 건너뛸 기회가 이미 지났다. 그래서 이 작업은 `run()`
+내부(`embedOrReuse()`)와 `File` 계층에 둔다.
 
-임베딩만이 아니라 API 순회도 `for...of` + `await`다. 병렬로 부르면 같은 호스트에 동시
-요청이 나가 arXiv의 요청 간격 권고(페이지 간 3초)를 깨뜨린다.
+- **`File.readStoredPaper(paper)`**: 이 논문이 저장될 경로에 이미 있는 저장본을
+  읽는다.
+- **`CollectAndSave.embedOrReuse(paper)`**: `embedOne()` 호출 전에 저장본을 확인해,
+  성공 상태면 그 벡터를 그대로 재사용하고 `embed()` 자체를 안 부른다. 논문은 그대로
+  `'forEach'` → `writePaper`로 흘러가므로 출처 병합·인용수 갱신은 정상 동작한다
+  (목록에서 빼는 방식과의 결정적 차이).
+- **`File.writePaperAt`의 보존 규칙**(백스톱): 들어온 논문의 임베딩이 실패 상태인데
+  기존 저장본이 성공 상태면 기존 값을 유지한다. `run()`의 재사용 경로가 대부분의
+  경우를 먼저 막지만, `repair()`나 앞으로 생길 다른 호출자까지 보호하는 안전망이다.
 
-### 중복 제거는 출처를 합치며 버린다
+### 재스캔 시 값이 같으면 다시 쓰지 않는다
 
-`sourceId` 기준 seen-set으로 걸러내되, 버리는 쪽의 `collectedApis`/`collectedQueries`를
-남는 쪽으로 옮긴다(인덱스 쌍 불변식 유지 — `File.mergeCollectionSources`와 같은 규칙).
-그냥 버리면 "이 논문이 어느 구독에도 걸렸다"는 정보가 사라진다.
+위 재사용 규칙을 적용해도 `writePaperAt`은 여전히 무조건 디스크에 다시 쓰고
+있었다. 재스캔 창에 걸리는 논문은 대부분 아무것도 안 바뀌는데도 매번 `.json`+`.md`를
+다시 써서, 내용이 같은데 파일 감시자/동기화 플러그인이 매번 깨어나고 `updatedAt`이
+매번 갱신돼 "이 논문이 실제로 마지막으로 바뀐 시점"이라는 정보가 사라졌다.
 
-## `main.ts` 커맨드 catch 교체
+`File.papersEqual(a, b)`로 필드별 직접 비교(순서에 흔들리는 `JSON.stringify` 통짜
+비교 대신 — 프로퍼티 삽입 순서가 다른 생성 경로에서 우연히 달라지면 내용이 같아도
+다르다고 오판할 수 있다)해서, 출처 병합·임베딩 보존을 마친 뒤에도 기존과 완전히
+같으면 **`.json`/`.md` 둘 다 안 쓰고 조기 반환**한다. 인용수 보강, 새 구독의 출처
+추가처럼 값이 실제로 바뀌면 정상적으로 다시 쓴다.
 
-004가 지적한 대로 `catch { new Notice('아직 구현되지 않음...') }`을 실제 에러 표시로
-바꿨다. `run()`이 사용자가 무엇을 해야 하는지 담아 throw하므로(모델 미설치, 구독 없음,
-구간 누락) 그 메시지를 그대로 보여주는 게 가장 유용하다. 성공 시 Notice도 추가했다 —
-그전엔 성공/실패 어느 쪽도 표시가 없었다.
+### 미들웨어 실패 격리
+
+`run()`의 미들웨어 호출을 `runMiddlewares(type, context)`로 모으고 try/catch로
+감쌌다. 외부 개발자가 붙인 미들웨어의 버그 하나가 수집 전체(임베딩·저장·커서 갱신)를
+죽이면 확장 지점으로서 너무 위험하다. `console.error`로만 기록하고 `Notice`는 띄우지
+않는다 — `CollectAndSave`는 Obsidian을 몰라야 한다는 001 합의를 지키기 위해서다.
+
+### 진행률 로딩 바 — UI/core 분리
+
+`run()` 시그니처는 그대로 두고, 설정 탭에 등록한 진단용 미들웨어로 관측한다.
+`Notice` 생성·표시·정리는 전부 `SettingTab.ts`(UI 계층) 안에 있고, `run()`은 그
+존재조차 모른다 — `'all'`이 총 개수를, `'forEach'`가 논문마다 진행 카운터를 채우면
+UI가 그 필드를 읽어 `Notice.setMessage()`로 `<progress>` 엘리먼트를 갱신한다
+(`Notice`가 `DocumentFragment`를 받는다). `progressNotice` 필드가 없을 때(Backfill/
+보정처럼 로딩 바를 안 띄운 실행)는 미들웨어가 아무 일도 하지 않는다. 같은 미들웨어가
+"몇 편 수집했는지"(수집 0편과 실제 오류를 구분하지 못하던 문제)도 함께 해결한다 —
+`run()`이 `Promise<void>`만 반환해 이 값을 자체적으로 알려줄 수 없기 때문이다.
+
+### File.ts 함수 중복 제거
+
+`readPapersByYear`(시각화 phase가 연도 단위로 읽을 자리)와 `readAllPapers`(보정
+패스가 전체를 훑을 자리)가 필터링 prefix 한 줄만 다르고 나머지 몸통이 완전히
+같았다. `readPapersUnder(prefix)` private 헬퍼로 몸통을 합쳤다(동작 변화 없음).
+
+### `main.ts` 커맨드는 "아직 구현되지 않음" 상태를 유지한다
+
+커맨드 팔레트의 두 커맨드(`collect-recent`, `collect-repair`)는 `EventListener.checking()`
+→ `TaskManager.runTask()`를 거쳐야 하는데, 이 둘이 아직 스텁이다(`throw`만 함,
+담당자 미배정 — 8/1 회의록 역할분담에 없음). 그래서 커맨드는 여전히 "아직 구현되지
+않음" Notice만 띄운다. **설정 탭의 수집/보정 버튼이 `plugin.collectflow`를 직접
+호출하는 유일한 실동작 경로다.**
 
 ## 검증
 
-`test/collectAndSave.test.ts`에 통합 테스트 19건을 추가했다(전체 36 → 55건).
-**대역은 네트워크(`requestUrl`)와 Vault 둘뿐이고 `File`·`ArxivAPI`·`CollectAndSave`는
-전부 실제 코드가 돈다** — 커서가 정말 JSON으로 왕복하는지, `writePaper`가 기존 파일을
-읽어 출처를 병합하는지는 `File`을 흉내 내면 검증되지 않기 때문이다.
+`test/collectAndSave.test.ts`에 통합 테스트를 추가해 총 **74건**(원래 36건에서
+시작). 대역은 네트워크(`requestUrl`)와 Vault 둘뿐이고 `File`·`ArxivAPI`·
+`CollectAndSave`는 전부 실제 코드가 돈다 — 커서가 정말 JSON으로 왕복하는지,
+`writePaper`가 기존 파일을 읽어 값을 병합/보존하는지는 각 클래스를 흉내 내면
+검증되지 않기 때문이다.
 
-`run()`이 `File.readSubscriptions()`로 구독을 직접 읽는 구조라 대역 API를 주입할 수 없어,
-`Subscriptions.json`을 심어 실제 `ArxivAPI`가 복원되게 하고 응답만 대역으로 뒀다.
+주요 검증 영역: 사전 조건(구독 없음/모델 미설치/backfill 구간 누락·NaN이 네트워크
+전에 멈추는지), 중복 제거 확장 지점 계약, 임베딩 계약(순차 호출·서킷브레이커
+초기화·실패해도 저장), 미들웨어 호출 순서·인자·실패 격리, 커서 전진·첫 실행·재스캔
+보정·truncated 처리, 저장본 재사용/보존(B-1/B-2), 재쓰기 스킵, `repair()`의 대상
+선별과 디스크 불변성, 새 설치 환경(`Subscriptions.json` 없음)에서의 안전한 폴백.
 
-검증한 것: 사전 조건 4건(구독 없음/모델 미설치/backfill 구간 누락·NaN — 전부 **요청이
-나가기 전에** 멈추는지 확인), 중복 제거 3건, 임베딩 계약 3건(순차 호출·브레이커 초기화·
-실패해도 저장), 미들웨어 4건(all/forEach 호출 횟수와 인자, visual 제외, forEach가 임베딩
-후·저장 전인지), 커서 6건(전진·첫 실행·4일 보정·테스트 경로 비오염·backfill 비오염·
-truncated 시 coveredThrough 사용).
+`npm run build`(tsc + esbuild) / `npm test`(74/74) / `npx eslint src test`(0 errors)
+통과. Obsidian 앱을 직접 열어 수동 클릭하는 검증은 하지 않았다.
 
 **임시 테스트 인프라 추가분** (004.md의 삭제 목록에 함께 포함될 것):
-- `test/helpers/vaultStub.ts` — 메모리 Vault 대역
-- `test/stubs/obsidian.ts`에 `TFile`/`TFolder`/`Notice` 추가
+`test/helpers/vaultStub.ts`(메모리 Vault 대역), `test/stubs/obsidian.ts`에
+`TFile`/`TFolder`/`Notice` 추가.
 
-`npm run build`(tsc + esbuild), `npm test`(55/55), `npx eslint src test`(0 errors) 통과.
-Obsidian 앱을 직접 열어 수동 클릭하는 검증은 하지 않았다.
+## 알려진 함정 (재발 방지 기록)
 
-## 2차 작업 (8월 7일): 보정 패스 · API 레지스트리 · 구독 UI 배선
-
-1차 작업의 "열린 항목" 중 팀 논의로 방향이 확정된 것들을 구현했다.
-
-### API 레지스트리 — 지원 API 목록을 코드 레벨로
-
-`File.createApi`의 switch를 `API_FACTORIES` 레코드로 승격하고
-`File.supportedApiNames()`를 노출했다. 구독 UI의 API 선택 드롭다운과 createApi가
-같은 목록을 보므로 "UI는 받는데 복원은 못 하는 이름"이 생길 수 없다. 새 API 추가 =
-레코드 한 줄 + import (UI 자동 반영).
-
-### 보정 패스 — `CollectAndSave.repair()`
-
-run()과 **별개 사이클**. 저장된 논문 전체를 훑어(`File.readAllPapers()` 신설 —
-`vault.getFiles()` 기반이라 연도 열거 불필요) 실패 플래그가 선 것만 재시도한다:
-
-- `embeddingSucceeded=false` → 재임베딩 (003 계약 그대로: 사전 모델 체크, 순차 호출,
-  실패 시 값 유지)
-- `citationsKnown=false` → S2 재보강. `ArxivAPI.enrichCitations`를
-  **`EnrichCitations`로 공개**하고 `API` 인터페이스에 추가 — 내부의
-  `if (citationsKnown) continue` 필터가 드디어 실사용된다(004가 예정했던 "저장된
-  논문을 다시 읽어오는 호출자"가 바로 이것). 재임베딩과 재보강은 다른 실패·다른
-  재시도지만 "읽기→필터→재시도→재저장" 뼈대 하나를 공유한다.
-- **큐를 두지 않았다** — 디스크의 실패 플래그가 곧 재시도 목록이라, 별도 큐는
-  큐↔디스크 동기화 문제만 새로 만든다. 값이 실제로 바뀐 논문만 재저장한다.
-- 미들웨어는 돌리지 않는다(다이어그램의 미들웨어 흐름은 수집 경로 정의).
-- `collect-repair` 커맨드 + `collect:repair` Task + 설정탭 "보정" 버튼으로 노출.
-
-### 설정탭 개편
-
-- **직접 호출 수집 버튼 3개(최근 논문/Backfill/커스텀 검색) 삭제** →
-  `run('recent')` / `run('backfill', {from,to})` / `repair()` 경유 버튼으로 교체.
-  Backfill은 날짜 입력 모달(종료일 당일 포함 +1일 로직 유지)로 범위를 받는다.
-  실행 중 버튼을 잠근다 — 연타로 두 실행이 겹치면 embed() 순차 계약이 실행 단위에서
-  깨진다. `CollectResultModal.ts` 삭제(유일 참조처가 사라짐).
-- **`collect-backfill` 커맨드 제거** — 범위 입력이 필수인 작업이라 인자를 못 받는
-  커맨드 팔레트에서는 항상 실패한다. 설정탭 Backfill 버튼이 유일한 경로.
-- **구독 UI 배선**: API 이름 자유 텍스트 → `supportedApiNames()` 드롭다운. 설정탭을
-  열면 `readSubscriptions()`로 복원하고, 추가/삭제 때마다 즉시 저장한다. 저장 시
-  현재 저장본을 읽어 apis만 갈아끼운다 — **updateTime(수집 커서)을 UI 저장이
-  덮어쓰면 다음 수집 구간이 틀어진다.** 조건 최대 3개(004 AND 규칙) 초과는 Notice로
-  거부. 같은 API 중복 등록은 허용(같은 arXiv에 다른 조건 묶음 = 정당한 구독).
-- **함정 버튼 2개 제거**: "저장 테스트 — Subscriptions"(`apis: []` 하드코딩 → 누르면
-  등록된 구독 전멸)와 "저장 테스트 — Secret"(`new Secret()` → 누르면 등록된 API 키
-  전멸). 둘 다 실데이터가 저장되는 지금은 데이터 파괴 버튼이었다.
-
-### 검증 (2차)
-
-`repair` 통합 테스트 5건 추가(전체 55 → 60건): 모델 미설치 시 시작 전 중단 /
-실패 플래그 선 논문만 재시도 / 재실패 시 디스크 불변 / S2 요청에 대상만 실림 /
-건강한 논문은 재시도·재저장 없음. 테스트 작성 중 실제 파이프라인이 sourceId를
-**버전 없이**(`arxiv:2501.00003`) 저장한다는 것도 재확인했다 — S2 정렬 검증이
-`stripVersion(echoed) !== id` 비교라, 버전 붙은 sourceId를 심으면 보강이 조용히
-버려진다. `VaultStub.getFiles()`/`TFile.extension` 스텁 보강.
-`npm run build` / `npm test`(60/60) / `eslint`(0 errors) 통과. Obsidian 수동 검증은
-하지 않았다.
-
-## 3차 작업 (8월 7일): 아키텍처 리뷰 반영
-
-수석 아키텍처 리뷰에서 나온 지적 중 팀 결정으로 확정된 것만 반영했다. 리뷰가 제안했던
-변경 중 실제로 틀렸던 판단(모델 미설치 시 재보강도 막아야 하는지, 재임베딩 자동 트리거
-여부)은 팀 논의로 기각됐다 — 아래 "기각된 리뷰 제안" 참고.
-
-### 중복 제거를 run()에서 들어냄 — 미들웨어 확장 지점으로 이동
-
-`dedupe()`/`mergeCollectionSources()`(private static)를 `CollectAndSave`에서
-삭제했다. 중복 제거는 담당자가 따로 있는 작업이라 run()이 직접 구현할 것이 아니었다.
-`run()`은 수집된 `Paper[]`를 그대로 `'all'` 미들웨어에 넘기고, 그 미들웨어가 배열을
-**in-place로** 줄이면(splice 등) 이후 임베딩·저장 단계가 줄어든 목록을 본다 —
-`Middleware.run()`이 `void`를 반환하므로 새 배열을 돌려주는 방식은 애초에 불가능하고,
-받은 참조를 직접 수정하는 것만 유일한 경로다. 이 계약을 테스트로 고정해뒀다
-(`test/collectAndSave.test.ts`의 "중복 제거 확장 지점" describe 블록) — 중복 제거를
-구현할 담당자가 참고할 수 있는 최소 예시이기도 하다.
-
-### `main.ts` 커맨드 메시지를 "아직 구현되지 않음"으로 되돌림
-
-1차 작업에서 004의 "run() 구현 후 catch를 실제 에러 표시로 바꿀 것" 지시를 그대로
-따랐는데, **`EventListener.checking()`/`TaskManager.runTask()`가 여전히 스텁**이라는
-전제를 확인하지 않았다. 그 결과 커맨드 팔레트에서 최근 논문 수집을 실행하면
-`Not implemented: EventListener.checking(...)`이라는 내부 스텁 메시지가 사용자에게
-그대로 노출되고 있었다. `EventListener`/`TaskManager` 담당자는 8/1 회의록 역할분담에
-아예 없어 주인 없는 공용 인프라로 남아 있다 — 수집 담당이 만들 수는 있지만
-(이벤트 배선 → run()/repair() 도달 경로가 지금 이것 때문에 막혀 있으므로) 이번
-작업 범위로 넣지 않기로 하고, 우선 정직한 메시지로만 되돌렸다. `errorMessage()`
-헬퍼는 참조가 사라져 같이 지웠다.
-
-**다음에 EventListener/TaskManager를 구현할 때 정해야 할 것** (구조는 다이어그램에
-있지만 아래는 안 정해져 있다):
-1. `EventListener`가 `TaskManager`를 참조할 필드가 없다 — 다이어그램에도 연결선 없음.
-   `main.ts.init()`에서 필드 주입이 결이 맞아 보인다.
-2. `checking(eventName, ...args)` / `runTask(taskName, ...args)` / `Task.func(...args)`
-   세 군데 다 `unknown[]`으로 열려 있는데 아무도 실제로 안 쓴다 — 지금 두 Task는
-   클로저로 인자를 다 담아버려서 `args`가 필요 없다. 쓸지 말지 결정 필요.
-3. 매칭 안 되는 eventName/taskName일 때 throw vs 무시.
-4. 같은 eventName에 여러 task를 걸 수 있는가(`events`가 배열이라 구조상 가능) —
-   001의 "미들웨어/태스크를 얹어 확장" 프레임워크화 방향과는 팬아웃(find가 아니라
-   filter) 쪽이 더 맞아 보인다. 이 결정은 시각화 phase도 그대로 물려받으므로 팀 공유 필요.
-5. 팬아웃이면 반환 타입도 `Promise<unknown>`에서 배열로 바뀌어야 한다.
-
-## 4차 작업 (8월 7일): 새 설치 환경에서 설정탭이 죽던 버그 수정
-
-"다른 팀원이 pull받아서 임시 UI로 바로 테스트할 수 있는 상태인가"를 점검하다가 발견한
-회귀. 커맨드 팔레트 2개가 막혀 있어도 설정탭 버튼(최근 논문/Backfill/보정/구독 UI)은
-전부 `plugin.collectflow`를 직접 호출하므로 `EventListener`와 무관하게 동작해야
-정상인데, **`Subscriptions.json`이 한 번도 생성된 적 없는 완전히 새 환경**에서는
-설정탭을 여는 순간부터 막혀 있었다.
-
-### 원인
-
-`File.readSubscriptions()`가 파일이 없을 때 돌려주는 폴백이 `apis`를 세팅하지 않았다:
-
-```ts
-() => {
-    const subscriptions = new Subscriptions();
-    subscriptions.secret = secret;
-    return subscriptions;   // apis는 세팅 안 함
-}
-```
-
-`Subscriptions.apis!: API[]`가 non-null assertion이라 컴파일은 통과하지만 런타임 값은
-`undefined`다. 2차 작업에서 추가한 `SettingTab.loadSubscriptions()`가
-`subscriptions.apis.map(...)`으로 이 값을 바로 순회하면서
-`TypeError: Cannot read properties of undefined (reading 'map')`로 터졌다. try/catch로
-감싸둬서 앱이 죽지는 않지만, **새로 pull받은 사람이 설정탭을 여는 첫 순간마다 에러
-Notice가 뜨는** 최악의 타이밍이었다 — 정확히 이번 작업으로 새로 생긴 화면(구독 UI)이
-가장 먼저 이 값에 의존했기 때문에 이전에는 드러나지 않던 경로다.
-
-`run()` 쪽은 `const apis = this.sub.apis ?? []`로 이미 방어돼 있어 영향이 없었다 —
-같은 값을 쓰는 두 호출자 중 하나만 방어돼 있던 상태.
-
-### 수정
-
-호출자마다 방어하는 대신 값을 만드는 자리(`File.ts`의 폴백)에서 고쳤다 — 앞으로
-`readSubscriptions()`를 쓸 다른 호출자도 같은 함정을 밟지 않도록.
-
-```ts
-() => {
-    const subscriptions = new Subscriptions();
-    subscriptions.secret = secret;
-    subscriptions.apis = [];
-    return subscriptions;
-}
-```
-
-### 검증
-
-`File.readSubscriptions()`가 파일 없을 때 `apis`로 빈 배열(undefined 아님)을 돌려주는지
-확인하는 회귀 테스트를 추가했다(60 → 61건).
-
-### 같은 유형 전수 점검에서 추가로 나온 2건
-
-위 버그가 "`!` 단언이라 타입은 채워진 것처럼 보이지만 런타임 값은 undefined"라는 유형이라,
-push 전에 `src/` 전체의 `!` 필드와 설정탭 상태 흐름을 훑어 같은 유형을 더 찾았다.
-
-1. **`updateTime`도 같은 폴백에서 비어 있었다.** 지금은 `resolveWindow()`의
-   `typeof cursor === 'number'` 검사와 `JSON.stringify`가 undefined 키를 버리는 성질
-   덕에 우연히 안전했지만, 방어가 두 군데로 흩어져 있어 하나만 바뀌어도 깨진다.
-   파일이 있을 때의 `data.updateTime ?? 0`과 같은 값(0)으로 폴백도 맞춰, 두 경로가
-   같은 모양을 내놓게 했다.
-2. **설정탭 API 드롭다운의 표시값과 내부 상태가 어긋날 수 있었다.** `apiNameDraft`는
-   `''`로 시작하는데 `loadSubscriptions()`가 끝나야 `'arxiv'`가 채워진다. 그 사이의
-   첫 렌더에서는 드롭다운이 첫 옵션(`arxiv`)을 보여주지만 내부 값은 `''`이라,
-   사용자가 그 상태에서 "추가"를 누르면 길이 검사에 걸려 **아무 일도 일어나지 않는다**.
-   드롭다운을 만드는 시점에 비어 있으면 첫 옵션으로 채우도록 고쳤다(표시값과 상태 일치).
-
-### 데이터 유실 경로 차단 (읽기 실패 후 저장)
-
-점검 중 발견한 별개 문제. `loadSubscriptions()`가 실패해도 `subscriptionsLoaded`를
-`true`로 세팅하고 `apiDrafts`는 빈 채로 남는다. 이 상태에서 사용자가 API를 하나 추가하면
-`persistSubscriptions()`가 **화면의 빈 목록으로 디스크를 덮어써, 읽지 못했을 뿐 멀쩡히
-있던 구독이 사라진다.**
-
-현실적인 발생 경로가 있다: 팀원이 새 API를 추가한 브랜치에서 구독을 저장하면
-`Subscriptions.json`에 이 버전이 모르는 `apiName`이 들어가고, 옛 코드로 열면
-`File.createApi`가 `Unknown apiName`으로 throw → 읽기 실패 → 위 시나리오 성립.
-
-`subscriptionsUnreadable` 플래그를 두어 **읽지 못한 상태에서는 저장을 거부**하도록 했다
-(이유를 담은 Notice로 안내). 읽기가 성공하면 플래그가 해제된다. "읽지 못한 데이터를
-덮어쓰지 않는다"는 규칙이라, 앞으로 구독 UI를 확정 디자인으로 갈아끼울 때도 유지해야 한다.
-
-`File.readSubscriptions()`가 모르는 apiName에 대해 조용히 빈 목록을 주지 않고 실제로
-throw하는지도 테스트로 고정했다 — 이 동작이 위 방어의 전제다.
-
-### 최종 검증
-
-`npm run build` / `npm test`(63/63) / `eslint src test`(0 errors) 통과.
-Obsidian 수동 검증은 하지 않았다.
+- **tsc/eslint 오탐**: 비동기 콜백(미들웨어)이 나중에 바꾸는 인스턴스 필드를
+  `await` 직후 직접 읽으면, `= undefined` 대입 시점의 좁혀진 타입을 정적 분석이
+  그대로 밀어붙여 `restrict-template-expressions`가 실제로는 값이 있는데도
+  `never`로 오판한다. `private readX(): T | undefined { return this.x; }`처럼
+  함수 호출로 감싸 선언된 반환 타입만 보게 하면 피해진다.
+- **`File.readSubscriptions()`의 빈 폴백**: `Subscriptions.json`이 없을 때 돌려주는
+  기본값은 `apis`/`updateTime`을 명시적으로 채운다(`!` 단언만 믿고 비워두면 컴파일은
+  통과해도 런타임에 `undefined`라 호출자가 `.map()` 등에서 터진다 — 새 설치 환경에서
+  실제로 재현됐다).
+- **읽기 실패 후 저장 금지**: 설정 탭 구독 UI는 `Subscriptions.json`을 못 읽은
+  상태에서는 저장을 거부한다(`subscriptionsUnreadable` 플래그). 안 그러면 화면의 빈
+  목록이 디스크의 멀쩡한 구독을 덮어쓴다 — 예: 이 코드가 모르는 `apiName`이 저장돼
+  있으면 읽기가 throw하는데, 그 상태에서 UI가 저장을 허용하면 기존 구독이 사라진다.
 
 ## 열린 항목 / 다음 담당자 참고
 
+- **EventListener/TaskManager가 스텁**이라 커맨드 팔레트가 동작하지 않는다. 구현
+  시 정해야 할 것들:
+  1. `EventListener`가 `TaskManager`를 참조할 필드가 없다 — 다이어그램에도
+     연결선 없음. `main.ts.init()`에서 필드 주입이 결이 맞아 보인다.
+  2. `checking(eventName, ...args)` / `runTask(taskName, ...args)` /
+     `Task.func(...args)`의 `unknown[]`을 실제로 쓸지 — 지금 두 Task는 클로저로
+     인자를 다 담아버려서 `args`가 필요 없다.
+  3. 매칭 안 되는 eventName/taskName일 때 throw vs 무시.
+  4. 같은 eventName에 여러 task를 걸 수 있는가(`events`가 배열이라 구조상 가능) —
+     001의 "미들웨어/태스크를 얹어 확장" 방향과는 팬아웃(find가 아니라 filter)이
+     더 맞아 보인다. 시각화 phase도 이 결정을 물려받으므로 팀 공유 필요.
+  5. 팬아웃이면 반환 타입도 `Promise<unknown>`에서 배열로 바뀌어야 한다.
+- **S2 배치 조회 중복은 여전히 막지 못한다.** `EnrichCitations`는 `collectWindow`
+  안에서 반환 전에 돈다 — API 인스턴스마다 자기 결과를 각자 보강하므로, 그 뒤에
+  붙는 중복 제거 미들웨어로는 이미 나간 요청을 되돌릴 수 없다(임베딩 중복은
+  막았음). 보강을 API 밖으로 빼야 하는데 "API = Paper를 완성하는 방법"이라는 현재
+  설계와 충돌해 별도 논의가 필요하다. `repair()`가 놓친 보강을 주기적으로 메워주므로
+  실질 피해는 중복 요청 비용뿐이다.
 - **시각화 뷰의 "실제 arXiv 수집으로 실행"은 여전히 `run()`을 우회한다** — 시각화
-  담당자 영역이라 손대지 않았다. `run()`은 결과를 반환하지 않고 저장까지 해버리므로,
-  교체하려면 미들웨어(`type: 'all'`)로 결과를 가로채는 방식이 자연스럽다 — 미들웨어의
-  첫 실사용처가 될 수 있다.
-- **API 키 입력 UI("임시 UI — 아직 저장되지 않습니다")는 여전히 미연결** — 키 등록은
-  FileTestModal의 Secret 폼으로 가능해 이번 범위에서 뺐다. 확정 설정 UI 작업 때 함께.
+  담당자 영역이라 손대지 않았다. 교체하려면 `'all'` 미들웨어로 결과를 가로채는
+  방식이 자연스럽다.
+- **API 키 입력 UI("임시 UI — 아직 저장되지 않습니다")는 여전히 미연결** — 키
+  등록은 FileTestModal의 Secret 폼으로 가능해 이번 범위에서 뺐다.
 - **구독 UI의 확정 디자인**(라디오 등)은 시각화 클래스 이후 별도 작업 — 현재 배선은
   유지한 채 표현만 갈아끼우면 된다.
-
-## 5차 작업 (8월 7일): "성공 Notice는 뜨는데 파일이 없다" — 수집 건수 관측성 추가
-
-실기기(Obsidian)에서 처음 돌려본 팀원이 보고한 증상. 원인은 버그가 아니라 관측성
-부족이었다: `run()`은 다이어그램 계약상 `Promise<void>`라 몇 편을 수집했는지 자체적으로
-알려주지 않는데, `runCollectFlow()`가 에러만 없으면 무조건 "마쳤습니다"를 띄워서
-**구독 조건에 맞는 논문이 0편이라 정상 종료된 것**과 실제 성공을 구분할 방법이
-없었다 — 폴더 생성 로직(`Vault.createFolder`는 중첩 경로를 재귀 생성하므로 혐의
-없음 확인)이 아니라 이쪽이 원인이었다.
-
-### 수정
-
-`SettingTab`에 진단용 `'all'` 미들웨어를 등록해 직전 `run()` 호출이 실제로 넘긴
-`Paper[]`의 길이를 관측하고, "최근 논문"/"Backfill" 버튼의 성공 Notice에
-"(N편 수집)"으로 붙인다. 004의 "임베딩 실패 시 collectResultModal 대신 미들웨어로
-결과를 가로채는 방식이 자연스럽다"던 메모가 실제로 처음 쓰인 자리다.
-
-- 미들웨어는 `display()`가 열릴 때마다 다시 등록되면 안 되므로(같은 `collectflow`
-  인스턴스에 중복 누적) `diagnosticsRegistered` 플래그로 1회만 등록한다.
-- 건수는 호출 직전 `undefined`로 리셋하고 `run()` 완료 후 읽는다 — `run()`이 구독
-  없음/모델 미설치 등으로 미들웨어 도달 전에 throw하면 `undefined`로 남아 Notice에
-  건수가 안 붙는다(정상 — 그 경우는 실패 Notice로 별도 처리됨).
-- ⚠️ **tsc/eslint 함정**: `this.lastCollectedCount`를 `await` 너머에서 직접 읽으면
-  `restrict-template-expressions`가 `never`로 오판해 빌드가 깨졌다. `= undefined` 대입
-  시점의 좁혀진 타입을 정적 분석이 그 이후(비동기 콜백이 실제로 값을 바꿀 수 있는
-  구간)까지 그대로 밀어붙이기 때문 — 필드가 비동기적으로 바뀔 수 있다는 걸 컴파일러는
-  모른다. `readLastCollectedCount(): number | undefined` 메서드로 감싸 선언된 반환
-  타입만 보게 해서 피했다. 이후 같은 패턴(async 콜백이 바꾸는 필드를 await 뒤에서
-  읽는 것)을 쓸 때 재현될 수 있다.
-
-### 검증
-
-`'all'` 미들웨어가 수집 결과 0편일 때도 **빈 배열로 호출되는지**(호출 자체가 스킵되면
-관측 자체가 안 됨) 테스트로 추가했다(63 → 64건). UI 레이어(`SettingTab`)의 Notice
-문자열 자체는 이 하네스로 검증하지 않았다 — 옵시디언 `Setting`/`PluginSettingTab` DOM
-스텁이 없어 이번 수정 규모 대비 과하다고 판단, 그 대신 의존하는 계약(빈 배열 호출)만
-고정했다.
-
-`npm run build` / `npm test`(64/64) / `eslint`(0 errors) 통과.
+- **커서 중간 저장은 하지 않는다**(설계 판단) — 저장본 재사용으로 재실행 비용이
+  낮아져 중단 복원력 목적이 상당 부분 해소됐고, 시간 커서와 편수의 환산 복잡도
+  대비 이득이 작다.
+- **수집 취소 기능은 없다** — `run()`에 취소 신호를 받을 자리가 구조적으로 없다.
+  별도 논의 필요.
