@@ -2,9 +2,6 @@ import { ItemView, WorkspaceLeaf, Notice, ButtonComponent } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { PCAError, type PCAResult } from '../visualize/PCA';
 import { Paper } from '../collect/Paper';
-import { ArxivAPI, S2_SECRET_PROVIDER } from '../collect/API';
-import { File } from '../common/File';
-import { PipelineTestModal } from './PipelineTestModal';
 
 export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
 
@@ -78,7 +75,8 @@ export class VisualizationView extends ItemView {
 	// PCA 테스트 칸 (스펙 6절 — 이 칸은 PCA 담당이 채운다)
 	//
 	// ⚠️ 합성 데이터 관련 코드(생성기·덩어리 검증·재사용 검증)는 전부 임시다 (스펙 7절).
-	// 임베딩(Embedding)이 실제 벡터를 만들기 시작하면 그쪽과 붙여 확인한 뒤 삭제한다.
+	// 임베딩(Embedding)이 dev에 머지되면 실제 벡터로 확인하는 버튼을 여기에 붙이고,
+	// 수집 파이프라인이 완성되면 이 블록 전체를 삭제한다.
 	// 지표 표시(describePcaResult)는 실데이터에서도 계속 쓴다.
 	// ─────────────────────────────────────────────────────────────
 
@@ -94,26 +92,11 @@ export class VisualizationView extends ItemView {
 		new ButtonComponent(contentEl).setButtonText('재사용 검증 (basis)').onClick(() => {
 			this.runPcaReuseCheck();
 		});
-		new ButtonComponent(contentEl).setButtonText('실제 임베딩으로 실행 (21편)').onClick(() => {
-			void this.runPcaWithRealEmbedding();
-		});
-		// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체한다.
-		// runPcaWithRealArxiv() 정의부 참고.
-		new ButtonComponent(contentEl).setButtonText('실제 arXiv 수집으로 실행').onClick(() => {
-			new PipelineTestModal(
-				this.app,
-				'실제 arXiv 수집 → 임베딩 → PCA',
-				[{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' }],
-				async (values) => {
-					const keyword = values.keyword?.trim();
-					if (!keyword) {
-						new Notice('키워드를 입력하세요');
-						return;
-					}
-					await this.runPcaWithRealArxiv(keyword);
-				},
-			).open();
-		});
+		// 임베딩(003)이 dev에 머지되면 아래 두 줄과 runPcaWithRealEmbedding()·makeRealisticPapers()의
+		// 주석을 풀면 된다. 지금 dev의 Embedding에는 embed()가 없어 컴파일되지 않으므로 막아둔다.
+		// new ButtonComponent(contentEl).setButtonText('실제 임베딩으로 실행 (21편)').onClick(() => {
+		// 	void this.runPcaWithRealEmbedding();
+		// });
 		// 긴 줄이 잘리지 않도록 줄바꿈 — 스타일은 styles.css의 클래스로 둔다 (인라인 스타일은 린트가 막는다)
 		this.pcaResultEl = contentEl.createEl('pre', {
 			text: '아직 실행하지 않았습니다.',
@@ -164,129 +147,65 @@ export class VisualizationView extends ItemView {
 		}
 	}
 
-	// 실제 임베딩 연결 확인: 제목·초록을 Embedding.embed()에 통과시킨 뒤 그 벡터로 PCA를 돌린다.
-	// 모델이 설치돼 있으면 768차원 SPECTER2 벡터가, 없으면 폴백(해시 2048차원, embeddingSucceeded=false)이
-	// 나오는데 후자는 PCA가 전부 걸러낸다 — 그 경로까지 여기서 확인된다 (스펙 8절 4번).
-	private async runPcaWithRealEmbedding(): Promise<void> {
-		const embedding = this.plugin.collectflow.embedding;
-		const papers = makeRealisticPapers(21, 3);
-		// 합성 데이터와는 다른 코퍼스이므로 이전 축을 버린다
-		this.plugin.visualflow.pca.resetBasis();
-
-		let installed = false;
-		try {
-			installed = await embedding.isModelInstalled();
-		} catch {
-			// 확인 자체가 실패해도 embed()는 폴백을 돌려주므로 계속 진행한다
-		}
-		this.showPcaText(
-			`임베딩 모델: ${installed ? '설치됨' : '미설치 — 폴백 벡터가 생성되어 PCA에서 전부 제외됩니다'}\n임베딩 중...`,
-		);
-
-		const embedStarted = performance.now();
-		for (let i = 0; i < papers.length; i++) {
-			const paper = papers[i]!;
-			// embed()는 절대 throw하지 않는다 — 실패해도 폴백 결과를 돌려준다
-			Object.assign(paper, await embedding.embed(paper.title, paper.abstract));
-			this.showPcaText(`임베딩 중... ${i + 1}/${papers.length}편`);
-		}
-		const embedMs = performance.now() - embedStarted;
-
-		const header = [
-			`임베딩 모델: ${installed ? '설치됨' : '미설치'}`,
-			`임베딩 소요: ${(embedMs / 1000).toFixed(1)}초 (${papers.length}편, 편당 ${(embedMs / papers.length).toFixed(0)}ms)`,
-			'',
-		].join('\n');
-
-		const pcaStarted = performance.now();
-		try {
-			const result = this.plugin.visualflow.pca.run(papers);
-			const elapsed = performance.now() - pcaStarted;
-			const separation = describeClusterSeparation(result);
-			this.showPcaText(header + describePcaResult(result, elapsed) + '\n\n' + separation);
-		} catch (error) {
-			this.showPcaText(header + describePcaError(error));
-		}
-	}
-
-	// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체한다.
-	// 004(수집) → 003(임베딩) → 005(PCA) 연결 확인용. run()이 아직
-	// 스텁이라 그 대신 세 클래스를 여기서 직접 이어 부른다("arXiv API 테스트" 버튼과
-	// 같은 성격 — run() 없이 단독 호출). 실제 ArxivAPI 결과를 넘긴다는 점에서
-	// runPcaWithRealEmbedding()의 makeRealisticPapers()(가짜 논문)와 다르다.
+	// ── 003 머지 후 주석 해제 ──────────────────────────────────────
+	// 실제 임베딩으로 PCA를 돌려 전 구간이 이어지는지 확인하는 버튼이다.
+	// dev의 Embedding에는 아직 embed()가 없어 컴파일되지 않으므로 주석으로 둔다.
+	// // 실제 임베딩 연결 확인: 제목·초록을 Embedding.embed()에 통과시킨 뒤 그 벡터로 PCA를 돌린다.
+	// // 모델이 설치돼 있으면 768차원 SPECTER2 벡터가 나오고, 없거나 실패하면 embed()가 throw한다 —
+	// // 그 논문은 빈 값 + embeddingSucceeded=false로 남아 PCA가 걸러낸다 (스펙 8절 4번).
+	// private async runPcaWithRealEmbedding(): Promise<void> {
+	// const embedding = this.plugin.collectflow.embedding;
+	// const papers = makeRealisticPapers(21, 3);
+	// // 합성 데이터와는 다른 코퍼스이므로 이전 축을 버린다
+	// this.plugin.visualflow.pca.resetBasis();
 	//
-	// 단계마다 Notice 팝업 한 줄 + 패널 상세 로그를 함께 남긴다 — 패널을 계속 보고
-	// 있지 않아도 어느 단계에서 멈췄는지 알 수 있게. 팝업은 단계당 1개로 제한한다
-	// (임베딩 루프처럼 반복되는 진행상황은 패널에만 표시 — 매 건마다 띄우면 스팸이 된다).
-	private async runPcaWithRealArxiv(keyword: string): Promise<void> {
-		// 다른 코퍼스이므로 이전 축을 버린다 (다른 버튼들과 동일 관례)
-		this.plugin.visualflow.pca.resetBasis();
-
-		// ── 1. 수집 (004) ──────────────────────────────────────────────
-		this.showPcaText(`arXiv 검색 중... (키워드: ${keyword})`);
-		const secret = await File.readSecret();
-		let papers: Paper[];
-		try {
-			const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
-			papers = await api.SearchBase();
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			new Notice(`arXiv 수집 실패: ${message}`);
-			this.showPcaText(`arXiv 수집 실패: ${message}`);
-			return;
-		}
-
-		const citationsKnown = papers.filter((p) => p.citationsKnown).length;
-		const s2Text = secret.hasKey(S2_SECRET_PROVIDER) ? ' (S2 키 사용)' : '';
-		new Notice(`arXiv 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})${s2Text}`);
-		this.showPcaText(
-			`arXiv 수집 완료: ${papers.length}편 (키워드: ${keyword})\n` +
-				`인용수 확인: ${citationsKnown}/${papers.length}\n\n임베딩 준비 중...`,
-		);
-
-		// ── 2. 임베딩 (003) ────────────────────────────────────────────
-		const embedding = this.plugin.collectflow.embedding;
-		let installed = false;
-		try {
-			installed = await embedding.isModelInstalled();
-		} catch {
-			// 확인 자체가 실패해도 embed()는 폴백을 돌려주므로 계속 진행한다
-		}
-		const header = `arXiv 수집 완료: ${papers.length}편 (인용수 확인 ${citationsKnown}/${papers.length})\n임베딩 모델: ${installed ? '설치됨' : '미설치 — 폴백 벡터가 생성되어 PCA에서 전부 제외됩니다'}\n`;
-
-		const embedStarted = performance.now();
-		for (let i = 0; i < papers.length; i++) {
-			const paper = papers[i]!;
-			// embed()는 절대 throw하지 않는다 — 실패해도 폴백 결과를 돌려준다
-			Object.assign(paper, await embedding.embed(paper.title, paper.abstract));
-			this.showPcaText(`${header}임베딩 중... ${i + 1}/${papers.length}편`);
-		}
-		const embedMs = performance.now() - embedStarted;
-
-		const embeddingSucceeded = papers.filter((p) => p.embeddingSucceeded).length;
-		new Notice(
-			`임베딩 완료: ${embeddingSucceeded}/${papers.length} (모델: ${installed ? '설치됨' : '미설치'})`,
-		);
-		const embedSummary = `${header}임베딩 완료: ${embeddingSucceeded}/${papers.length} 성공, ` +
-			`${(embedMs / 1000).toFixed(1)}초 (편당 ${(embedMs / papers.length).toFixed(0)}ms)\n\nPCA 실행 중...`;
-		this.showPcaText(embedSummary);
-
-		// ── 3. PCA (005) ───────────────────────────────────────────────
-		const pcaStarted = performance.now();
-		try {
-			const result = this.plugin.visualflow.pca.run(papers);
-			const elapsed = performance.now() - pcaStarted;
-			new Notice(`PCA 완료: 좌표 ${result.points.length}개 생성`);
-			this.showPcaText(`${embedSummary}\n\n${describePcaResult(result, elapsed)}`);
-		} catch (error) {
-			new Notice(
-				error instanceof PCAError
-					? `PCA 실패: 유효 논문 ${error.validCount}/${error.inputCount}편 (최소 15편 필요)`
-					: `PCA 실패: ${String(error)}`,
-			);
-			this.showPcaText(`${embedSummary}\n\n${describePcaError(error)}`);
-		}
-	}
+	// let installed = false;
+	// try {
+	// installed = await embedding.isModelInstalled();
+	// } catch {
+	// // 확인이 실패해도 계속 진행한다 — 어차피 embed()가 논문마다 성공/실패를 알려준다
+	// }
+	// this.showPcaText(
+	// `임베딩 모델: ${installed ? '설치됨' : '미설치 — 임베딩이 전부 실패해 PCA에서 제외됩니다'}\n임베딩 중...`,
+	// );
+	//
+	// const embedStarted = performance.now();
+	// let embedFailed = 0;
+	// for (let i = 0; i < papers.length; i++) {
+	// const paper = papers[i]!;
+	// // embed()는 실패하면 throw한다 (003, 2026-08-06 계약 변경 — 이전에는 폴백 벡터를 돌려줬다).
+	// // 한 편이 실패해도 나머지는 계속 임베딩하고, 실패한 논문은 빈 값 + embeddingSucceeded=false로
+	// // 남겨 PCA가 걸러내게 한다. 순차 호출만 안전하므로 병렬로 돌리지 않는다.
+	// try {
+	// Object.assign(paper, await embedding.embed(paper.title, paper.abstract));
+	// } catch {
+	// embedFailed++;
+	// paper.embedding = [];
+	// paper.embeddingModel = '';
+	// paper.embeddingSource = '';
+	// paper.embeddingSucceeded = false;
+	// }
+	// this.showPcaText(`임베딩 중... ${i + 1}/${papers.length}편`);
+	// }
+	// const embedMs = performance.now() - embedStarted;
+	//
+	// const header = [
+	// `임베딩 모델: ${installed ? '설치됨' : '미설치'}${embedFailed > 0 ? ` — ${embedFailed}편 실패` : ''}`,
+	// `임베딩 소요: ${(embedMs / 1000).toFixed(1)}초 (${papers.length}편, 편당 ${(embedMs / papers.length).toFixed(0)}ms)`,
+	// '',
+	// ].join('\n');
+	//
+	// const pcaStarted = performance.now();
+	// try {
+	// const result = this.plugin.visualflow.pca.run(papers);
+	// const elapsed = performance.now() - pcaStarted;
+	// const separation = describeClusterSeparation(result);
+	// this.showPcaText(header + describePcaResult(result, elapsed) + '\n\n' + separation);
+	// } catch (error) {
+	// this.showPcaText(header + describePcaError(error));
+	// }
+	// }
+	// ────────────────────────────────────────────────────────────
 
 	private showPcaText(text: string): void {
 		this.pcaResultEl?.setText(text);
@@ -320,7 +239,9 @@ function describePcaResult(result: PCAResult, elapsedMs: number): string {
 		`직교성: ${m.orthogonality.toExponential(2)} (0에 가까워야 정상)`,
 		`결과 평균: x ${m.meanX.toExponential(2)} · y ${m.meanY.toExponential(2)} ${meanNote}`,
 		`수렴: ${describeConvergence(m.converged, m.iterations, result.didFit)}`,
+		...(result.didFit ? [] : [`축 낡음: 설명 분산이 fit 당시보다 ${(m.explainedDrop * 100).toFixed(1)}% 떨어짐`]),
 		`basis: ${result.didFit ? `fit 수행 (${result.fitReason})` : '재사용 — 기존 좌표 고정'}`,
+		describeReembedding(result.needsReembedding),
 		`좌표 앞 3건:\n${samples}`,
 		`실행 시간: ${elapsedMs.toFixed(1)}ms`,
 	].join('\n');
@@ -334,6 +255,17 @@ function describeConvergence(converged: boolean, iterations: number, didFit: boo
 	return converged ? `완료 (${iterations}회 반복)` : `상한 도달 (${iterations}회) — 축이 덜 안정적일 수 있음`;
 }
 
+// 재임베딩하면 살아날 논문 수를 알린다. PCA는 걸러내기만 하므로, 이 논문들은
+// 임베딩을 다시 하지 않는 한 계속 그래프 밖에 남는다.
+function describeReembedding(sourceIds: string[]): string {
+	if (sourceIds.length === 0) {
+		return '재임베딩 필요: 없음';
+	}
+	const sample = sourceIds.slice(0, 3).join(', ');
+	const more = sourceIds.length > 3 ? ` 외 ${sourceIds.length - 3}편` : '';
+	return `재임베딩 필요: ${sourceIds.length}편 (${sample}${more}) — 다시 임베딩해야 그래프에 들어옵니다`;
+}
+
 function describePcaError(error: unknown): string {
 	if (error instanceof PCAError) {
 		const ex = error.excluded;
@@ -341,6 +273,7 @@ function describePcaError(error: unknown): string {
 			`PCA 에러: ${error.message}`,
 			`입력 ${error.inputCount}편 → 유효 ${error.validCount}편 (기준 모델: ${error.usedModel || '없음'})`,
 			`제외: malformed ${ex.malformed} · embeddingFailed ${ex.embeddingFailed} · modelMismatch ${ex.modelMismatch} · invalidVector ${ex.invalidVector} · duplicateId ${ex.duplicateId}`,
+			describeReembedding(error.needsReembedding),
 		];
 		// 임베딩이 실패한 논문이 제외의 대부분이면 원인은 대개 "모델 미설치"다.
 		// Embedding.embed()는 모델이 없을 때 throw 대신 폴백 벡터(embeddingSucceeded=false)를
@@ -404,8 +337,8 @@ function makeSyntheticPapers(
 		paper.publicationDate = `202${index % 5}-0${(index % 9) + 1}-15`;
 		paper.citationCount = 0;
 		paper.citationsKnown = false;
-		paper.collectedApis = ['synthetic'];
-		paper.collectedQueries = [{ searchType: 'keyword', query: 'synthetic' }];
+		paper.collectedApi = 'synthetic';
+		paper.collectedQuery = { searchType: 'keyword', query: 'synthetic' };
 		paper.embedding = embedding;
 		paper.embeddingModel = 'synthetic-test';
 		paper.embeddingSource = 'synthetic';
@@ -415,83 +348,83 @@ function makeSyntheticPapers(
 	return papers;
 }
 
-// 실제 임베딩 테스트용 논문. 벡터 대신 제목·초록을 만들고, 임베딩 필드는 비워 둔다
-// (Embedding.embed()의 결과로 채워진다). 주제가 뚜렷이 다른 세 덩어리로 구성해
-// 실제 모델이 내용 차이를 좌표로 반영하는지 확인할 수 있게 한다.
-function makeRealisticPapers(count: number, clusterCount: number): Paper[] {
-	// 주제별 어휘 — 서로 겹치지 않게 골라야 덩어리 분리를 확인할 수 있다
-	const topics = [
-		{
-			name: '언어모델',
-			titles: [
-				'Attention-based Transformers for Multilingual Text Generation',
-				'Scaling Laws in Large Language Model Pretraining',
-				'Instruction Tuning Improves Zero-shot Reasoning in Language Models',
-				'Efficient Tokenization Strategies for Neural Machine Translation',
-				'Retrieval-Augmented Generation for Open-domain Question Answering',
-				'Sparse Attention Reduces Inference Cost in Long-context Transformers',
-				'Cross-lingual Transfer in Multilingual Sentence Encoders',
-			],
-			abstract:
-				'We study transformer language models trained on large text corpora. Our approach improves perplexity and downstream accuracy on natural language understanding benchmarks, including question answering and summarization. We analyze attention patterns, tokenization, and the effect of instruction tuning on zero-shot generalization.',
-		},
-		{
-			name: '컴퓨터비전',
-			titles: [
-				'Convolutional Architectures for Fine-grained Image Classification',
-				'Self-supervised Pretraining for Semantic Segmentation of Satellite Imagery',
-				'Diffusion Models for High-resolution Image Synthesis',
-				'Robust Object Detection under Adverse Weather Conditions',
-				'Vision Transformers with Hierarchical Feature Pyramids',
-				'Depth Estimation from Monocular Video Sequences',
-				'Neural Radiance Fields for Novel View Synthesis of Indoor Scenes',
-			],
-			abstract:
-				'We present a computer vision method for recognizing objects in images and video. The model uses convolutional and vision transformer backbones trained with self-supervised objectives on large image datasets. Experiments on segmentation, detection, and depth estimation benchmarks show improved pixel accuracy and mean intersection over union.',
-		},
-		{
-			name: '강화학습',
-			titles: [
-				'Off-policy Reinforcement Learning for Robotic Manipulation',
-				'Sample-efficient Exploration in Sparse-reward Environments',
-				'Model-based Planning with Learned World Dynamics',
-				'Multi-agent Reinforcement Learning for Cooperative Navigation',
-				'Offline Reinforcement Learning from Suboptimal Demonstrations',
-				'Reward Shaping Accelerates Policy Convergence in Continuous Control',
-				'Sim-to-real Transfer of Locomotion Policies for Legged Robots',
-			],
-			abstract:
-				'We propose a reinforcement learning algorithm for continuous control and robotic manipulation. The agent learns a policy through interaction with the environment, using reward signals and a learned dynamics model for planning. We evaluate sample efficiency, exploration behavior, and sim-to-real transfer on locomotion and manipulation tasks.',
-		},
-	];
-
-	const papers: Paper[] = [];
-	for (let i = 0; i < count; i++) {
-		const cluster = i % clusterCount;
-		const topic = topics[cluster % topics.length]!;
-		const titleIndex = Math.floor(i / clusterCount) % topic.titles.length;
-
-		const paper = new Paper();
-		// describeClusterSeparation이 라벨을 sourceId의 두 번째 조각에서 읽으므로 형식을 맞춘다
-		paper.sourceId = `real-c${cluster}-${String(i).padStart(3, '0')}`;
-		paper.title = topic.titles[titleIndex] ?? topic.titles[0]!;
-		paper.abstract = topic.abstract;
-		paper.authors = [];
-		paper.references = [];
-		paper.publicationDate = `2025-0${(i % 9) + 1}-15`;
-		paper.citationCount = 0;
-		paper.citationsKnown = false;
-		paper.collectedApis = ['synthetic'];
-		paper.collectedQueries = [{ searchType: 'keyword', query: topic.name }];
-		// 임베딩 필드는 Embedding.embed()의 결과로 덮어쓴다
-		paper.embedding = [];
-		paper.embeddingModel = '';
-		paper.embeddingSource = '';
-		paper.embeddingSucceeded = false;
-		papers.push(paper);
-	}
-	return papers;
-}
+// // 실제 임베딩 테스트용 논문. 벡터 대신 제목·초록을 만들고, 임베딩 필드는 비워 둔다
+// // (Embedding.embed()의 결과로 채워진다). 주제가 뚜렷이 다른 세 덩어리로 구성해
+// // 실제 모델이 내용 차이를 좌표로 반영하는지 확인할 수 있게 한다.
+// function makeRealisticPapers(count: number, clusterCount: number): Paper[] {
+// 	// 주제별 어휘 — 서로 겹치지 않게 골라야 덩어리 분리를 확인할 수 있다
+// 	const topics = [
+// 		{
+// 			name: '언어모델',
+// 			titles: [
+// 				'Attention-based Transformers for Multilingual Text Generation',
+// 				'Scaling Laws in Large Language Model Pretraining',
+// 				'Instruction Tuning Improves Zero-shot Reasoning in Language Models',
+// 				'Efficient Tokenization Strategies for Neural Machine Translation',
+// 				'Retrieval-Augmented Generation for Open-domain Question Answering',
+// 				'Sparse Attention Reduces Inference Cost in Long-context Transformers',
+// 				'Cross-lingual Transfer in Multilingual Sentence Encoders',
+// 			],
+// 			abstract:
+// 				'We study transformer language models trained on large text corpora. Our approach improves perplexity and downstream accuracy on natural language understanding benchmarks, including question answering and summarization. We analyze attention patterns, tokenization, and the effect of instruction tuning on zero-shot generalization.',
+// 		},
+// 		{
+// 			name: '컴퓨터비전',
+// 			titles: [
+// 				'Convolutional Architectures for Fine-grained Image Classification',
+// 				'Self-supervised Pretraining for Semantic Segmentation of Satellite Imagery',
+// 				'Diffusion Models for High-resolution Image Synthesis',
+// 				'Robust Object Detection under Adverse Weather Conditions',
+// 				'Vision Transformers with Hierarchical Feature Pyramids',
+// 				'Depth Estimation from Monocular Video Sequences',
+// 				'Neural Radiance Fields for Novel View Synthesis of Indoor Scenes',
+// 			],
+// 			abstract:
+// 				'We present a computer vision method for recognizing objects in images and video. The model uses convolutional and vision transformer backbones trained with self-supervised objectives on large image datasets. Experiments on segmentation, detection, and depth estimation benchmarks show improved pixel accuracy and mean intersection over union.',
+// 		},
+// 		{
+// 			name: '강화학습',
+// 			titles: [
+// 				'Off-policy Reinforcement Learning for Robotic Manipulation',
+// 				'Sample-efficient Exploration in Sparse-reward Environments',
+// 				'Model-based Planning with Learned World Dynamics',
+// 				'Multi-agent Reinforcement Learning for Cooperative Navigation',
+// 				'Offline Reinforcement Learning from Suboptimal Demonstrations',
+// 				'Reward Shaping Accelerates Policy Convergence in Continuous Control',
+// 				'Sim-to-real Transfer of Locomotion Policies for Legged Robots',
+// 			],
+// 			abstract:
+// 				'We propose a reinforcement learning algorithm for continuous control and robotic manipulation. The agent learns a policy through interaction with the environment, using reward signals and a learned dynamics model for planning. We evaluate sample efficiency, exploration behavior, and sim-to-real transfer on locomotion and manipulation tasks.',
+// 		},
+// 	];
+//
+// 	const papers: Paper[] = [];
+// 	for (let i = 0; i < count; i++) {
+// 		const cluster = i % clusterCount;
+// 		const topic = topics[cluster % topics.length]!;
+// 		const titleIndex = Math.floor(i / clusterCount) % topic.titles.length;
+//
+// 		const paper = new Paper();
+// 		// describeClusterSeparation이 라벨을 sourceId의 두 번째 조각에서 읽으므로 형식을 맞춘다
+// 		paper.sourceId = `real-c${cluster}-${String(i).padStart(3, '0')}`;
+// 		paper.title = topic.titles[titleIndex] ?? topic.titles[0]!;
+// 		paper.abstract = topic.abstract;
+// 		paper.authors = [];
+// 		paper.references = [];
+// 		paper.publicationDate = `2025-0${(i % 9) + 1}-15`;
+// 		paper.citationCount = 0;
+// 		paper.citationsKnown = false;
+// 		paper.collectedApi = 'synthetic';
+// 		paper.collectedQuery = { searchType: 'keyword', query: topic.name };
+// 		// 임베딩 필드는 Embedding.embed()의 결과로 덮어쓴다
+// 		paper.embedding = [];
+// 		paper.embeddingModel = '';
+// 		paper.embeddingSource = '';
+// 		paper.embeddingSucceeded = false;
+// 		papers.push(paper);
+// 	}
+// 	return papers;
+// }
 
 // 덩어리 분리 확인: sourceId에 심어둔 정답 라벨(syn-c0-… / real-c0-…)로 안/밖 거리를 비교한다
 function describeClusterSeparation(result: PCAResult): string {
