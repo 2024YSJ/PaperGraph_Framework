@@ -337,8 +337,8 @@ function makeSyntheticPapers(
 		paper.publicationDate = `202${index % 5}-0${(index % 9) + 1}-15`;
 		paper.citationCount = 0;
 		paper.citationsKnown = false;
-		paper.collectedApi = 'synthetic';
-		paper.collectedQuery = { searchType: 'keyword', query: 'synthetic' };
+		paper.collectedApis = ['synthetic'];
+		paper.collectedQueries = [{ searchType: 'keyword', query: 'synthetic' }];
 		paper.embedding = embedding;
 		paper.embeddingModel = 'synthetic-test';
 		paper.embeddingSource = 'synthetic';

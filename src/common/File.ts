@@ -95,8 +95,15 @@ export class File {
 				return subscriptions;
 			},
 			() => {
+				// Subscriptions.json이 아직 없는 첫 실행(새로 설치한 환경) 기본값.
+				// 모든 필드를 실제로 채워야 한다 — 비워두면 `!` 단언 때문에 타입은 채워진
+				// 것처럼 보이지만 런타임 값은 undefined라, 호출자가 그대로 .map/.forEach하면
+				// 그 자리에서 터진다(설정탭이 실제로 이렇게 죽었었다). updateTime도 파일이
+				// 있을 때의 `?? 0`과 같은 값으로 맞춰 두 경로가 같은 모양을 내놓게 한다.
 				const subscriptions = new Subscriptions();
 				subscriptions.secret = secret;
+				subscriptions.apis = [];
+				subscriptions.updateTime = 0;
 				return subscriptions;
 			},
 		);
@@ -132,17 +139,32 @@ export class File {
 		});
 	}
 
+	// API 구현체 등록부 — 이 코드베이스가 지원하는 API 목록의 유일한 진실.
+	// 새 API 추가 = 여기 한 줄 + import. 구독 UI의 드롭다운(supportedApiNames)과
+	// createApi가 같은 목록을 보므로 "UI는 받는데 복원은 못 하는 이름"이 생길 수 없다.
+	private static readonly API_FACTORIES: Record<
+		string,
+		(querys: SearchQuery[], secret?: Secret) => API
+	> = {
+		arxiv: (querys, secret) => new ArxivAPI(querys, secret),
+	};
+
+	// 구독 UI가 API 선택지를 만들 때 쓴다. 이름을 손으로 치게 하면 'arXiv' 같은 오타가
+	// 저장은 통과하고 다음 수집(createApi)에서야 터진다 — 목록에서 고르게 해야 한다.
+	static supportedApiNames(): string[] {
+		return Object.keys(File.API_FACTORIES);
+	}
+
 	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
 	// 평범한 객체({ apiName, querys })를 메서드가 살아있는 API 인스턴스로 복원할 때 쓴다
-	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md). 새 API는 case를 한 줄 추가한다.
+	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md).
 	// secret은 선택 사항 — 없으면 각 API 구현체가 알아서 익명으로 동작한다.
 	static createApi(apiName: string, querys: SearchQuery[] = [], secret?: Secret): API {
-		switch (apiName) {
-			case 'arxiv':
-				return new ArxivAPI(querys, secret);
-			default:
-				throw new Error(`Unknown apiName: ${apiName}`);
+		const factory = File.API_FACTORIES[apiName];
+		if (factory === undefined) {
+			throw new Error(`Unknown apiName: ${apiName}`);
 		}
+		return factory(querys, secret);
 	}
 
 	// ── Paper (콘텐츠 트리, .json + .md) ────────────────────────────────
@@ -151,6 +173,26 @@ export class File {
 	// 경로가 날짜로 결정되므로 연도만 있으면 sourceId 조회/인덱스 없이 일괄 로드된다.
 	static async readPapersByYear(year: number): Promise<Paper[]> {
 		const prefix = `${File.PAPER_ROOT}/${year}/`;
+		const files = File.vault
+			.getFiles()
+			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
+		const papers: Paper[] = [];
+		for (const file of files) {
+			const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
+			const paper = Object.assign(new Paper(), wrapper.paper);
+			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
+			paper.collectedApis ??= [];
+			paper.collectedQueries ??= [];
+			papers.push(paper);
+		}
+		return papers;
+	}
+
+	// 콘텐츠 트리 전체(PaperGraph3D/ 아래 모든 연도)의 논문을 읽는다. 보정 패스
+	// (CollectAndSave.repair — 실패 플래그가 선 논문을 다시 시도)가 대상을 찾을 때 쓴다.
+	// vault.getFiles()가 이미 전체 목록을 주므로 연도를 열거할 필요가 없다.
+	static async readAllPapers(): Promise<Paper[]> {
+		const prefix = `${File.PAPER_ROOT}/`;
 		const files = File.vault
 			.getFiles()
 			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');

@@ -1,14 +1,10 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { File } from '../common/File';
-import { PipelineTestModal, type PipelineTestField } from './PipelineTestModal';
+import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
-import { CollectResultModal } from './CollectResultModal';
-import { Secret } from '../collect/Secret';
-import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
-import { ArxivAPI, S2_SECRET_PROVIDER } from '../collect/API';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
 // 단어 수 분포(실측: 최소 63, 최대 302, 평균 193단어)를 참고해 문서마다 문장 수를
@@ -120,42 +116,30 @@ function parseDateInput(value: string): number | undefined {
 	return Number.isNaN(parsed) ? undefined : parsed;
 }
 
-// timestamp -> <input type="date">가 받는 "YYYY-MM-DD".
+// timestamp -> <input type="date">가 받는 "YYYY-MM-DD". Backfill 범위 입력의 기본값 계산용.
 function isoDateInput(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
 }
 
-// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 그 경로로 교체한다.
-// "수집" 버튼 공용 실행기. run()이 스텁이라 그 대신 ArxivAPI를 직접
-// 호출한다("arXiv API 테스트" 버튼과 같던 성격 — 이제 이 버튼들이 그 역할을 흡수했다).
-// (위 isoDateInput()도 이 임시 버튼의 날짜 기본값 계산 전용이라 같은 운명이다.)
-//
-// 결과는 CollectResultModal로 띄운다. 처음엔 console에만 남겼는데 두 가지가 문제였다:
-// obsidianmd 린트가 console.log를 막아 console.debug를 썼더니 DevTools 기본 필터
-// (Verbose 숨김)에 걸려 아예 안 보였고, 무엇보다 "N편 수집" 숫자만으로는 날짜 필터나
-// 페이지네이션이 실제로 동작했는지 알 수 없었다. 모달이 그 판정을 대신 보여준다.
-async function runCollectTest(
-	app: App,
+// 수집/보정 버튼 공용 실행기. run()/repair()는 실패 시 사용자가 무엇을 해야 하는지 담아
+// throw하므로(모델 미설치, 구독 없음 등) 그 메시지를 그대로 Notice로 보여준다.
+// 실행 중 버튼을 잠그는 이유: run()도 repair()도 embed()를 순차 호출한다는 계약 위에
+// 서 있는데, 버튼 연타로 두 실행이 겹치면 그 계약이 실행 단위에서 깨진다.
+async function runCollectFlow(
 	label: string,
-	keyword: string,
-	fetchPapers: () => Promise<Paper[]>,
-	api: ArxivAPI,
-	usedS2Key: boolean,
-	window?: { from: number; to: number },
+	button: { setDisabled(disabled: boolean): unknown },
+	action: () => Promise<void>,
 ): Promise<void> {
+	button.setDisabled(true);
 	try {
-		const papers = await fetchPapers();
-		new Notice(`${label} 수집 완료: ${papers.length}편`);
-		new CollectResultModal(app, papers, api.lastCoverage, {
-			label,
-			keyword,
-			window,
-			usedS2Key,
-		}).open();
+		await action();
+		new Notice(`${label}을(를) 마쳤습니다.`);
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
-		new Notice(`${label} 수집 실패: ${message}`);
-		console.error(`[PaperGraph3D] ${label} 수집 실패`, e);
+		new Notice(`${label} 실패: ${message}`);
+		console.error(`[PaperGraph3D] ${label} 실패`, e);
+	} finally {
+		button.setDisabled(false);
 	}
 }
 
@@ -173,66 +157,31 @@ const CONDITION_TYPE_LABEL: Record<ConditionType, string> = {
 
 // 구독 한 건 = API 하나. API 하나에 여러 조건(키워드/저자/분류 등, SearchQuery)을
 // 동시에 걸 수 있다 (Subscriptions.apis: API[], API.querys: SearchQuery[]와 대응).
+// apiName은 File.supportedApiNames() 목록에서 고른 값 — 자유 텍스트였을 때는 'arXiv'
+// 같은 오타가 저장을 통과하고 다음 수집(createApi)에서야 터졌다.
 interface ApiDraft {
-	label: string;
+	apiName: string;
 	conditions: { searchType: ConditionType; query: string }[];
 	newConditionType: ConditionType;
 	newConditionQuery: string;
 }
 
-// ⚠️ 임시(삭제 예정) — "커스텀 검색" 버튼 전용. CollectAndSave.run()이 구현되면
-// 구독 UI가 그 역할을 대신한다.
-//
-// 조건 3개(최대치, 004의 AND 결합 규칙)를 입력받는 필드를 만든다. 다른 수집 테스트
-// 버튼들이 전부 keyword 조건 1개만 넘겨서 category/author 경로와 AND 결합이 실기기에서
-// 한 번도 실행된 적이 없어, 그 셋을 직접 조립해볼 수 있게 하는 게 목적이다.
-const CONDITION_SLOTS = [1, 2, 3] as const;
+// 한 구독(API 하나)에 걸 수 있는 조건 수 상한 — 004의 "조건 최대 3개, 전부 AND" 규칙.
+const MAX_CONDITIONS_PER_API = 3;
 
-function buildConditionFields(): PipelineTestField[] {
-	return CONDITION_SLOTS.flatMap((slot) => [
-		{
-			key: `type${slot}`,
-			label: `조건 ${slot} 타입`,
-			type: 'select' as const,
-			// ARXIV_FIELD_PREFIX 키와 일치해야 하는 값이라 기존 라벨 맵을 그대로 쓴다.
-			options: CONDITION_TYPE_LABEL,
-			defaultValue: slot === 2 ? 'category' : 'keyword',
-		},
-		{
-			key: `query${slot}`,
-			label: `조건 ${slot} 검색어`,
-			desc: slot === 1 ? '비워두면 그 조건은 제외된다' : '',
-			type: 'text' as const,
-			// 첫 조건만 기본값을 주고 나머지는 비워둔다 — 조건 1개짜리 검색이 기본 동작이 되게.
-			defaultValue: slot === 1 ? 'transformer' : '',
-		},
-	]);
-}
-
-// 입력값에서 검색어가 채워진 조건만 SearchQuery로 뽑는다.
-function collectConditions(values: Record<string, string>): SearchQuery[] {
-	const querys: SearchQuery[] = [];
-	for (const slot of CONDITION_SLOTS) {
-		const query = values[`query${slot}`]?.trim();
-		if (!query) {
-			continue;
-		}
-		querys.push({ searchType: values[`type${slot}`] ?? 'keyword', query });
-	}
-	return querys;
-}
-
-// 임시 UI. Secret/Subscriptions/API/SearchQuery 클래스의 실제 필드는 아직 우빈/신빈이
-// 정하지 않았으므로, 여기서는 SettingTab 자체의 로컬 상태에만 바인딩한다 (담당자들의
-// 설계를 선점하지 않기 위함). 다만 구조(API 하나 : 조건 여러 개)는 다이어그램의
-// Subscriptions/API/SearchQuery 관계를 그대로 반영한다.
-// 실제 저장은 PaperStore/SecretStore/Secret/Subscriptions/API 구현이 끝난 뒤 TODO 부분에서 연결한다.
+// 구독 UI는 Subscriptions.json과 실시간 동기화된다: 열 때 읽어와 복원하고, 추가/삭제
+// 때마다 즉시 저장한다. 스타일은 임시지만 삭제 대상이 아니다 — CollectAndSave.run()이
+// 읽는 Subscriptions.json을 만드는 유일한 입력 경로다(확정 UI는 시각화 이후 별도 작업).
 export class SettingTab extends PluginSettingTab {
 	plugin: PaperGraph3D;
 
 	private apiKeyDraft = '';
-	private apiLabelDraft = '';
+	private apiNameDraft = '';
 	private apiDrafts: ApiDraft[] = [];
+	private subscriptionsLoaded = false;
+	// 저장된 구독을 읽지 못한 상태인가. 읽기에 실패했는데 저장을 허용하면, 화면의 빈
+	// 목록이 그대로 디스크를 덮어써 읽지 못했을 뿐 멀쩡히 있던 구독이 사라진다.
+	private subscriptionsUnreadable = false;
 
 	constructor(app: App, plugin: PaperGraph3D) {
 		super(app, plugin);
@@ -243,77 +192,47 @@ export class SettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
+		// 저장된 구독은 비동기로만 읽을 수 있는데 display()는 동기다. 첫 렌더에서 로드를
+		// 걸어두고 끝나면 다시 그린다 — 이후 렌더부터는 캐시된 드래프트를 그대로 쓴다.
+		if (!this.subscriptionsLoaded) {
+			void this.loadSubscriptions();
+		}
+
 		new Setting(containerEl)
 			.setName('파이프라인 테스트')
 			.setDesc(
-				'각 단계가 구현되는 대로 담당자가 바로 확인할 수 있도록 만든 임시 버튼입니다. ' +
-					'아직 미구현인 단계는 클릭 시 "아직 구현되지 않음" 알림이 뜹니다. (임베딩은 아래 항목의 확인/설치 버튼으로 테스트하세요.)',
+				'각 단계를 바로 확인할 수 있는 버튼들입니다. (임베딩은 아래 항목의 확인/설치 버튼으로 테스트하세요.)',
 			)
 			.setHeading();
 
-		// ⚠️ 임시(삭제 예정) — CollectAndSave.run()이 구현되면 이 버튼들은 그 경로로
-		// 교체하거나 지운다. runCollectTest() 정의부 참고.
+		// 정식 수집 경로. 아래 "구독" 섹션에 등록된 조건으로 CollectAndSave.run()을 실행해
+		// 수집 → 임베딩 → 저장까지 수행한다 (예전의 ArxivAPI 직접 호출 버튼들을 대체).
 		new Setting(containerEl)
 			.setName('수집')
 			.setDesc(
-				'CollectAndSave.run() 없이 ArxivAPI.SearchRecentPaper()/Backfill()을 단독 호출합니다. ' +
-					'저장하지 않습니다. 결과 창에서 날짜 필터·페이지네이션·인용수 보강이 실제로 ' +
-					'동작했는지 항목별로 확인할 수 있고, 전체 JSON은 클립보드로 복사됩니다.',
+				'구독에 등록된 조건으로 수집을 실행하고 결과를 저장합니다. ' +
+					'최근 논문은 마지막 수집 지점부터 이어서, Backfill은 지정한 과거 구간을 수집합니다. ' +
+					'보정은 임베딩·인용수 조회에 실패했던 논문을 다시 시도합니다.',
 			)
 			.addButton((button) =>
-				button.setButtonText('최근 논문').onClick(() => {
-					new PipelineTestModal(
-						this.app,
-						'수집 테스트 — 최근 논문',
-						[
-							{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' },
-							{
-								key: 'hours',
-								label: '최근 몇 시간',
-								desc: 'API.SearchRecentPaper(hours)에 대응',
-								type: 'number',
-								defaultValue: '24',
-							},
-						],
-						async (values) => {
-							const keyword = values.keyword?.trim();
-							if (!keyword) {
-								new Notice('키워드를 입력하세요');
-								return;
-							}
-							const hours = Number(values.hours);
-							if (Number.isNaN(hours)) {
-								new Notice('시간을 숫자로 입력하세요');
-								return;
-							}
-							const secret = await File.readSecret();
-							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
-							// SearchRecentPaper가 내부에서 잡는 구간과 같은 값을 검증용으로 만든다.
-							const to = Date.now();
-							await runCollectTest(
-								this.app,
-								'최근 논문',
-								keyword,
-								() => api.SearchRecentPaper(hours),
-								api,
-								secret.hasKey(S2_SECRET_PROVIDER),
-								{ from: to - hours * 60 * 60 * 1000, to },
-							);
-						},
-					).open();
-				}),
+				button
+					.setButtonText('최근 논문')
+					.setCta()
+					.onClick(() => {
+						void runCollectFlow('최근 논문 수집', button, () =>
+							this.plugin.collectflow.run('recent'),
+						);
+					}),
 			)
 			.addButton((button) =>
 				button.setButtonText('Backfill').onClick(() => {
 					new PipelineTestModal(
 						this.app,
-						'수집 테스트 — Backfill',
+						'Backfill — 과거 구간 수집',
 						[
-							{ key: 'keyword', label: '키워드', defaultValue: 'transformer', type: 'text' },
 							{
 								key: 'from',
 								label: '시작일',
-								desc: 'API.Backfill(from, to)의 from',
 								type: 'date',
 								// 기본 2주 — 좁은 구간을 고르면 100건 미만이라 페이지네이션이
 								// 한 번도 안 돌아 검증이 안 된다.
@@ -322,17 +241,11 @@ export class SettingTab extends PluginSettingTab {
 							{
 								key: 'to',
 								label: '종료일 (당일 포함)',
-								desc: 'API.Backfill(from, to)의 to',
 								type: 'date',
 								defaultValue: isoDateInput(Date.now()),
 							},
 						],
 						async (values) => {
-							const keyword = values.keyword?.trim();
-							if (!keyword) {
-								new Notice('키워드를 입력하세요');
-								return;
-							}
 							const from = parseDateInput(values.from ?? '');
 							const toMidnight = parseDateInput(values.to ?? '');
 							if (from === undefined || toMidnight === undefined) {
@@ -343,91 +256,25 @@ export class SettingTab extends PluginSettingTab {
 							// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 							// "종료일 당일 포함"으로 맞춘다.
 							const to = toMidnight + 24 * 60 * 60 * 1000;
-							const secret = await File.readSecret();
-							const api = new ArxivAPI([{ searchType: 'keyword', query: keyword }], secret);
-							await runCollectTest(
-								this.app,
-								'Backfill',
-								keyword,
-								() => api.Backfill(from, to),
-								api,
-								secret.hasKey(S2_SECRET_PROVIDER),
-								{ from, to },
+							await runCollectFlow('Backfill', button, () =>
+								this.plugin.collectflow.run('backfill', { from, to }),
 							);
 						},
 					).open();
 				}),
 			)
 			.addButton((button) =>
-				button.setButtonText('커스텀 검색').onClick(() => {
-					new PipelineTestModal(
-						this.app,
-						'수집 테스트 — 커스텀 검색 (조건 최대 3개, AND)',
-						buildConditionFields(),
-						async (values) => {
-							// 검색어가 빈 조건은 없는 것으로 친다 — 조건 1개만 쓰고 싶을 때
-							// 나머지 칸을 비워두면 되도록.
-							const querys = collectConditions(values);
-							if (querys.length === 0) {
-								new Notice('조건을 하나 이상 입력하세요');
-								return;
-							}
-							const secret = await File.readSecret();
-							const api = new ArxivAPI(querys, secret);
-							await runCollectTest(
-								this.app,
-								'커스텀 검색',
-								querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
-								() => api.SearchBase(),
-								api,
-								secret.hasKey(S2_SECRET_PROVIDER),
-							);
-						},
-					).open();
+				button.setButtonText('보정').onClick(() => {
+					void runCollectFlow('보정', button, () => this.plugin.collectflow.repair());
 				}),
 			);
 
 		new Setting(containerEl)
 			.setName('저장 (File)')
 			.setDesc('입력창에서 값을 받아 File의 쓰기 함수를 호출합니다.')
-			.addButton((button) =>
-				button.setButtonText('Secret').onClick(async () => {
-					// Secret은 아직 필드가 없는 빈 클래스라 입력창 없이 바로 호출한다.
-					try {
-						await File.writeSecret(new Secret());
-					} catch {
-						new Notice('아직 구현되지 않음: 저장(Secret)');
-					}
-				}),
-			)
-			.addButton((button) =>
-				button.setButtonText('Subscriptions').onClick(() => {
-					new PipelineTestModal(
-						this.app,
-						'저장 테스트 — Subscriptions',
-						[
-							{
-								key: 'updateTime',
-								label: '갱신 시점 (timestamp, ms)',
-								type: 'number',
-								defaultValue: String(Date.now()),
-							},
-						],
-						async (values) => {
-							try {
-								const subscriptions = new Subscriptions();
-								const updateTime = Number(values.updateTime);
-								subscriptions.updateTime = Number.isNaN(updateTime) ? Date.now() : updateTime;
-								subscriptions.secret = new Secret();
-								subscriptions.apis = [];
-								await File.writeSubscriptions(subscriptions);
-							} catch {
-								new Notice('아직 구현되지 않음: 저장(Subscriptions)');
-							}
-						},
-					).open();
-				}),
-			)
+			// Secret/Subscriptions 저장 버튼은 없앴다 — 둘 다 빈 객체를 하드코딩해 써서,
+			// 실데이터가 저장되는 지금은 누르는 순간 등록된 API 키/구독을 전부 지우는
+			// 함정이었다 (키 등록은 FileTestModal의 Secret 폼, 구독은 아래 구독 UI가 담당).
 			.addButton((button) =>
 				button.setButtonText('Paper').onClick(() => {
 					new PipelineTestModal(
@@ -610,28 +457,41 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('API 추가')
-			.setDesc('구독 조건을 묶을 API 이름 (예: arXiv, Semantic Scholar)')
-			.addText((text) =>
-				text.setPlaceholder('API 이름').onChange((value) => {
-					this.apiLabelDraft = value;
-				}),
-			)
+			.setDesc('구독 조건을 묶을 API를 목록에서 고릅니다. 새 API 지원은 코드에 등록하면 목록에 나타납니다.')
+			.addDropdown((dropdown) => {
+				// 지원 목록은 File의 API 레지스트리가 진실이다 — 이름을 손으로 치게 하면
+				// 'arXiv' 같은 오타가 저장을 통과하고 다음 수집(createApi)에서야 터진다.
+				const names = File.supportedApiNames();
+				for (const name of names) {
+					dropdown.addOption(name, name);
+				}
+				// 첫 렌더는 loadSubscriptions()가 끝나기 전이라 draft가 비어 있을 수 있다.
+				// 그대로 두면 드롭다운은 첫 옵션을 보여주는데 내부 값만 ''이라, 사용자가
+				// 'arxiv'를 보면서 추가를 눌러도 아래 길이 검사에 걸려 아무 일도 안 일어난다.
+				if (this.apiNameDraft.length === 0) {
+					this.apiNameDraft = names[0] ?? '';
+				}
+				dropdown.setValue(this.apiNameDraft).onChange((value) => {
+					this.apiNameDraft = value;
+				});
+			})
 			.addButton((button) =>
 				button
 					.setButtonText('추가')
 					.setCta()
 					.onClick(() => {
-						if (this.apiLabelDraft.trim().length === 0) {
+						if (this.apiNameDraft.length === 0) {
 							return;
 						}
+						// 같은 API를 여러 번 추가하는 것은 허용한다 — 구독 하나 = API 인스턴스
+						// 하나이고, 같은 arXiv에 서로 다른 조건 묶음을 거는 건 정당한 사용이다.
 						this.apiDrafts.push({
-							label: this.apiLabelDraft.trim(),
+							apiName: this.apiNameDraft,
 							conditions: [],
 							newConditionType: 'keyword',
 							newConditionQuery: '',
 						});
-						this.apiLabelDraft = '';
-						// TODO: File/Subscriptions/API 구현 후 File.writeSubscriptions(...)로 연결
+						void this.persistSubscriptions();
 						this.display();
 					}),
 			);
@@ -641,23 +501,75 @@ export class SettingTab extends PluginSettingTab {
 		}
 	}
 
+	// Subscriptions.json -> apiDrafts. 설정탭을 열 때 한 번만 — 이후에는 UI가 진실이고
+	// 변경할 때마다 persistSubscriptions()로 즉시 내려쓴다.
+	private async loadSubscriptions(): Promise<void> {
+		try {
+			const subscriptions = await File.readSubscriptions();
+			this.apiDrafts = subscriptions.apis.map((api) => ({
+				apiName: api.apiName,
+				conditions: api.querys.map((query) => ({
+					searchType: query.searchType as ConditionType,
+					query: query.query,
+				})),
+				newConditionType: 'keyword',
+				newConditionQuery: '',
+			}));
+			this.subscriptionsUnreadable = false;
+		} catch (e) {
+			// 예: 이 버전이 모르는 apiName이 저장돼 있으면 createApi가 throw한다(팀원이 새
+			// API를 추가한 브랜치로 저장한 파일을 옛 코드로 열었을 때). 이 상태로 저장까지
+			// 허용하면 그 구독을 통째로 날리므로 저장을 막는다.
+			this.subscriptionsUnreadable = true;
+			new Notice(`구독 정보를 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
+		}
+		this.apiNameDraft = File.supportedApiNames()[0] ?? '';
+		this.subscriptionsLoaded = true;
+		this.display();
+	}
+
+	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다 —
+	// updateTime(수집 커서)을 UI 저장이 덮어쓰면 다음 수집 구간이 틀어진다.
+	private async persistSubscriptions(): Promise<void> {
+		if (this.subscriptionsUnreadable) {
+			new Notice(
+				'저장된 구독을 읽지 못한 상태라 저장하지 않습니다 — 덮어쓰면 기존 구독이 사라집니다. Subscriptions.json을 확인하세요.',
+			);
+			return;
+		}
+		try {
+			const subscriptions = await File.readSubscriptions();
+			subscriptions.apis = this.apiDrafts.map((draft) =>
+				File.createApi(
+					draft.apiName,
+					draft.conditions.map((c): SearchQuery => ({ searchType: c.searchType, query: c.query })),
+				),
+			);
+			await File.writeSubscriptions(subscriptions);
+		} catch (e) {
+			new Notice(`구독 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
+		}
+	}
+
 	private renderApiDraft(containerEl: HTMLElement, api: ApiDraft): void {
 		new Setting(containerEl)
-			.setName(api.label)
+			.setName(api.apiName)
 			.setHeading()
 			.addButton((button) =>
 				button.setButtonText('API 삭제').onClick(() => {
 					this.apiDrafts = this.apiDrafts.filter((item) => item !== api);
+					void this.persistSubscriptions();
 					this.display();
 				}),
 			);
 
 		for (const condition of api.conditions) {
 			new Setting(containerEl)
-				.setName(`${CONDITION_TYPE_LABEL[condition.searchType]}: ${condition.query}`)
+				.setName(`${CONDITION_TYPE_LABEL[condition.searchType] ?? condition.searchType}: ${condition.query}`)
 				.addButton((button) =>
 					button.setButtonText('조건 삭제').onClick(() => {
 						api.conditions = api.conditions.filter((item) => item !== condition);
+						void this.persistSubscriptions();
 						this.display();
 					}),
 				);
@@ -665,7 +577,7 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('조건 추가')
-			.setDesc(`${api.label}에 동시에 구독할 조건을 추가합니다.`)
+			.setDesc(`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND).`)
 			.addDropdown((dropdown) =>
 				dropdown
 					.addOption('keyword', CONDITION_TYPE_LABEL.keyword)
@@ -686,12 +598,17 @@ export class SettingTab extends PluginSettingTab {
 					if (api.newConditionQuery.trim().length === 0) {
 						return;
 					}
+					// 004의 결합 규칙 — 한 구독의 조건은 최대 3개, 전부 AND.
+					if (api.conditions.length >= MAX_CONDITIONS_PER_API) {
+						new Notice(`조건은 API당 최대 ${MAX_CONDITIONS_PER_API}개까지 등록할 수 있습니다.`);
+						return;
+					}
 					api.conditions.push({
 						searchType: api.newConditionType,
 						query: api.newConditionQuery.trim(),
 					});
 					api.newConditionQuery = '';
-					// TODO: Subscriptions/API 구현 후 SecretStore.writeSubscriptions(...)로 연결
+					void this.persistSubscriptions();
 					this.display();
 				}),
 			);

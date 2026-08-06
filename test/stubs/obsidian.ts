@@ -8,6 +8,37 @@
 // 대역으로 바꾸는 건 requestUrl(= 네트워크) 하나뿐이고, ApiSupport/API의 나머지 코드는
 // 전부 실제 구현이 돈다. "가짜 응답을 넣고 진짜 파이프라인을 통과시킨다"가 이 테스트의 전제.
 
+// Vault 파일 핸들. File.readVaultText/writeVaultText가 `instanceof TFile`로 "이미 있는
+// 파일인가"를 판별하므로, 대역 Vault는 반드시 이 클래스의 인스턴스를 돌려줘야 한다.
+// extension은 getFiles() 순회(File.readAllPapers의 .json 필터)가 읽는다.
+export class TFile {
+	extension: string;
+
+	constructor(public path: string) {
+		const dot = path.lastIndexOf('.');
+		this.extension = dot === -1 ? '' : path.slice(dot + 1);
+	}
+}
+
+// 폴더 핸들. getAbstractFileByPath가 폴더를 돌려줄 때 TFile이 아니어야 한다.
+export class TFolder {
+	constructor(public path: string) {}
+}
+
+// Notice는 UI 알림이라 테스트에서 할 일이 없지만, Embedding.ts가 import하므로 번들이
+// 깨지지 않도록 대역이 필요하다. 띄운 메시지는 검사할 수 있게 모아둔다.
+const NOTICES: string[] = [];
+
+export class Notice {
+	constructor(message: string) {
+		NOTICES.push(message);
+	}
+}
+
+export function recordedNotices(): string[] {
+	return NOTICES;
+}
+
 export interface RequestUrlParam {
 	url: string;
 	method?: string;

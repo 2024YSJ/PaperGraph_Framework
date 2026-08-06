@@ -49,6 +49,12 @@ export interface API {
 	SearchRecentPaper(hours: number): Promise<Paper[]>;
 	Backfill(from: number, to: number): Promise<Paper[]>;
 
+	// [3] 정책의 재시도 경로. citationsKnown=false인 논문만 골라 보강을 다시 시도하고,
+	// 나머지는 건드리지 않는다. 수집 경로는 내부에서 자동으로 호출하므로 외부에서 부를
+	// 일은 "저장돼 있던 논문을 다시 읽어와 재시도하는" 보정 패스(CollectAndSave.repair)뿐이다.
+	// 실패해도 throw하지 않는다 — 플래그가 false로 남아 다음 기회에 또 시도된다.
+	EnrichCitations(papers: Paper[]): Promise<void>;
+
 	// 직전 SearchRecentPaper/Backfill 호출의 커버리지. 단발 조회(SearchBase)나 아직 한 번도
 	// 수집하지 않았으면 undefined. 커서 저장(CollectAndSave.run)과 결과 표시(UI)가 읽는
 	// 값이라 인터페이스에 포함한다. 값을 정하는 건 구현체의 책임이므로 readonly다.
@@ -192,7 +198,7 @@ export class ArxivAPI implements API {
 					`(entry ${page.entryCount}건 중 ${page.papers.length}건만 Paper로 변환됨)`,
 			);
 		}
-		await runQuietly(() => this.enrichCitations(page.papers));
+		await runQuietly(() => this.EnrichCitations(page.papers));
 		return page.papers;
 	}
 
@@ -240,7 +246,7 @@ export class ArxivAPI implements API {
 		}
 
 		const papers = await this.collectPaged(ArxivAPI.buildDateFilter(from, to), from, to);
-		await runQuietly(() => this.enrichCitations(papers));
+		await runQuietly(() => this.EnrichCitations(papers));
 		return papers;
 	}
 
@@ -563,7 +569,9 @@ export class ArxivAPI implements API {
 
 	// [3] 정책 — citationsKnown=false인 논문만 골라 S2에서 citationCount를 채운다. 실패해도
 	// 예외를 던지지 않고 citationsKnown=false로 남겨 다음 수집에서 다시 시도되게 한다.
-	private async enrichCitations(papers: Paper[]): Promise<void> {
+	// public인 이유: 보정 패스(CollectAndSave.repair)가 저장된 논문을 다시 읽어와 이 재시도
+	// 필터를 실사용한다 — 인터페이스 주석 참고.
+	public async EnrichCitations(papers: Paper[]): Promise<void> {
 		const idToPapers = new Map<string, Paper[]>();
 		for (const paper of papers) {
 			if (paper.citationsKnown) {
