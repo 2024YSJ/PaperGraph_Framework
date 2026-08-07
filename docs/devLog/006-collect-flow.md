@@ -1,4 +1,4 @@
-# 수집 클래스 완성 (우빈 — CollectAndSave.run/repair 구현)
+# 수집 클래스 완성 (CollectAndSave.run/repair 구현)
 
 `CollectAndSave.run()`/`repair()`을 구현하고, 그 위에서 실기기 테스트로 드러난 데이터
 유실·재작업·관측성 문제를 고쳤다. 003·004 devLog가 `run()` 구현자에게 남긴 계약을
@@ -36,7 +36,7 @@
 
 ### 임베딩 실패 시 빈 값으로 저장 (스킵하지 않음)
 
-003이 남긴 두 선택지(저장 스킵 / 빈 값+`embeddingSucceeded=false`) 중 후자를 택했다.
+003이 남긴 두 선택지(빈 값+`embeddingSucceeded=false`) 중 후자를 택했다.
 스킵하면 "이 논문이 임베딩에 실패했다"는 사실이 어디에도 안 남아 나중에 재임베딩
 대상을 찾을 수 없다. 가짜 벡터는 만들지 않는다.
 
@@ -251,6 +251,61 @@ UI 레이어(`SettingTab`)의 버튼 클릭·Notice 문자열 자체는 이 하�
   아무도 몰랐다. 병합 충돌을 "한쪽 통째로 채택"으로 해소하면, 채택 안 된 쪽의 작은
   기능이 diff에 안 보이는 채로 없어질 수 있다는 사례로 남긴다.
 
+## 재시도/복구 흐름 전수 점검 (8월 7일)
+
+구조·재시도·효율·연결 상태를 코드로 다시 훑어 확인했다. 새로 고친 것은 없고
+확인 결과만 남긴다.
+
+### 재시도가 4계층으로 분리돼 있고 서로 안 겹친다
+
+| 계층 | 대상 | 정책 | 실패 시 |
+|---|---|---|---|
+| HTTP (`ApiSupport.requestWithRetry`) | 429/502/503/504 | 3회, `Retry-After` 존중, arXiv·S2 각 재시도 간격 3초(`ARXIV_RETRY`/`S2_RETRY`) | `HttpRequestError` throw |
+| 페이지네이션 (`ArxivAPI.collectPaged`) | 구간이 상한 초과 | `MAX_PAGES=20`, 페이지 사이 3초 | `truncated=true` + `coveredThrough` 보고 |
+| 임베딩 (`Embedding.runLocalModel`) | ONNX 추론 실패 | 새 세션으로 1회 재시도 → 서킷브레이커(3회 연속 실패 시 60초 차단) | throw → `embedOne()`이 빈 값 저장 |
+| 보강 (`ArxivAPI.EnrichCitations`) | S2 조회 실패 | `runQuietly`로 삼킴, 재시도 없음 | `citationsKnown=false` 유지 |
+
+각 계층이 정확히 자기 책임만 지고 있다 — HTTP 계층은 상태코드만 보고, 페이지네이션은
+구간 커버리지만, 임베딩은 세션 수명만, 보강은 [3] 정책 플래그만 다룬다.
+
+### 실패가 실제로 회수되는지 끝까지 추적 확인
+
+- arXiv 요청 실패(throw) → `run()`까지 전파 → 커서 갱신 코드에 도달 못 함 →
+  **다음 실행이 같은 구간을 다시 시도**한다(커서가 안 움직였으므로).
+- 임베딩 실패 → `embeddingSucceeded=false` 저장 → **`repair()`의 1단계가 대상으로
+  잡아 재시도**한다.
+- S2 실패 → `citationsKnown=false` 유지 → **`repair()`의 2단계가 대상으로 잡아
+  재시도**한다.
+- 페이지네이션 상한 초과(`truncated`) → `coveredThrough`가 커서로 저장 → **다음
+  실행이 그 지점부터 이어받는다**(처음부터 다시 안 훑음).
+
+네 갈래 모두 "실패하면 조용히 사라지는" 경로 없이 다음 기회로 이어진다는 걸 확인했다.
+
+### 효율 관찰 2건 (지금 고칠 정도는 아님, 기록만)
+
+- **`File.readKnownCitations()`가 매 `collect()` 호출마다 저장소 전체를 스캔한다.**
+  `repair()`와 같은 비용 특성(코퍼스가 커지면 부담)을 공유한다 — 이미 위에서
+  한계로 남겨둔 것과 같은 종류.
+- **논문 한 편당 파일을 두 번 읽는다.** `embedOrReuse()`의 `readStoredPaper()`와
+  뒤이은 `writePaper()` 내부의 `existing` 조회가 같은 파일을 각각 연다. 임베딩
+  비용(1~2초) 대비 무시할 수준이라 지금은 안 건드렸다.
+
+### 연결 상태 재확인 — 수집 경로는 끊긴 곳 없음, 그 밖 3곳 확인됨
+
+설정탭 버튼 → `run()`/`repair()` → API → 임베딩 → 저장 → 커서까지 전 구간
+이어져 있다. 끊긴 지점은 전부 수집 파이프라인 밖이다: `EventListener.checking()`/
+`TaskManager.runTask()` 스텁(위 "열린 항목" 참고), 시각화 phase 전체
+(`VisualizationFlow.run()`/`Visualization.init/render()` 스텁, 담당자 별도),
+자동 스케줄러 부재(`registerInterval` 등 시간 기반 트리거가 코드에 없음 —
+지금은 사용자가 버튼을 눌러야만 수집이 시작된다).
+
+부수적으로 `SettingTab.ts`의 "저장 테스트 — Paper" 버튼 catch가
+`'아직 구현되지 않음: 저장(Paper)'`을 띄우는데, `File.writePaper`는 이미
+구현돼 있어 이 메시지는 옛 문구가 남은 것으로 보인다 — 실패 시 원인을 가리므로
+정리 대상이지만 이번엔 손대지 않았다.
+
+`npm run build` / `npm test`(78/78) / `npx eslint src test`(0 errors) 통과.
+
 ## 열린 항목 / 다음 담당자 참고
 
 - **EventListener/TaskManager가 스텁**이라 커맨드 팔레트가 동작하지 않는다. 구현
@@ -280,3 +335,10 @@ UI 레이어(`SettingTab`)의 버튼 클릭·Notice 문자열 자체는 이 하�
   대비 이득이 작다.
 - **수집 취소 기능은 없다** — `run()`에 취소 신호를 받을 자리가 구조적으로 없다.
   별도 논의 필요.
+- **`SettingTab.ts`의 "저장 테스트 — Paper" 버튼이 옛 문구를 띄운다** — catch에
+  `'아직 구현되지 않음: 저장(Paper)'`이 남아 있는데 `File.writePaper`는 이미
+  구현돼 있어, 실제 저장 실패가 나도 원인이 아니라 "미구현"으로 잘못 표시된다.
+  다른 버튼들이 쓰는 `e.message` 노출 패턴으로 바꿔야 한다.
+- **`repair()`가 `PaperGraph3D_Class_Diagram.md`에 반영돼 있지 않다** — `run()`과
+  별개로 새로 생긴 공개 메서드인데 다이어그램의 `CollectAndSave` 정의에는 없다.
+  다이어그램만 보는 다음 담당자가 놓칠 수 있다.
