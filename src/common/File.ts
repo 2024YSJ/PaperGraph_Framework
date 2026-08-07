@@ -67,7 +67,12 @@ export class File {
 		return File.writeConfig('Secret.json', secret.toJSON(), (text) => File.obfuscate(text));
 	}
 
-	static readSubscriptions(): Promise<Subscriptions> {
+	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json
+	// 자체엔 secret이 없다(writeSubscriptions가 의도적으로 제외, 아래 참고). readConfig의
+	// revive 콜백은 동기 함수라 그 안에서 await할 수 없으므로, secret은 미리 읽어 클로저로
+	// 넘긴다.
+	static async readSubscriptions(): Promise<Subscriptions> {
+		const secret = await File.readSecret();
 		return File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
@@ -79,34 +84,87 @@ export class File {
 				};
 				const subscriptions = new Subscriptions();
 				subscriptions.updateTime = data.updateTime ?? 0;
+				subscriptions.secret = secret;
 				subscriptions.apis = (data.apis ?? []).map((api) =>
-					File.createApi(api.apiName, api.querys ?? []),
+					File.createApi(
+						api.apiName,
+						(api.querys ?? []).map((query) => File.migrateSearchType(query)),
+						secret,
+					),
 				);
 				return subscriptions;
 			},
-			() => new Subscriptions(),
+			() => {
+				// Subscriptions.json이 아직 없는 첫 실행(새로 설치한 환경) 기본값.
+				// 모든 필드를 실제로 채워야 한다 — 비워두면 `!` 단언 때문에 타입은 채워진
+				// 것처럼 보이지만 런타임 값은 undefined라, 호출자가 그대로 .map/.forEach하면
+				// 그 자리에서 터진다(설정탭이 실제로 이렇게 죽었었다). updateTime도 파일이
+				// 있을 때의 `?? 0`과 같은 값으로 맞춰 두 경로가 같은 모양을 내놓게 한다.
+				const subscriptions = new Subscriptions();
+				subscriptions.secret = secret;
+				subscriptions.apis = [];
+				subscriptions.updateTime = 0;
+				return subscriptions;
+			},
 		);
+	}
+
+	// 이름이 바뀐 searchType을 현재 값으로 옮긴다. 설정탭이 'domain'을 저장하던 시절의
+	// Subscriptions.json이 그대로 남아 있으면, 복원된 구독으로 수집할 때 arXiv 쪽에서
+	// "Unknown searchType"으로 throw해 해당 구독 전체가 실패한다. 읽는 시점에 한 번
+	// 정규화해 두면 저장 파일이 다음 writeSubscriptions에서 자연스럽게 갱신된다.
+	private static readonly SEARCH_TYPE_ALIASES: Record<string, string> = {
+		domain: 'category',
+	};
+
+	// typeof 검사는 프로토타입 체인 방어다. searchType이 'toString' 같은 값이면 맵에서
+	// 함수가 잡히는데, truthy라서 그대로 searchType에 대입돼버린다.
+	private static migrateSearchType(query: SearchQuery): SearchQuery {
+		const renamed = File.SEARCH_TYPE_ALIASES[query.searchType];
+		return typeof renamed === 'string' ? { ...query, searchType: renamed } : query;
 	}
 
 	static writeSubscriptions(subscriptions: Subscriptions): Promise<void> {
 		// secret은 별도 Secret.json(난독화)에만 저장한다. Subscriptions.json에 함께 넣으면
 		// API 키가 평문으로 중복 저장되므로 제외한다.
+		//
+		// ⚠️ apis를 그대로 넘기면 안 된다. API 구현체는 Secret 참조나 캐시(lastCoverage 등)를
+		// 인스턴스 필드로 들고 있을 수 있고, TypeScript의 private은 컴파일 타임 표시일 뿐이라
+		// JSON.stringify가 전부 직렬화한다 — 실제로 ArxivAPI에 secret을 넘기기 시작하자
+		// 이 파일에 API 키가 평문으로 찍혔다. 저장할 필드를 여기서 명시적으로 골라내
+		// 구현체가 어떤 필드를 갖든 새지 않게 한다(복원에 필요한 건 apiName과 querys뿐이다).
 		return File.writeConfig('Subscriptions.json', {
 			updateTime: subscriptions.updateTime,
-			apis: subscriptions.apis,
+			apis: subscriptions.apis.map((api) => ({ apiName: api.apiName, querys: api.querys })),
 		});
+	}
+
+	// API 구현체 등록부 — 이 코드베이스가 지원하는 API 목록의 유일한 진실.
+	// 새 API 추가 = 여기 한 줄 + import. 구독 UI의 드롭다운(supportedApiNames)과
+	// createApi가 같은 목록을 보므로 "UI는 받는데 복원은 못 하는 이름"이 생길 수 없다.
+	private static readonly API_FACTORIES: Record<
+		string,
+		(querys: SearchQuery[], secret?: Secret) => API
+	> = {
+		arxiv: (querys, secret) => new ArxivAPI(querys, secret),
+	};
+
+	// 구독 UI가 API 선택지를 만들 때 쓴다. 이름을 손으로 치게 하면 'arXiv' 같은 오타가
+	// 저장은 통과하고 다음 수집(createApi)에서야 터진다 — 목록에서 고르게 해야 한다.
+	static supportedApiNames(): string[] {
+		return Object.keys(File.API_FACTORIES);
 	}
 
 	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
 	// 평범한 객체({ apiName, querys })를 메서드가 살아있는 API 인스턴스로 복원할 때 쓴다
-	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md). 새 API는 case를 한 줄 추가한다.
-	static createApi(apiName: string, querys: SearchQuery[] = []): API {
-		switch (apiName) {
-			case 'arxiv':
-				return new ArxivAPI(querys);
-			default:
-				throw new Error(`Unknown apiName: ${apiName}`);
+	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md).
+	// secret은 선택 사항 — 없으면 각 API 구현체가 알아서 익명으로 동작한다.
+	static createApi(apiName: string, querys: SearchQuery[] = [], secret?: Secret): API {
+		const factory = File.API_FACTORIES[apiName];
+		if (factory === undefined) {
+			throw new Error(`Unknown apiName: ${apiName}`);
 		}
+		return factory(querys, secret);
 	}
 
 	// ── Paper (콘텐츠 트리, .json + .md) ────────────────────────────────
@@ -114,14 +172,44 @@ export class File {
 	// 해당 연도 폴더(PaperGraph3D/<year>/) 아래 모든 .json을 읽어 Paper 배열로 반환.
 	// 경로가 날짜로 결정되므로 연도만 있으면 sourceId 조회/인덱스 없이 일괄 로드된다.
 	static async readPapersByYear(year: number): Promise<Paper[]> {
-		const prefix = `${File.PAPER_ROOT}/${year}/`;
+		return File.readPapersUnder(`${File.PAPER_ROOT}/${year}/`);
+	}
+
+	// 콘텐츠 트리 전체(PaperGraph3D/ 아래 모든 연도)의 논문을 읽는다. 보정 패스
+	// (CollectAndSave.repair — 실패 플래그가 선 논문을 다시 시도)가 대상을 찾을 때 쓴다.
+	static async readAllPapers(): Promise<Paper[]> {
+		return File.readPapersUnder(`${File.PAPER_ROOT}/`);
+	}
+
+	// 이미 인용수를 아는 논문의 sourceId -> citationCount. CollectAndSave.run()이 수집
+	// 직전에 읽어 API에 넘긴다 — 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아와도,
+	// 이미 아는 값이면 S2를 다시 두드리지 않게 하려는 목적이다(collectedApis 기준으로
+	// 거르지 않는다 — 어느 API가 수집했든 sourceId가 같으면 같은 논문이므로 값도 같다).
+	static async readKnownCitations(): Promise<Map<string, number>> {
+		const known = new Map<string, number>();
+		for (const paper of await File.readAllPapers()) {
+			if (paper.citationsKnown) {
+				known.set(paper.sourceId, paper.citationCount);
+			}
+		}
+		return known;
+	}
+
+	// readPapersByYear/readAllPapers의 공통 몸통 — 둘 다 "이 prefix 아래 .json을 전부
+	// Paper로 읽는다"만 다르게 좁힌 것이라 한 곳에만 둔다. vault.getFiles()가 이미 전체
+	// 목록을 주므로 연도를 하나씩 열거할 필요가 없다.
+	private static async readPapersUnder(prefix: string): Promise<Paper[]> {
 		const files = File.vault
 			.getFiles()
 			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
 		const papers: Paper[] = [];
 		for (const file of files) {
 			const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
-			papers.push(Object.assign(new Paper(), wrapper.paper));
+			const paper = Object.assign(new Paper(), wrapper.paper);
+			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
+			paper.collectedApis ??= [];
+			paper.collectedQueries ??= [];
+			papers.push(paper);
 		}
 		return papers;
 	}
@@ -129,14 +217,64 @@ export class File {
 	// .json(진실 원본)과 .md(Obsidian 뷰)를 함께 쓴다. 재작성 시 기존 createdAt / 사용자
 	// 자유 본문을 보존한다.
 	static async writePaper(paper: Paper): Promise<void> {
-		const base = File.resolvePaperPath(paper);
+		await File.writePaperAt(paper, File.resolvePaperPath(paper));
+	}
+
+	// 이 Paper가 저장될 자리에 이미 저장돼 있는 논문을 읽는다. 없으면 null. 저장 경로가
+	// publicationDate/title/sourceId로 결정되므로, 넘긴 paper의 이 필드들이 실제 저장본과
+	// 같아야 같은 파일을 찾는다 — run()이 "이미 임베딩된 논문인가"를 판단할 때 쓴다.
+	static async readStoredPaper(paper: Paper): Promise<Paper | null> {
+		const jsonPath = `${File.resolvePaperPath(paper)}.json`;
+		const text = await File.readVaultText(jsonPath);
+		if (text === null) {
+			return null;
+		}
+		const wrapper = JSON.parse(text) as StoredPaperFile;
+		return Object.assign(new Paper(), wrapper.paper);
+	}
+
+	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
+	// 바로 아래에 저장한다. .json+.md 형식과 upsert(생성 또는 갱신) 동작은 writePaper와
+	// 동일 — readPapersByYear는 PaperGraph3D/<year>/ 접두사만 보므로 이 폴더 아래 파일은
+	// 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용 SettingTab 버튼에서 사용).
+	static async writeTestPaper(paper: Paper, folder: string): Promise<void> {
+		await File.writePaperAt(paper, `${folder}/${File.baseNoteName(paper.title, paper.sourceId)}`);
+	}
+
+	private static async writePaperAt(paper: Paper, base: string): Promise<void> {
 		const jsonPath = `${base}.json`;
 		const mdPath = `${base}.md`;
 
 		const existingJson = await File.readVaultText(jsonPath);
-		const createdAt = existingJson
-			? (JSON.parse(existingJson) as StoredPaperFile).createdAt
-			: Date.now();
+		const existing = existingJson ? (JSON.parse(existingJson) as StoredPaperFile) : null;
+		const createdAt = existing ? existing.createdAt : Date.now();
+
+		// 같은 sourceId(같은 파일 경로)로 다른 구독이 다시 써도, 먼저 저장된 구독의
+		// collectedApis/collectedQueries가 이번 값으로 덮이지 않도록 병합한다. 병합 없이
+		// 그대로 덮으면 "이 논문이 어느 구독들에 걸렸는가"라는 정보가 매번 마지막에 쓴
+		// 구독 하나로 조용히 줄어든다.
+		File.mergeCollectionSources(paper, existing?.paper);
+
+		// 백스톱: run()이 이미 저장본을 확인해 성공한 임베딩은 재사용하지만(가장 흔한 경로),
+		// repair()나 앞으로 생길 다른 호출자가 그 확인을 건너뛰고 실패 상태로 다시 저장하면
+		// 멀쩡했던 벡터가 빈 값으로 덮인다 — 실제로 재현됨. 들어온 값이 실패인데 기존이
+		// 성공이면 기존 임베딩을 지키고, 그 외(기존도 실패/없음)는 003의 (b)대로 그대로 둔다.
+		if (!paper.embeddingSucceeded && existing?.paper.embeddingSucceeded) {
+			paper.embedding = existing.paper.embedding;
+			paper.embeddingModel = existing.paper.embeddingModel;
+			paper.embeddingSource = existing.paper.embeddingSource;
+			paper.embeddingSucceeded = true;
+		}
+
+		// 재스캔(4일 보정 창)이 같은 논문을 다시 저장 대상으로 올려도, 위 두 단계(출처
+		// 병합·임베딩 보존)를 거친 뒤 실제 값이 기존과 완전히 같으면 디스크에 다시 쓰지
+		// 않는다. 무조건 쓰면 (1) 내용이 똑같은데 파일 감시자/동기화가 매번 깨어나고,
+		// (2) updatedAt이 매번 지금 시각으로 갱신돼 "이 논문이 실제로 마지막으로 바뀐
+		// 시점"이라는 정보 자체가 사라진다. 인용수 보강이나 새 구독의 출처 추가처럼 값이
+		// 하나라도 실제로 다르면 정상적으로 다시 쓴다.
+		if (existing !== null && File.papersEqual(paper, existing.paper)) {
+			return;
+		}
 
 		const existingMd = await File.readVaultText(mdPath);
 		const userBody = existingMd ? File.parseUserBody(existingMd) : '';
@@ -149,6 +287,74 @@ export class File {
 		};
 		await File.writeVaultText(jsonPath, JSON.stringify(wrapper, null, 2));
 		await File.writeVaultText(mdPath, File.renderNote(paper, userBody));
+	}
+
+	// paper.collectedApis/collectedQueries에 existingPaper가 이미 가지고 있던 (api, query)
+	// 쌍을 합친다(paper를 직접 수정). 두 배열은 같은 인덱스가 한 쌍이라는 불변식을 유지해야
+	// 하므로, 항상 이 함수를 통해서만 합친다 — 각자 밀거나 당기면 인덱스가 어긋난다.
+	// 중복 판정은 (apiName, searchType, query) 조합 — 같은 구독이 다시 써도 항목이
+	// 늘어나지 않는다. 예전 스키마 파일(collectedApis 없음)은 빈 배열로 취급한다.
+	private static mergeCollectionSources(paper: Paper, existingPaper: Paper | undefined): void {
+		const existingApis = existingPaper?.collectedApis ?? [];
+		const existingQueries = existingPaper?.collectedQueries ?? [];
+		if (existingApis.length === 0) {
+			return;
+		}
+
+		const seen = new Set(
+			paper.collectedApis.map(
+				(api, i) => `${api}:${paper.collectedQueries[i]?.searchType}:${paper.collectedQueries[i]?.query}`,
+			),
+		);
+		for (let i = 0; i < existingApis.length; i += 1) {
+			const api = existingApis[i];
+			const query = existingQueries[i];
+			if (!api || !query) {
+				continue;
+			}
+			const key = `${api}:${query.searchType}:${query.query}`;
+			if (seen.has(key)) {
+				continue;
+			}
+			seen.add(key);
+			paper.collectedApis.push(api);
+			paper.collectedQueries.push(query);
+		}
+	}
+
+	// writePaperAt이 "다시 쓸 필요가 있는가"를 판단할 때 쓴다. JSON.stringify로 통째로
+	// 비교하지 않는 이유: 두 값의 프로퍼티 삽입 순서가 우연히 달라지면(예: 다른 생성
+	// 경로를 거친 Paper) 내용이 같아도 다르다고 오판할 수 있다. 필드별로 직접 비교하면
+	// 그 위험이 없다. collectedApis/collectedQueries는 인덱스가 한 쌍이라는 불변식이 있어
+	// 순서까지 같아야 진짜로 같은 것이다(정렬 없이 순차 비교).
+	private static papersEqual(a: Paper, b: Paper): boolean {
+		return (
+			a.title === b.title &&
+			a.abstract === b.abstract &&
+			a.sourceId === b.sourceId &&
+			a.publicationDate === b.publicationDate &&
+			a.citationCount === b.citationCount &&
+			a.citationsKnown === b.citationsKnown &&
+			a.embeddingModel === b.embeddingModel &&
+			a.embeddingSource === b.embeddingSource &&
+			a.embeddingSucceeded === b.embeddingSucceeded &&
+			File.arraysEqual(a.authors, b.authors) &&
+			File.arraysEqual(a.references, b.references) &&
+			File.arraysEqual(a.embedding, b.embedding) &&
+			File.arraysEqual(a.collectedApis, b.collectedApis) &&
+			File.searchQueriesEqual(a.collectedQueries, b.collectedQueries)
+		);
+	}
+
+	private static arraysEqual<T>(a: T[], b: T[]): boolean {
+		return a.length === b.length && a.every((v, i) => v === b[i]);
+	}
+
+	private static searchQueriesEqual(a: SearchQuery[], b: SearchQuery[]): boolean {
+		return (
+			a.length === b.length &&
+			a.every((q, i) => q.searchType === b[i]?.searchType && q.query === b[i]?.query)
+		);
 	}
 
 	// ── config 공통: encode/decode는 옵션(기본=평문 통과). Secret만 난독화 변환을 넘긴다.

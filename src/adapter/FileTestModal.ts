@@ -79,8 +79,8 @@ export class FileTestModal extends Modal {
 						paper.publicationDate = this.paperDate;
 						paper.citationCount = 0;
 						paper.citationsKnown = false;
-						paper.collectedApi = '';
-						paper.collectedQuery = { searchType: '', query: '' };
+						paper.collectedApis = [];
+						paper.collectedQueries = [];
 						paper.embedding = [];
 						paper.embeddingModel = '';
 						paper.embeddingSource = '';

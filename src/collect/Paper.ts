@@ -18,10 +18,12 @@ export class Paper {
 	citationCount!: number;
 	citationsKnown!: boolean; // (+) 인용수가 확인된 논문인가
 
-	// 수집 출처: "어떤 방법으로 수집됐는가" = 어떤 API로, 어떤 검색 쿼리로 수집했는가.
-	// (recent/backfill 구분이 아니다 — 그건 CollectAndSave.run()의 실행 모드다.)
-	collectedApi!: string; // (+) 수집한 API 식별자 (Secret 맵의 provider 키와 동일 체계)
-	collectedQuery!: SearchQuery; // (+) 수집에 사용된 검색 쿼리
+	// 수집 출처: "어떤 방법(들)으로 수집됐는가" = 어떤 API로, 어떤 검색 쿼리로 수집했는가.
+	// 같은 논문을 서로 다른 구독이 각각 발견할 수 있으므로 배열이다 — 두 배열은 같은
+	// 인덱스가 한 쌍(같은 구독)을 이룬다. (recent/backfill 구분이 아니다 — 그건
+	// CollectAndSave.run()의 실행 모드다.)
+	collectedApis!: string[]; // (+) 수집한 API 식별자들 (Secret 맵의 provider 키와 동일 체계)
+	collectedQueries!: SearchQuery[]; // (+) 수집에 사용된 검색 쿼리들 (collectedApis와 같은 인덱스가 한 쌍)
 
 	// 임베딩
 	embedding!: number[]; // 임베딩 벡터 (PCA/시각화 입력)

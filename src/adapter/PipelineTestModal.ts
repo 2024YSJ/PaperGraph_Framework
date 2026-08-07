@@ -4,8 +4,10 @@ export interface PipelineTestField {
 	key: string;
 	label: string;
 	desc?: string;
-	type: 'text' | 'number' | 'date';
+	type: 'text' | 'number' | 'date' | 'select';
 	defaultValue?: string;
+	// type이 'select'일 때만 쓴다 — 값 -> 화면에 보일 라벨.
+	options?: Record<string, string>;
 }
 
 // 설정탭의 "파이프라인 테스트" 버튼 공용 입력창. 각 단계가 아직 대부분 미구현
@@ -32,15 +34,28 @@ export class PipelineTestModal extends Modal {
 		contentEl.createEl('h3', { text: this.title });
 
 		for (const field of this.fields) {
-			new Setting(contentEl)
-				.setName(field.label)
-				.setDesc(field.desc ?? '')
-				.addText((text) => {
-					text.setValue(this.values[field.key] ?? '').onChange((value) => {
+			const setting = new Setting(contentEl).setName(field.label).setDesc(field.desc ?? '');
+
+			// 값이 정해진 목록 중 하나여야 하는 필드(예: searchType)는 드롭다운으로 받는다.
+			// 자유 텍스트로 두면 오타가 그대로 API까지 내려가 "Unknown searchType"으로 터진다.
+			if (field.type === 'select') {
+				setting.addDropdown((dropdown) => {
+					for (const [value, label] of Object.entries(field.options ?? {})) {
+						dropdown.addOption(value, label);
+					}
+					dropdown.setValue(this.values[field.key] ?? '').onChange((value) => {
 						this.values[field.key] = value;
 					});
-					text.inputEl.type = field.type;
 				});
+				continue;
+			}
+
+			setting.addText((text) => {
+				text.setValue(this.values[field.key] ?? '').onChange((value) => {
+					this.values[field.key] = value;
+				});
+				text.inputEl.type = field.type;
+			});
 		}
 
 		new Setting(contentEl).addButton((button) =>
