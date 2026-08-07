@@ -6,3 +6,9 @@
 	white-space: pre-wrap;
 	word-break: break-word;
 }
+
+/* 3D force graph를 그릴 컨테이너. 3d-force-graph가 이 요소의 크기에 맞춰 캔버스를 채운다. */
+.papergraph3d-graph {
+	width: 100%;
+	height: 600px;
+}
