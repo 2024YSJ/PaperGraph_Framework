@@ -30,15 +30,6 @@ export class CollectAndSave {
 	embedding!: Embedding;
 	middlewares: Middleware[] = [];
 
-	// 색인 지연 보정 창. arXiv는 제출과 색인 사이에 지연이 있어, 커서 시점부터만 훑으면
-	// "커서를 지난 뒤에 색인된 논문"을 영영 못 본다. 커서보다 이만큼 뒤로 물러난 지점부터
-	// 다시 훑되, 이 창 자체는 커서에 반영하지 않는다(반영하면 커서가 전진하지 못한다).
-	private static readonly RESCAN_WINDOW_MS = 4 * 24 * 60 * 60 * 1000;
-
-	// 커서가 아직 없는 첫 실행에서 훑을 범위. 커서 0에 보정 창을 빼면 1970년부터 훑게 돼
-	// 상한(MAX_PAGES)에 걸려 "가장 오래된 2000편"을 가져오는 엉뚱한 동작이 된다.
-	private static readonly FIRST_RUN_HOURS = 24;
-
 	// 등록 계열: 안전하게 동작한다.
 	setMiddleware(mw: Middleware): void {
 		this.middlewares.push(mw);
@@ -70,7 +61,7 @@ export class CollectAndSave {
 			);
 		}
 
-		const window = this.resolveWindow(mode, testOptions);
+		const window = this.resolveWindow(mode, testOptions, apis);
 		const papers = await this.collect(apis, window);
 
 		// 'all' 미들웨어는 수집 결과 전체를 한 번 받는다. 받는 배열은 아래 루프가 그대로
@@ -158,6 +149,7 @@ export class CollectAndSave {
 	private resolveWindow(
 		mode: 'recent' | 'backfill',
 		testOptions: CollectTestOptions | undefined,
+		apis: API[],
 	): CollectWindow {
 		const now = Date.now();
 
@@ -182,23 +174,31 @@ export class CollectAndSave {
 			return { hours, from: now - hours * 60 * 60 * 1000, to: now, advancesCursor: false };
 		}
 
+		// "최근"의 실제 폭 = 구독된 API들의 색인 지연 중 가장 보수적인 값(recentRescanWindowMs
+		// 최댓값). 이 값을 API 계층으로 옮긴 이유는 API.ts의 recentRescanWindowMs 주석 참고.
+		// 커서가 없는 첫 실행도 같은 폭을 쓴다 — "최근"은 이제 24시간이 아니라 이 값이라는
+		// 개념 정정이다(코드만 반영, UI 문구·사용자 공지는 별도).
+		const recentWindowMs = Math.max(...apis.map((api) => api.recentRescanWindowMs));
 		const cursor = this.sub.updateTime;
 		const hasCursor = typeof cursor === 'number' && Number.isFinite(cursor) && cursor > 0;
-		const from = hasCursor
-			? cursor - CollectAndSave.RESCAN_WINDOW_MS
-			: now - CollectAndSave.FIRST_RUN_HOURS * 60 * 60 * 1000;
-		return { from, to: now, advancesCursor: true };
+		const referencePoint = hasCursor ? cursor : now;
+		return { from: referencePoint - recentWindowMs, to: now, advancesCursor: true };
 	}
 
 	// API를 순차로 돌며 수집한다. 병렬로 부르면 같은 호스트에 동시 요청이 나가 arXiv의
 	// 요청 간격 권고를 깨뜨린다. 수집 자체의 실패([1] 정책)는 그대로 전파한다.
+	//
+	// knownCitations를 수집 전에 한 번 읽어 모든 API 호출에 넘긴다 — 재스캔이 이전에 이미
+	// 보강을 끝낸 논문을 다시 잡아와도 S2 등 외부 API를 다시 두드리지 않게 하려는 목적이다
+	// (API.ts의 knownCitations 계약 참고).
 	private async collect(apis: API[], window: CollectWindow): Promise<Paper[]> {
+		const knownCitations = await File.readKnownCitations();
 		const collected: Paper[] = [];
 		for (const api of apis) {
 			const papers =
 				window.hours === undefined
-					? await api.Backfill(window.from, window.to)
-					: await api.SearchRecentPaper(window.hours);
+					? await api.Backfill(window.from, window.to, knownCitations)
+					: await api.SearchRecentPaper(window.hours, knownCitations);
 			collected.push(...papers);
 		}
 		return collected;
@@ -227,10 +227,10 @@ export class CollectAndSave {
 	// ── 논문 한 편 ─────────────────────────────────────────────────
 
 	// 저장된 논문이 이미 임베딩에 성공했으면 그 벡터를 재사용하고, 아니면 새로 임베딩한다.
-	// 4일 재스캔 창(RESCAN_WINDOW_MS) 때문에 recent 수집은 매번 최근 논문을 다시 훑는데,
-	// 이 확인이 없으면 같은 논문을 실행마다 다시 임베딩하게 된다 — 파이프라인에서 가장
-	// 비싼 단계라 낭비가 크다. File.writePaperAt의 보존 규칙과 별개로(그건 안전망), 여기서
-	// 건너뛰어야 애초에 비용 자체가 안 든다.
+	// 재스캔 창(resolveWindow의 recentRescanWindowMs) 때문에 recent 수집은 매번 최근
+	// 논문을 다시 훑는데, 이 확인이 없으면 같은 논문을 실행마다 다시 임베딩하게 된다 —
+	// 파이프라인에서 가장 비싼 단계라 낭비가 크다. File.writePaperAt의 보존 규칙과
+	// 별개로(그건 안전망), 여기서 건너뛰어야 애초에 비용 자체가 안 든다.
 	private async embedOrReuse(paper: Paper): Promise<void> {
 		const stored = await File.readStoredPaper(paper);
 		if (stored?.embeddingSucceeded) {

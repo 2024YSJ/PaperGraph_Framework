@@ -181,6 +181,20 @@ export class File {
 		return File.readPapersUnder(`${File.PAPER_ROOT}/`);
 	}
 
+	// 이미 인용수를 아는 논문의 sourceId -> citationCount. CollectAndSave.run()이 수집
+	// 직전에 읽어 API에 넘긴다 — 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아와도,
+	// 이미 아는 값이면 S2를 다시 두드리지 않게 하려는 목적이다(collectedApis 기준으로
+	// 거르지 않는다 — 어느 API가 수집했든 sourceId가 같으면 같은 논문이므로 값도 같다).
+	static async readKnownCitations(): Promise<Map<string, number>> {
+		const known = new Map<string, number>();
+		for (const paper of await File.readAllPapers()) {
+			if (paper.citationsKnown) {
+				known.set(paper.sourceId, paper.citationCount);
+			}
+		}
+		return known;
+	}
+
 	// readPapersByYear/readAllPapers의 공통 몸통 — 둘 다 "이 prefix 아래 .json을 전부
 	// Paper로 읽는다"만 다르게 좁힌 것이라 한 곳에만 둔다. vault.getFiles()가 이미 전체
 	// 목록을 주므로 연도를 하나씩 열거할 필요가 없다.

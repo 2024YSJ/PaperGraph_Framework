@@ -42,12 +42,23 @@
 
 ### 커서 정책
 
-- **첫 실행(커서 없음)**: `FIRST_RUN_HOURS`(24시간)로 시작한다. 커서 0에 재스캔 창을
-  그냥 빼면 음수 epoch이 돼 상한(MAX_PAGES=20)에 걸려 "가장 오래된 2000편"을 가져오는
-  엉뚱한 동작이 된다.
-- **재스캔 창**: `recent` 수집은 커서보다 `RESCAN_WINDOW_MS`(4일) 물러난 지점부터
-  다시 훑는다. arXiv는 제출과 색인 사이에 지연이 있어, 커서 시점부터만 훑으면
-  "커서를 지난 뒤에 색인된 논문"을 영영 못 본다. 이 창 자체는 커서에 반영하지 않는다.
+- **재스캔 창은 API가 선언한다**: `API.recentRescanWindowMs`(구현체별 readonly
+  프로퍼티). `recent` 수집은 커서보다 이만큼 물러난 지점부터 다시 훑는다. arXiv는
+  제출과 색인 사이에 지연이 있어, 커서 시점부터만 훑으면 "커서를 지난 뒤에 색인된
+  논문"을 영영 못 본다. 이 창 자체는 커서에 반영하지 않는다. 원래는
+  `CollectAndSave`에 상수로 고정돼 있었는데, "이 API가 얼마나 늦게 색인하는가"는
+  그 API만 아는 사정이라 옮겼다 — `ArxivAPI.ARXIV_RETRY`(재시도 간격)를
+  `ApiSupport`가 아니라 `ArxivAPI`에 둔 것과 같은 원칙("3초는 arXiv의 사정이지
+  HTTP의 사정이 아니다"). 구독에 API가 여럿이면 그중 가장 보수적인(가장 긴) 값을
+  쓴다 — 하나라도 놓치지 않아야 하므로. `ArxivAPI`는 4일로 선언한다(arXiv가 배치로
+  공지해 금요일 마감분이 월요일에야 뜨는 주말 갭 ~3일 + 여유 — 이 저장소에서 실측한
+  값은 아니고 이전 프로젝트의 관행을 이어받았다, 004 문서).
+- **"최근"의 개념이 24시간에서 4일로 바뀌었다(코드만 반영)**: 커서가 없는 첫
+  실행도 이제 같은 `recentRescanWindowMs`를 쓴다. 예전엔 첫 실행만 24시간짜리
+  별도 상수(`FIRST_RUN_HOURS`)를 썼는데, 커서가 생긴 뒤로는 항상 4일 재스캔이 실제
+  동작이었으므로 "최근"이라는 이름과 실제 동작(4일)이 처음부터 어긋나 있었다.
+  개념을 4일로 통일해 일관되게 만들었다. **UI 문구·사용자 공지는 별도** — 회의를
+  통해 알려야 한다는 판단으로 이번 범위에 포함하지 않았다.
 - **커서 갱신 경로 제한**: `advancesCursor` 플래그로 recent 운영 경로만 커서를
   옮긴다. 범위를 직접 준 테스트 경로(`testOptions.hours`)와 `backfill`은 갱신하지
   않는다 — 전자는 운영 커서 오염 방지, 후자는 "과거 구간을 메우는 작업"이라 최신
@@ -55,6 +66,27 @@
 - **truncated 처리**: `lastCoverage.truncated`면 `coveredThrough`를 커서로 쓴다.
   API가 여러 개면 가장 이른 지점(min)으로 보수적으로 맞춘다 — 요청 구간의 끝(`to`)을
   그대로 쓰면 못 본 구간을 봤다고 기록해 영구 누락된다.
+
+### 재스캔이 이미 아는 인용수를 다시 S2에 묻지 않는다
+
+재스캔 창에 다시 걸리는 논문 중 이미 `citationsKnown=true`로 저장된 것들은 S2에
+다시 물어볼 필요가 없는데, 이전엔 `EnrichCitations`가 `collectWindow` 안에서
+반환 직전에 자동으로 돌아 매번 다시 조회했다(freshly 파싱된 `Paper`는 항상
+`citationsKnown=false`로 시작하므로 그 안의 `if (citationsKnown) continue` 필터가
+무력했다).
+
+- **`API.SearchRecentPaper`/`Backfill`에 `knownCitations?: ReadonlyMap<string, number>`
+  선택 인자 추가** — 호출자(`CollectAndSave`)가 이미 아는 `sourceId -> citationCount`를
+  넘기면, 구현체가 `EnrichCitations` 호출 **전에** 그 값으로 먼저 채워 넣는다.
+  기존 필터가 그 논문들을 자연히 건너뛰므로 S2 재조회가 실제로 안 나간다. 인터페이스
+  시그니처만 늘렸을 뿐 "API = Paper를 완성하는 방법"이라는 기존 설계(보강이 API
+  내부에서 자동으로 도는 것)는 그대로 유지된다 — 별도 논의가 필요하다고 남겨뒀던
+  "보강을 API 밖으로 빼는" 재구조화 없이 해결됐다.
+- **`File.readKnownCitations()`** 추가 — `readAllPapers()`를 스캔해
+  `citationsKnown=true`인 논문의 `sourceId -> citationCount` 맵을 만든다.
+  `CollectAndSave.collect()`가 API 호출 전에 한 번 읽어 모든 API 호출에 넘긴다.
+  전량 스캔이라 `repair()`와 같은 비용 특성을 공유한다(코퍼스가 커지면 부담 — 별도
+  최적화는 실사용 규모가 나온 뒤로 미룸).
 
 ### Backfill은 구간 없이 거부한다
 
@@ -141,6 +173,25 @@ UI가 그 필드를 읽어 `Notice.setMessage()`로 `<progress>` 엘리먼트를
 패스가 전체를 훑을 자리)가 필터링 prefix 한 줄만 다르고 나머지 몸통이 완전히
 같았다. `readPapersUnder(prefix)` private 헬퍼로 몸통을 합쳤다(동작 변화 없음).
 
+### API 키 입력을 실제로 연결
+
+설정 탭의 "API 키" 필드는 값을 로컬 상태(`apiKeyDraft`)에만 담고 어디에도 저장하지
+않는 죽은 UI였다. 저장은 이미 `FileTestModal`의 범용 Secret 폼(provider 이름을
+직접 입력)으로 가능했지만, 개발자 테스트 모달이라 사용자가 여기서 등록해도 안
+됐다고 착각하기 쉬운 상태였다.
+
+- `Setting`에 "저장" 버튼을 추가해 `File.readSecret()` → `S2_SECRET_PROVIDER` 항목만
+  갈아끼우고 `File.writeSecret()`으로 저장한다. 현재 저장본을 먼저 읽는 이유는
+  Secret이 provider→key 맵 전체를 한 파일에 담기 때문 — 그대로 새 `Secret()`을 써서
+  저장하면 다른 provider의 키까지 날아간다(구독 UI의 `persistSubscriptions()`가
+  `updateTime`을 보존하려고 먼저 읽는 것과 같은 이유).
+- 설정 탭을 열 때(`loadSubscriptions()`와 같은 시점) 이미 등록된 키가 있으면
+  입력창에 채워서 보여준다 — 안 그러면 등록해놓고도 다시 열 때마다 비어 보여 헷갈린다.
+  평문으로 보여주는 판단은 `FileTestModal`의 "Secret 확인하기"가 이미 쓰던 것과
+  같다(이 vault 밖으로 안 나가는 로컬 값).
+- 저장 실패를 성공으로 잘못 알리지 않도록, `persistApiKey()`는 에러를 삼키지 않고
+  그대로 throw해 호출부(버튼 클릭 핸들러)가 성공/실패 Notice를 정확히 나눠 띄운다.
+
 ### `main.ts` 커맨드는 "아직 구현되지 않음" 상태를 유지한다
 
 커맨드 팔레트의 두 커맨드(`collect-recent`, `collect-repair`)는 `EventListener.checking()`
@@ -151,7 +202,7 @@ UI가 그 필드를 읽어 `Notice.setMessage()`로 `<progress>` 엘리먼트를
 
 ## 검증
 
-`test/collectAndSave.test.ts`에 통합 테스트를 추가해 총 **74건**(원래 36건에서
+`test/collectAndSave.test.ts`에 통합 테스트를 추가해 총 **78건**(원래 36건에서
 시작). 대역은 네트워크(`requestUrl`)와 Vault 둘뿐이고 `File`·`ArxivAPI`·
 `CollectAndSave`는 전부 실제 코드가 돈다 — 커서가 정말 JSON으로 왕복하는지,
 `writePaper`가 기존 파일을 읽어 값을 병합/보존하는지는 각 클래스를 흉내 내면
@@ -159,11 +210,18 @@ UI가 그 필드를 읽어 `Notice.setMessage()`로 `<progress>` 엘리먼트를
 
 주요 검증 영역: 사전 조건(구독 없음/모델 미설치/backfill 구간 누락·NaN이 네트워크
 전에 멈추는지), 중복 제거 확장 지점 계약, 임베딩 계약(순차 호출·서킷브레이커
-초기화·실패해도 저장), 미들웨어 호출 순서·인자·실패 격리, 커서 전진·첫 실행·재스캔
-보정·truncated 처리, 저장본 재사용/보존(B-1/B-2), 재쓰기 스킵, `repair()`의 대상
-선별과 디스크 불변성, 새 설치 환경(`Subscriptions.json` 없음)에서의 안전한 폴백.
+초기화·실패해도 저장), 미들웨어 호출 순서·인자·실패 격리, 커서 전진·첫 실행이
+API 선언 재스캔 창(4일)과 같은 폭인지·재스캔 보정·truncated 처리, 저장된
+인용수는 재스캔에서 S2에 다시 안 묻는지(모르는 것만 정상적으로 묻는지), 저장본
+재사용/보존(B-1/B-2), 재쓰기 스킵, `repair()`의 대상 선별과 디스크 불변성, 새
+설치 환경(`Subscriptions.json` 없음)에서의 안전한 폴백, Secret 저장이 다른
+provider의 키를 보존하는지.
 
-`npm run build`(tsc + esbuild) / `npm test`(74/74) / `npx eslint src test`(0 errors)
+UI 레이어(`SettingTab`)의 버튼 클릭·Notice 문자열 자체는 이 하네스로 검증하지
+않는다(옵시디언 `Setting`/`PluginSettingTab` DOM 스텁 없음 — 기존 판단과 동일).
+대신 그 UI가 의존하는 `File.readSecret`/`writeSecret`의 계약만 고정했다.
+
+`npm run build`(tsc + esbuild) / `npm test`(78/78) / `npx eslint src test`(0 errors)
 통과. Obsidian 앱을 직접 열어 수동 클릭하는 검증은 하지 않았다.
 
 **임시 테스트 인프라 추가분** (004.md의 삭제 목록에 함께 포함될 것):
@@ -200,17 +258,17 @@ UI가 그 필드를 읽어 `Notice.setMessage()`로 `<progress>` 엘리먼트를
      001의 "미들웨어/태스크를 얹어 확장" 방향과는 팬아웃(find가 아니라 filter)이
      더 맞아 보인다. 시각화 phase도 이 결정을 물려받으므로 팀 공유 필요.
   5. 팬아웃이면 반환 타입도 `Promise<unknown>`에서 배열로 바뀌어야 한다.
-- **S2 배치 조회 중복은 여전히 막지 못한다.** `EnrichCitations`는 `collectWindow`
-  안에서 반환 전에 돈다 — API 인스턴스마다 자기 결과를 각자 보강하므로, 그 뒤에
-  붙는 중복 제거 미들웨어로는 이미 나간 요청을 되돌릴 수 없다(임베딩 중복은
-  막았음). 보강을 API 밖으로 빼야 하는데 "API = Paper를 완성하는 방법"이라는 현재
-  설계와 충돌해 별도 논의가 필요하다. `repair()`가 놓친 보강을 주기적으로 메워주므로
-  실질 피해는 중복 요청 비용뿐이다.
+- **S2 배치 조회 중복 — 재스캔(실행 간) 건은 해결, 한 실행 안(구독 간) 건은
+  여전히 못 막는다.** `knownCitations`으로 이전 실행에서 이미 안 값은 다시 안
+  묻게 됐다(위 참고). 다만 **같은 `run()` 호출 안에서** 서로 다른 구독(API
+  인스턴스)이 같은 논문을 각자 잡으면 여전히 중복 조회한다 — `EnrichCitations`가
+  `collectWindow` 안에서 API 인스턴스별로 반환 직전에 자동으로 돌기 때문에, 그
+  뒤에 붙는 중복 제거 미들웨어(배열을 합친 뒤에야 동작)로는 이미 나간 요청을
+  되돌릴 수 없다. 이건 API 밖으로 보강을 빼야 하는 문제라 "API = Paper를 완성하는
+  방법"이라는 현재 설계와 충돌해 별도 논의가 필요하다.
 - **시각화 뷰의 "실제 arXiv 수집으로 실행"은 여전히 `run()`을 우회한다** — 시각화
   담당자 영역이라 손대지 않았다. 교체하려면 `'all'` 미들웨어로 결과를 가로채는
   방식이 자연스럽다.
-- **API 키 입력 UI("임시 UI — 아직 저장되지 않습니다")는 여전히 미연결** — 키
-  등록은 FileTestModal의 Secret 폼으로 가능해 이번 범위에서 뺐다.
 - **구독 UI의 확정 디자인**(라디오 등)은 시각화 클래스 이후 별도 작업 — 현재 배선은
   유지한 채 표현만 갈아끼우면 된다.
 - **커서 중간 저장은 하지 않는다**(설계 판단) — 저장본 재사용으로 재실행 비용이

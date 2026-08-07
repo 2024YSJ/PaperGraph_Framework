@@ -5,6 +5,7 @@ import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
+import { S2_SECRET_PROVIDER } from '../collect/API';
 import type { Middleware } from '../common/Middleware';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
@@ -360,14 +361,28 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName('API 키')
-			.setDesc('Semantic Scholar 등 외부 API 키 (임시 UI — 아직 저장되지 않습니다)')
+			.setDesc(
+				'Semantic Scholar 인용수 조회에 쓰는 키(선택 사항 — 없으면 익명으로 호출되지만 ' +
+					'요청 한도가 낮습니다). 입력 후 저장을 눌러야 반영됩니다.',
+			)
 			.addText((text) =>
 				text
 					.setPlaceholder('API 키 입력')
 					.setValue(this.apiKeyDraft)
 					.onChange((value) => {
 						this.apiKeyDraft = value;
-						// TODO: File/Secret 구현 후 File.writeSecret(...)로 연결
+					}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText('저장')
+					.setCta()
+					.onClick(() => {
+						void this.persistApiKey()
+							.then(() => new Notice('API 키를 저장했습니다.'))
+							.catch((e: unknown) => {
+								new Notice(`API 키 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
+							});
 					}),
 			);
 
@@ -619,8 +634,29 @@ export class SettingTab extends PluginSettingTab {
 			new Notice(`구독 정보를 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
 		}
 		this.apiNameDraft = File.supportedApiNames()[0] ?? '';
+
+		// 이미 등록된 S2 키가 있으면 빈칸 대신 그대로 보여준다 — 안 그러면 등록해놓고도
+		// 설정탭을 다시 열 때마다 "비어 있나?" 헷갈린다(FileTestModal의 "Secret 확인하기"도
+		// 평문으로 보여주는 것과 같은 판단 — 이 vault 밖으로 안 나가는 로컬 값이다).
+		try {
+			const secret = await File.readSecret();
+			this.apiKeyDraft = secret.getKey(S2_SECRET_PROVIDER) ?? '';
+		} catch (e) {
+			new Notice(`API 키를 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
+		}
+
 		this.subscriptionsLoaded = true;
 		this.display();
+	}
+
+	// apiKeyDraft -> Secret.json. Secret은 provider->key 맵 전체를 한 파일에 저장하므로,
+	// 현재 저장본을 읽어 S2_SECRET_PROVIDER 항목만 갈아끼운다 — 그대로 새 Secret()을
+	// 써서 저장하면 다른 provider의 키까지 날아간다. 실패 시 호출부가 처리하도록 그대로
+	// throw한다(성공 Notice를 잘못 띄우지 않기 위해 여기서 삼키지 않는다).
+	private async persistApiKey(): Promise<void> {
+		const secret = await File.readSecret();
+		secret.setKey(S2_SECRET_PROVIDER, this.apiKeyDraft.trim());
+		await File.writeSecret(secret);
 	}
 
 	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다 —

@@ -35,6 +35,14 @@ export interface API {
 	readonly apiName: string;
 	querys: SearchQuery[];
 
+	// "최근" 수집이 색인 지연을 놓치지 않으려면 커서보다 얼마나 뒤로 물러나 다시 훑어야
+	// 하는지 — 이 API가 얼마나 늦게 논문을 색인하는지는 이 API만 아는 사정이라 여기 둔다
+	// (ArxivAPI.ARXIV_RETRY의 재시도 간격을 ApiSupport가 아니라 여기 둔 것과 같은 이유:
+	// "3초는 arXiv의 사정이지 HTTP의 사정이 아니다"). CollectAndSave.run()이 recent 수집
+	// 구간을 계산할 때, 구독된 API들 중 가장 큰 값을 취해 "어느 하나도 못 보고 지나치지
+	// 않도록" 보수적으로 정한다.
+	readonly recentRescanWindowMs: number;
+
 	// 이 API와 통신해 데이터를 가져오는 가장 근본적인 핵심 진입점(엔진). 날짜 조건 없이
 	// 현재 querys만으로 이 API에 실제로 접근하는 최소 단위의 통신을 수행한다.
 	// SearchRecentPaper/Backfill은 별도의 통신 로직을 새로 구현하지 않는다 — 어떤 구간을
@@ -46,8 +54,18 @@ export interface API {
 	// 지정 구간을 빠짐없이 훑는 수집 경로. 내부적으로 SearchBase가 쓰는 것과 같은 통신
 	// 엔진을 날짜 필터/페이지를 바꿔가며 반복 호출한다. SearchBase와 달리 "구간을 어디까지
 	// 실제로 훑었는가"에 책임을 지며, 그 결과를 lastCoverage로 보고한다.
-	SearchRecentPaper(hours: number): Promise<Paper[]>;
-	Backfill(from: number, to: number): Promise<Paper[]>;
+	//
+	// knownCitations: 호출자(CollectAndSave)가 이미 알고 있는 sourceId -> citationCount.
+	// 재스캔 구간이 이전에 이미 보강까지 끝낸 논문을 다시 잡아올 수 있는데, 그 값을 여기로
+	// 넘기면 구현체가 해당 논문의 인용수를 그대로 채우고 보강([3] 정책)을 건너뛴다 — 이미
+	// 아는 값을 얻으려고 외부 API(S2 등)를 다시 두드리지 않는다. 안 넘기면(undefined) 전부
+	// 새로 보강한다.
+	SearchRecentPaper(hours: number, knownCitations?: ReadonlyMap<string, number>): Promise<Paper[]>;
+	Backfill(
+		from: number,
+		to: number,
+		knownCitations?: ReadonlyMap<string, number>,
+	): Promise<Paper[]>;
 
 	// [3] 정책의 재시도 경로. citationsKnown=false인 논문만 골라 보강을 다시 시도하고,
 	// 나머지는 건드리지 않는다. 수집 경로는 내부에서 자동으로 호출하므로 외부에서 부를
@@ -115,6 +133,12 @@ interface S2BatchElement {
 export class ArxivAPI implements API {
 	public readonly apiName = 'arxiv';
 	public querys: SearchQuery[];
+
+	// arXiv는 논문을 실시간이 아니라 배치로 공지한다. 특히 금요일 마감 이후 제출분은
+	// 월요일에야 뜨는 주말 갭이 있어, 최소 그 갭(~3일)을 덮어야 한다. 4일로 여유를 더 뒀다
+	// — 이 저장소에서 실측한 값은 아니고 이전 프로젝트의 관행을 이어받은 것이다
+	// (docs/devLog/004.md). 재현측이 나오면 이 상수만 조정하면 된다.
+	public readonly recentRescanWindowMs = 4 * 24 * 60 * 60 * 1000;
 
 	// ── arXiv 쿼리 문법 ──
 	// SearchQuery.searchType 허용값
@@ -202,14 +226,21 @@ export class ArxivAPI implements API {
 		return page.papers;
 	}
 
-	public SearchRecentPaper(hours: number): Promise<Paper[]> {
+	public SearchRecentPaper(
+		hours: number,
+		knownCitations?: ReadonlyMap<string, number>,
+	): Promise<Paper[]> {
 		const to = Date.now();
 		const from = to - hours * 60 * 60 * 1000;
-		return this.collectWindow(from, to);
+		return this.collectWindow(from, to, knownCitations);
 	}
 
-	public Backfill(from: number, to: number): Promise<Paper[]> {
-		return this.collectWindow(from, to);
+	public Backfill(
+		from: number,
+		to: number,
+		knownCitations?: ReadonlyMap<string, number>,
+	): Promise<Paper[]> {
+		return this.collectWindow(from, to, knownCitations);
 	}
 
 	// ── 수집 흐름 ──────────────────────────────────────────────────
@@ -221,7 +252,11 @@ export class ArxivAPI implements API {
 	// SearchRecentPaper/Backfill의 공통 몸통. 구간을 검증하고, 페이지네이션으로 구간을
 	// 끝까지 훑은 뒤, 반환 전에 S2 인용수 보강까지 마친다 — "API = Paper를 완성하는 방법".
 	// 수집([1])은 실패 시 throw로 전파되지만, 보강([3])은 실패해도 수집 결과를 그대로 반환한다.
-	private async collectWindow(from: number, to: number): Promise<Paper[]> {
+	private async collectWindow(
+		from: number,
+		to: number,
+		knownCitations?: ReadonlyMap<string, number>,
+	): Promise<Paper[]> {
 		this.coverage = undefined;
 
 		// [1] 정책 — 숫자가 아닌 구간은 여기서 끊는다. NaN을 그냥 흘려보내면
@@ -246,6 +281,21 @@ export class ArxivAPI implements API {
 		}
 
 		const papers = await this.collectPaged(ArxivAPI.buildDateFilter(from, to), from, to);
+
+		// 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아올 수 있다. 호출자가 이미
+		// 아는 값을 여기서 먼저 채워두면, 아래 EnrichCitations의 기존 필터
+		// (`if (citationsKnown) continue`)가 이 논문들을 자연히 건너뛴다 — S2를 다시
+		// 두드리지 않는다. 모르는 논문(이번에 새로 걸린 것)만 실제로 보강한다.
+		if (knownCitations) {
+			for (const paper of papers) {
+				const known = knownCitations.get(paper.sourceId);
+				if (known !== undefined) {
+					paper.citationCount = known;
+					paper.citationsKnown = true;
+				}
+			}
+		}
+
 		await runQuietly(() => this.EnrichCitations(papers));
 		return papers;
 	}

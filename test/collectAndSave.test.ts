@@ -9,6 +9,7 @@ import { Embedding } from '../src/collect/Embedding';
 import { File } from '../src/common/File';
 import type { Middleware } from '../src/common/Middleware';
 import { Paper } from '../src/collect/Paper';
+import { S2_SECRET_PROVIDER } from '../src/collect/API';
 import { mockRequests, recordedRequests, response } from './stubs/obsidian';
 import { entries, entry, feed, installDomParser, withFastTimers } from './helpers/arxivFixtures';
 import { VaultStub } from './helpers/vaultStub';
@@ -505,6 +506,33 @@ describe('CollectAndSave.run — 커서', () => {
 		assert.ok(fromYear >= new Date().getFullYear() - 1, `첫 실행이 ${fromYear}년부터 훑는다`);
 	});
 
+	it('첫 실행의 폭은 24시간이 아니라 API가 선언한 재스캔 창(4일)과 같다', async () => {
+		// "최근"의 개념을 24시간에서 4일로 통일했다 — 첫 실행과 재스캔이 같은 폭을 쓴다
+		// (API.recentRescanWindowMs). 다른 값을 억지로 도입하지 않았는지 확인한다.
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([entry()], 1));
+		const { embedding } = fakeEmbedding();
+
+		const before = Date.now();
+		await collectFlow(embedding).run('recent');
+		const after = Date.now();
+
+		const { from, to } = requestedWindow();
+		const widthMs = Date.UTC(
+			Number(to.slice(0, 4)), Number(to.slice(4, 6)) - 1, Number(to.slice(6, 8)),
+			Number(to.slice(8, 10)), Number(to.slice(10, 12)),
+		) - Date.UTC(
+			Number(from.slice(0, 4)), Number(from.slice(4, 6)) - 1, Number(from.slice(6, 8)),
+			Number(from.slice(8, 10)), Number(from.slice(10, 12)),
+		);
+		const fourDaysMs = 4 * 24 * 60 * 60 * 1000;
+		// 쿼리 문자열은 분 단위까지만(YYYYMMDDHHmm) 실려 양쪽 절삭 오차가 최대 ~2분 생긴다.
+		assert.ok(
+			Math.abs(widthMs - fourDaysMs) < 120_000,
+			`첫 실행 폭이 4일이 아니다: ${widthMs}ms (테스트 실행 시간: ${after - before}ms)`,
+		);
+	});
+
 	it('커서가 있으면 그보다 4일 뒤로 물러난 지점부터 훑는다 — 색인 지연 보정', async () => {
 		const cursor = Date.UTC(2025, 5, 20, 12, 0, 0);
 		writeSubscriptionsFile(['graph'], cursor);
@@ -567,6 +595,72 @@ describe('CollectAndSave.run — 커서', () => {
 			`잘렸는데 커서가 구간 끝으로 갔다: ${new Date(updateTime).toISOString()}`,
 		);
 		assert.equal(new Date(updateTime).getUTCFullYear(), 2025);
+	});
+});
+
+// ── 재스캔 시 이미 아는 인용수는 S2에 다시 묻지 않는다 (knownCitations) ─────
+describe('CollectAndSave.run — 저장된 인용수는 S2에 다시 묻지 않는다', () => {
+	it('이미 citationsKnown=true인 논문이 재스캔에 다시 걸리면 S2 요청을 보내지 않는다', async () => {
+		writeSubscriptionsFile(['graph']);
+		// 1차: S2가 인용수 7을 알려주고, citationsKnown=true로 저장된다.
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(
+					200,
+					JSON.stringify([{ citationCount: 7, externalIds: { ArXiv: '2501.00001' } }]),
+				);
+			}
+			return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00001v1' })], 1));
+		});
+		const { embedding } = fakeEmbedding();
+		await collectFlow(embedding).run('recent', { hours: 24 });
+		assert.equal(vault.storedPapers()[0]?.paper.citationCount, 7);
+
+		// 2차: 재스캔이 같은 논문을 다시 잡아온다. S2가 이번엔 호출되면 즉시 실패하도록
+		// 해서, 실제로 호출되는지 여부를 직접 검증한다.
+		let s2Called = false;
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				s2Called = true;
+				return response(200, '[]');
+			}
+			return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00001v1' })], 1));
+		});
+		const { embedding: embedding2 } = fakeEmbedding();
+		await collectFlow(embedding2).run('recent', { hours: 24 });
+
+		assert.equal(s2Called, false, '이미 아는 인용수인데 S2를 다시 불렀다');
+		assert.equal(vault.storedPapers()[0]?.paper.citationCount, 7, '기존 인용수가 유지돼야 한다');
+	});
+
+	it('citationsKnown=false인 논문은 재스캔에서도 정상적으로 S2에 묻는다', async () => {
+		writeSubscriptionsFile(['graph']);
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]'); // S2가 실패/모름 -> citationsKnown=false로 남음
+			}
+			return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00002v1' })], 1));
+		});
+		const { embedding } = fakeEmbedding();
+		await collectFlow(embedding).run('recent', { hours: 24 });
+		assert.equal(vault.storedPapers()[0]?.paper.citationsKnown, false);
+
+		let s2Called = false;
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				s2Called = true;
+				return response(
+					200,
+					JSON.stringify([{ citationCount: 3, externalIds: { ArXiv: '2501.00002' } }]),
+				);
+			}
+			return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00002v1' })], 1));
+		});
+		const { embedding: embedding2 } = fakeEmbedding();
+		await collectFlow(embedding2).run('recent', { hours: 24 });
+
+		assert.equal(s2Called, true, '모르는 인용수인데 S2를 안 불렀다');
+		assert.equal(vault.storedPapers()[0]?.paper.citationCount, 3);
 	});
 });
 
@@ -850,5 +944,24 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 			JSON.stringify({ updateTime: 123, apis: [{ apiName: 'pubmed', querys: [] }] }),
 		);
 		await assert.rejects(() => File.readSubscriptions(), /Unknown apiName: pubmed/);
+	});
+});
+
+// ── Secret 저장 — 설정탭 API 키 필드가 의존하는 계약 ────────────────────
+describe('File.readSecret/writeSecret — provider별 키 보존', () => {
+	it('한 provider의 키를 저장해도 이미 등록된 다른 provider의 키가 사라지지 않는다', async () => {
+		const first = await File.readSecret();
+		first.setKey('otherProvider', 'other-key');
+		await File.writeSecret(first);
+
+		// 설정탭의 persistApiKey()가 하는 것과 같은 패턴: 다시 읽고, 한 provider만
+		// 갈아끼우고, 다시 쓴다.
+		const second = await File.readSecret();
+		second.setKey(S2_SECRET_PROVIDER, 's2-key');
+		await File.writeSecret(second);
+
+		const final = await File.readSecret();
+		assert.equal(final.getKey('otherProvider'), 'other-key', '다른 provider의 키가 사라졌다');
+		assert.equal(final.getKey(S2_SECRET_PROVIDER), 's2-key');
 	});
 });
