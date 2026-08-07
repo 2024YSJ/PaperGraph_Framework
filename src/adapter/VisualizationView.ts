@@ -30,6 +30,8 @@ export class VisualizationView extends ItemView {
 	async onOpen(): Promise<void> {
 		const { contentEl } = this;
 		contentEl.empty();
+		// 뷰를 화면 크기에 꽉 맞추고 스크롤바가 안 생기게 한다(styles.css).
+		contentEl.addClass('papergraph3d-view');
 
 		// 그래프를 그릴 컨테이너 — 뷰를 열 때마다 새로 만들어 등록한다(DOM 수명 = 뷰 수명).
 		const container = contentEl.createDiv({ cls: 'papergraph3d-graph' });
@@ -49,6 +51,7 @@ export class VisualizationView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.contentEl.removeClass('papergraph3d-view');
 		this.contentEl.empty();
 	}
 }

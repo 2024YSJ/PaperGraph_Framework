@@ -100,9 +100,9 @@ export default class PaperGraph3D extends Plugin {
 
 		let leaf = workspace.getLeavesOfType(VIEW_TYPE_PAPERGRAPH3D)[0];
 		if (!leaf) {
-			const rightLeaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
-			await rightLeaf.setViewState({ type: VIEW_TYPE_PAPERGRAPH3D, active: true });
-			leaf = rightLeaf;
+			// 사이드 패널이 아니라 현재(메인) 탭에서 연다.
+			leaf = workspace.getLeaf(false);
+			await leaf.setViewState({ type: VIEW_TYPE_PAPERGRAPH3D, active: true });
 		}
 
 		await workspace.revealLeaf(leaf);
