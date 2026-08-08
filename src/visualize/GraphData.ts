@@ -1,4 +1,10 @@
+import type { ForceGraph3DInstance } from '3d-force-graph';
 import { Paper } from '../collect/Paper';
+
+// render가 3d-force-graph 인스턴스를 만든 뒤 호출하는 후크. 미들웨어가 push해서 링크
+// 화살표/스타일 등 인스턴스 설정을 직접 건다 — 새 설정을 추가할 때 render를 수정하지
+// 않아도 되게 하는 확장 지점. (후크는 3d-force-graph API에 의존한다.)
+export type RenderHook = (forceGraph: ForceGraph3DInstance) => void;
 
 // 그래프 노드 한 개 = 논문 한 편. 좌표는 fx/fy/fz로 고정한다(3d-force-graph의 force
 // 시뮬레이션이 위치를 흔들지 않도록) — x,y는 PCA 투영을 펼친 값, z는 발행 날짜.
@@ -56,4 +62,8 @@ export class GraphData {
 
 	// hover/click 등 이벤트 핸들러. 미들웨어가 push하고 render가 3d-force-graph에 연결한다.
 	events: GraphEvents = { nodeHover: [], nodeClick: [] };
+
+	// render가 3d-force-graph 인스턴스를 만든 뒤 실행할 후크들. 미들웨어가 push해서
+	// 링크 화살표/스타일 등 인스턴스 설정을 render 수정 없이 추가한다.
+	renderHooks: RenderHook[] = [];
 }

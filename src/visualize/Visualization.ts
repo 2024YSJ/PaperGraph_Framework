@@ -87,6 +87,12 @@ export class Visualization {
 			.nodeColor((n) => (n as GraphNode).color ?? NODE_COLOR)
 			.nodeLabel((n) => (n as GraphNode).label ?? '');
 
+		// 미들웨어가 등록한 렌더 후크 실행 — 링크 화살표/스타일 등 인스턴스 설정을
+		// 여기서 적용한다(새 설정을 추가해도 render는 안 고쳐도 된다).
+		for (const hook of graph.renderHooks) {
+			hook(forceGraph);
+		}
+
 		// 그래프 크기를 컨테이너 실제 크기에 맞추고, 리프 크기가 바뀌면 따라간다
 		// (3d-force-graph는 창 리사이즈만 감지하므로, 리프/패널 리사이즈까지 잡으려면
 		// 직접 지정한다). 스크롤바가 생기지 않도록 하는 핵심.

@@ -4,7 +4,11 @@ import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
 import { PCA } from './visualize/PCA';
 import { Visualization } from './visualize/Visualization';
-import { CitationColorMiddleware, OpenNoteOnClickMiddleware } from './visualize/CitationColorMiddleware';
+import {
+	CitationColorMiddleware,
+	CitationEdgeMiddleware,
+	OpenNoteOnClickMiddleware,
+} from './visualize/VisualMiddlewares';
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
@@ -81,6 +85,8 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.setMiddleware(new CitationColorMiddleware());
 		// 노드 클릭 시 해당 논문 .md 노트를 여는 시각화 미들웨어 등록.
 		this.visualflow.setMiddleware(new OpenNoteOnClickMiddleware(this.app));
+		// 논문 간 인용 관계를 엣지로 그리는 시각화 미들웨어 등록.
+		this.visualflow.setMiddleware(new CitationEdgeMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		this.eventListener = new EventListener();
