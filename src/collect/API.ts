@@ -162,6 +162,17 @@ interface ArxivPage {
 interface S2BatchElement {
 	citationCount?: number;
 	externalIds?: { ArXiv?: string } | null;
+	// 이 논문이 인용하는 논문들. externalIds만 요청하므로(제목 등은 안 받음) 각 항목에서
+	// ArXiv id 유무만 본다 — arXiv에 없는 참고문헌은 이 코퍼스의 노드가 될 수 없어서
+	// 어차피 그래프에서 매칭되지 않는다.
+	references?: ({ externalIds?: { ArXiv?: string } | null } | null)[] | null;
+}
+
+// S2 배치 조회가 논문 하나에 대해 알려주는 것. fetchCitationBatch의 반환 값 단위.
+interface S2PaperInfo {
+	citationCount: number;
+	// 인용하는 논문들의 sourceId ("arxiv:2501.12345" 형태, 버전 제거·중복 제거 완료).
+	references: string[];
 }
 
 // 예시용 구현체 — arXiv API. apiName은 'arxiv' 고정(Subscriptions 복원 시 판별 키).
@@ -235,10 +246,17 @@ export class ArxivAPI implements API {
 	// 빈 인용수를 메우는 부품이므로, 별도 API 구현체가 아니라 이 클래스의 private으로 둔다.
 	// (S2 자체를 수집원으로 쓸 일이 생기면 그때 별도의 implements API 클래스를 만든다.)
 	private static readonly S2_BATCH_ENDPOINT = 'https://api.semanticscholar.org/graph/v1/paper/batch';
-	private static readonly S2_BATCH_CHUNK_SIZE = 500; // S2 배치 엔드포인트의 요청당 최대 id 수
+	// S2 배치 엔드포인트 자체는 요청당 최대 500개 id를 받지만, references까지 실으면서
+	// 100으로 낮췄다 — 논문당 참고문헌이 보통 수십 개라 응답이 수십 배 커지는데, 응답이
+	// 클수록 타임아웃/스로틀 확률이 올라간다(arXiv PAGE_SIZE를 2000이 아니라 100으로
+	// 잡은 것과 같은 판단).
+	private static readonly S2_BATCH_CHUNK_SIZE = 100;
 	// externalIds를 함께 받는 이유는 fetchCitationBatch의 정렬 검증 때문이다.
 	// 이게 없으면 응답이 자기 arXiv id를 안 알려줘서 검증 자체가 불가능하다.
-	private static readonly S2_BATCH_FIELDS = 'externalIds,citationCount';
+	// references.externalIds는 인용 그래프 엣지용 — 시각화(CitationEdgeMiddleware)가
+	// paper.references에서 엣지를 그리는데, arXiv 응답에는 참고문헌이 아예 없어서
+	// 이 요청이 references가 채워지는 유일한 경로다.
+	private static readonly S2_BATCH_FIELDS = 'externalIds,citationCount,references.externalIds';
 	private static readonly S2_RETRY: RetryPolicy = { retryDelayMs: 3_000, timeoutMs: 60_000 };
 	// 배치 청크 사이 간격. S2 익명 호출은 공용 rate limit(대략 초당 1회)을 다른 모든 익명
 	// 사용자와 나눠 쓴다. 키가 있으면 더 여유롭지만, 키 유무로 값을 나누면 "키를 넣었더니
@@ -848,10 +866,14 @@ export class ArxivAPI implements API {
 			return;
 		}
 
-		const citations = await this.fetchCitationBatch(Array.from(idToPapers.keys()));
-		for (const [localId, count] of citations) {
+		const infos = await this.fetchCitationBatch(Array.from(idToPapers.keys()));
+		for (const [localId, info] of infos) {
 			for (const paper of idToPapers.get(localId) ?? []) {
-				paper.citationCount = count;
+				paper.citationCount = info.citationCount;
+				// 참고문헌도 같은 응답에 실려 오므로 citationsKnown이 두 값의 "보강 완료"
+				// 플래그를 겸한다 — 이 플래그가 서면 재스캔이 S2를 다시 두드리지 않고,
+				// prefillFromStore가 저장본의 references를 함께 복원한다.
+				paper.references = info.references;
 				paper.citationsKnown = true;
 			}
 		}
@@ -870,8 +892,8 @@ export class ArxivAPI implements API {
 	// secret에 S2 키가 등록돼 있으면 x-api-key 헤더로 실어 보낸다 — 익명 호출은 S2의 공용
 	// rate limit을 다른 모든 익명 사용자와 나눠 쓰므로 429가 잦다. 키가 없으면 지금까지처럼
 	// 익명으로 호출한다(throw하지 않음 — 키는 선택 사항).
-	private async fetchCitationBatch(arxivIds: string[]): Promise<Map<string, number>> {
-		const result = new Map<string, number>();
+	private async fetchCitationBatch(arxivIds: string[]): Promise<Map<string, S2PaperInfo>> {
+		const result = new Map<string, S2PaperInfo>();
 		const apiKey = this.secret?.getKey(S2_SECRET_PROVIDER);
 		const chunks = chunk(arxivIds, ArxivAPI.S2_BATCH_CHUNK_SIZE);
 
@@ -907,7 +929,10 @@ export class ArxivAPI implements API {
 					if (typeof echoed === 'string' && ArxivAPI.stripVersion(echoed) !== id) {
 						continue;
 					}
-					result.set(id, element.citationCount);
+					result.set(id, {
+						citationCount: element.citationCount,
+						references: ArxivAPI.extractArxivReferences(element),
+					});
 				}
 			});
 		}
@@ -919,5 +944,22 @@ export class ArxivAPI implements API {
 	private static toLocalId(sourceId: string): string | null {
 		const [provider, localId] = sourceId.split(':');
 		return provider === 'arxiv' && localId ? localId : null;
+	}
+
+	// S2 응답의 참고문헌 목록에서 arXiv에 있는 것만 sourceId 형태로 골라낸다.
+	//
+	// arXiv id가 없는 참고문헌(저널 논문, 단행본 등)은 버린다 — 이 코퍼스는 arXiv
+	// 논문만 수집하므로 그런 참고문헌은 그래프의 어떤 노드와도 매칭될 수 없고, 저장해봐야
+	// 파일 크기만 늘린다. 버전 접미사(v1 등)는 sourceId 규칙에 맞춰 떼고, 같은 논문을
+	// 두 번 인용한 것처럼 보이는 항목(버전만 다른 중복 등)은 하나로 합친다.
+	private static extractArxivReferences(element: S2BatchElement): string[] {
+		const ids = new Set<string>();
+		for (const reference of element.references ?? []) {
+			const arxivId = reference?.externalIds?.ArXiv;
+			if (typeof arxivId === 'string' && arxivId.length > 0) {
+				ids.add(`arxiv:${ArxivAPI.stripVersion(arxivId)}`);
+			}
+		}
+		return Array.from(ids);
 	}
 }

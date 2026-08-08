@@ -468,6 +468,59 @@ arXiv를 두드리게 된다. "구독 추가 = 자동 수집"은 구독을 한 �
 저장 지점에서 다시 부르면 된다. 지금은 「최근 논문」/「Backfill」 버튼을 명시적으로
 눌러야만 수집이 시작된다.
 
+### 10. 진행률 총계를 arXiv의 진짜 결과 수로 (사용자 리포트)
+
+진행률 Notice의 총 편수가 100 → 200 → 300으로 계속 바뀐다는 제보. 4번(청크
+스트리밍)의 부작용이었다. `'all'` 미들웨어가 이제 페이지마다 불리는데, 진행률의
+분모(`flow.total`)를 그 미들웨어에서 **청크 크기를 계속 더해** 채우고 있었다 —
+"총계"가 아니라 "지금까지 받은 양"을 총계인 척 보여준 셈이다.
+
+`CollectOptions.onTotal` 콜백을 추가해, arXiv **첫 페이지 응답의 `totalResults`**
+(진짜 결과 수)를 그 자리에서 바로 보고한다. `ArxivAPI.collectPaged` →
+`collectRounds` → `collectWindow` → `CollectAndSave.run()/collect()` →
+`SettingTab.runWithProgress`로 흘려보낸다.
+
+핵심은 **첫 라운드 값만 보고한다**는 것이다(`collectRounds`가 `round === 0`일
+때만 전달). 2라운드부터는 `dateFilter`가 좁아진 "남은 구간"의 건수라 원래 요청한
+전체 구간의 총계가 아니다 — 이걸 안 걸렀으면 상한을 넘긴 Backfill에서 총계가
+라운드마다 또 바뀌는 같은 버그가 재발했을 것이다. `'all'` 미들웨어는 이제
+`flow.collected`(완료 편수)만 갱신하고 분모는 건드리지 않는다.
+
+### 11. `references`가 아무도 채우지 않아 항상 비어 있었다 (사용자 리포트)
+
+"reference 값이 제대로 안 들어간다"는 제보로 추적해보니 **버그가 아니라 채우는
+코드가 아예 없었다**. `ArxivAPI.parseEntry`가 `paper.references = []`로 고정하는데,
+이건 잘못이 아니라 **arXiv Atom API가 참고문헌 목록을 제공하지 않기** 때문이다.
+인용 관련 데이터를 주는 유일한 소스인 S2 배치 조회는
+`S2_BATCH_FIELDS = 'externalIds,citationCount'`로 **인용수(숫자)만** 요청하고 있었다.
+즉 수집→보강→저장 어디에서도 채워질 수 없어, 저장된 모든 논문이 `references: []`인
+게 당시 코드의 "정상" 동작이었다(002 devLog의 스키마 확정 때도 값 없이 필드만 유지).
+
+곧 문제가 되는 이유: 008 브랜치의 `CitationEdgeMiddleware`가 `paper.references`를
+읽어 인용 엣지를 그린다. 그대로 머지하면 엣지가 항상 0개 — 시각화의 핵심 기능이
+데이터 부재로 조용히 죽는다.
+
+- `S2_BATCH_FIELDS`에 `references.externalIds`를 추가해 **이미 보내던 인용수
+  요청에 얹어서** 함께 받는다(추가 요청 없음).
+- `ArxivAPI.extractArxivReferences`가 참고문헌 중 **arXiv id가 있는 것만** 골라
+  `arxiv:XXXX.XXXXX` 형태(008 미들웨어가 기대하는 sourceId 형식)로 저장한다. 이
+  코퍼스는 arXiv 논문만 수집하므로 저널·단행본 참고문헌은 어떤 노드와도 매칭될 수
+  없어 저장해봐야 파일 크기만 늘린다. 버전 접미사는 떼고 중복은 합친다.
+- `fetchCitationBatch`의 반환 타입을 `Map<string, number>`에서
+  `Map<string, S2PaperInfo>`(인용수 + 참고문헌)로 넓혔다.
+- **`S2_BATCH_CHUNK_SIZE`를 500 → 100으로 낮췄다.** 논문당 참고문헌이 보통 수십
+  개라 응답이 수십 배 커지는데, 응답이 클수록 타임아웃/스로틀 확률이 올라간다
+  (arXiv `PAGE_SIZE`를 2000이 아니라 100으로 잡은 것과 같은 판단).
+- `CollectAndSave.prefillFromStore`가 `citationsKnown`일 때 인용수와 함께
+  **references도 복원**한다. `citationsKnown` 하나가 두 값의 "보강 완료" 플래그를
+  겸하므로, 이걸 빼먹으면 보강이 건너뛰어진 재스캔 논문의 빈 `references`(arXiv
+  파싱 기본값)가 저장본을 덮어 엣지가 조용히 사라진다 — 회귀 테스트로 고정했다.
+
+`repair()`도 같은 `EnrichCitations`를 거치므로, `citationsKnown=false`로 남아
+있던 논문은 보정이 인용수와 references를 한 번에 채운다. 다만 **이 변경 이전에
+`citationsKnown=true`로 저장된 논문**은 보정 대상이 아니라 references가 빈 채로
+남는다 — 그 논문들까지 채우려면 별도의 일회성 재보강 경로가 필요하다(미해결).
+
 ### 검증
 
 `npm run build` / `npm test`(78 → **104/104**) / `npm run lint`(0 errors) 통과.

@@ -589,6 +589,10 @@ export class CollectAndSave {
 			}
 			if (stored.citationsKnown) {
 				paper.citationCount = stored.citationCount;
+				// references는 인용수와 같은 S2 응답에서 함께 채워진다(EnrichCitations).
+				// citationsKnown만 복사하고 이걸 빼먹으면, 보강이 건너뛰어진 재스캔 논문의
+				// 빈 references([] — arXiv 파싱 기본값)가 저장본의 참고문헌을 덮어쓴다.
+				paper.references = stored.references ?? [];
 				paper.citationsKnown = true;
 			}
 			if (stored.embeddingSucceeded) {

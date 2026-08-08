@@ -788,6 +788,100 @@ describe('[3] 정책 — S2 인용수 보강은 실패해도 수집을 깨지 �
 		await new ArxivAPI([KEYWORD]).SearchBase();
 		assert.equal(s2Requests()[0]?.headers, undefined);
 	});
+
+	// arXiv Atom 응답에는 참고문헌이 아예 없다. 이 S2 배치 조회가 paper.references가
+	// 채워지는 유일한 경로다 — 시각화(008의 CitationEdgeMiddleware)가 이 값으로 인용
+	// 엣지를 그리므로, 비어 있으면 그래프에 엣지가 하나도 안 그려진다.
+	describe('references — 인용 그래프 엣지의 유일한 공급원', () => {
+		it('references.externalIds 필드를 함께 요청한다', async () => {
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					return response(200, '[]');
+				}
+				return response(200, okFeed);
+			});
+
+			await new ArxivAPI([KEYWORD]).SearchBase();
+			const url = s2Requests()[0]?.url ?? '';
+			assert.ok(
+				decodeURIComponent(url).includes('references.externalIds'),
+				`references를 요청하지 않았다: ${url}`,
+			);
+		});
+
+		it('arXiv id가 있는 참고문헌만 sourceId 형태로 채운다', async () => {
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					return response(
+						200,
+						JSON.stringify([
+							{
+								externalIds: { ArXiv: '2501.00001' },
+								citationCount: 42,
+								references: [
+									{ externalIds: { ArXiv: '1706.03762v5' } }, // 버전 접미사는 떼야 한다
+									{ externalIds: { DOI: '10.1000/journal' } }, // arXiv 아님 → 버린다
+									{ externalIds: { ArXiv: '2010.11929' } },
+									null, // S2가 가끔 null을 섞어 보낸다
+									{ externalIds: null },
+								],
+							},
+							{ externalIds: { ArXiv: '2501.00002' }, citationCount: 7, references: [] },
+						]),
+					);
+				}
+				return response(200, okFeed);
+			});
+
+			const papers = await new ArxivAPI([KEYWORD]).SearchBase();
+			// arXiv에 없는 참고문헌은 이 코퍼스의 노드가 될 수 없어 저장하지 않는다.
+			assert.deepEqual(papers[0]?.references, ['arxiv:1706.03762', 'arxiv:2010.11929']);
+			assert.deepEqual(papers[1]?.references, []);
+		});
+
+		it('같은 논문을 버전만 다르게 여러 번 인용해도 하나로 합친다', async () => {
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					return response(
+						200,
+						JSON.stringify([
+							{
+								externalIds: { ArXiv: '2501.00001' },
+								citationCount: 1,
+								references: [
+									{ externalIds: { ArXiv: '1706.03762v1' } },
+									{ externalIds: { ArXiv: '1706.03762v5' } },
+									{ externalIds: { ArXiv: '1706.03762' } },
+								],
+							},
+						]),
+					);
+				}
+				return response(200, okFeed);
+			});
+
+			const papers = await new ArxivAPI([KEYWORD]).SearchBase();
+			assert.deepEqual(papers[0]?.references, ['arxiv:1706.03762']);
+		});
+
+		it('S2가 references를 안 주면 빈 배열로 남긴다 — 인용수는 정상 반영', async () => {
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					// references 필드 자체가 없는 응답(구버전 API/부분 응답 등)
+					return response(
+						200,
+						JSON.stringify([{ externalIds: { ArXiv: '2501.00001' }, citationCount: 3 }]),
+					);
+				}
+				return response(200, okFeed);
+			});
+
+			const papers = await new ArxivAPI([KEYWORD]).SearchBase();
+			assert.deepEqual(papers[0]?.references, []);
+			assert.equal(papers[0]?.citationCount, 3);
+			assert.equal(papers[0]?.citationsKnown, true);
+		});
+	});
 });
 
 // ── 응답 없는 요청 ────────────────────────────────────────────────────

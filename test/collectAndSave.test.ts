@@ -775,6 +775,42 @@ describe('CollectAndSave.run — 저장된 인용수는 S2에 다시 묻지 않�
 		assert.equal(vault.storedPapers()[0]?.paper.citationCount, 7, '기존 인용수가 유지돼야 한다');
 	});
 
+	it('재스캔에서 보강을 건너뛴 논문의 references가 빈 배열로 덮이지 않는다', async () => {
+		// references는 인용수와 같은 S2 응답으로 채워지므로 citationsKnown 하나가 둘 다의
+		// "보강 완료" 플래그다. 재스캔은 그 플래그를 보고 S2를 건너뛰는데, prefill이
+		// 인용수만 복원하고 references를 빼먹으면 arXiv 파싱 기본값인 빈 배열이 그대로
+		// 저장돼 인용 그래프의 엣지가 조용히 사라진다.
+		writeSubscriptionsFile(['graph']);
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(
+					200,
+					JSON.stringify([
+						{
+							citationCount: 7,
+							externalIds: { ArXiv: '2501.00001' },
+							references: [{ externalIds: { ArXiv: '1706.03762' } }],
+						},
+					]),
+				);
+			}
+			return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00001v1' })], 1));
+		});
+		const { embedding } = fakeEmbedding();
+		await collectFlow(embedding).run('recent', { hours: 24 });
+		assert.deepEqual(vault.storedPapers()[0]?.paper.references, ['arxiv:1706.03762']);
+
+		// 2차 재스캔 — S2는 호출되지 않고, 저장본의 references가 그대로 남아야 한다.
+		const { embedding: embedding2 } = fakeEmbedding();
+		await collectFlow(embedding2).run('recent', { hours: 24 });
+
+		assert.deepEqual(
+			vault.storedPapers()[0]?.paper.references,
+			['arxiv:1706.03762'],
+			'재스캔이 저장된 references를 빈 배열로 덮었다',
+		);
+	});
+
 	it('citationsKnown=false인 논문은 재스캔에서도 정상적으로 S2에 묻는다', async () => {
 		writeSubscriptionsFile(['graph']);
 		mockRequests((param) => {
@@ -1046,6 +1082,45 @@ describe('CollectAndSave.repair — 보정 패스', () => {
 		const enriched = vault.storedPapers().find((s) => s.paper.title === '인용수 없는 논문');
 		assert.equal(enriched?.paper.citationsKnown, true);
 		assert.equal(enriched?.paper.citationCount, 42);
+	});
+
+	it('보정이 references도 함께 채운다 — references가 빈 옛 논문의 복구 경로', async () => {
+		// references를 채우기 전에 수집된 논문은 citationsKnown=true인데 references는
+		// 빈 배열이다. 그 논문들은 이 조건으로는 보정 대상이 아니지만(citationsKnown이
+		// 이미 true), citationsKnown=false로 남아 있던 논문은 보정이 인용수와 references를
+		// 한 번에 채워준다 — 같은 S2 응답에서 오기 때문이다.
+		await File.writePaper(
+			buildStoredPaper({
+				sourceId: 'arxiv:2501.00003',
+				title: '보강 안 된 논문',
+				citationsKnown: false,
+				citationCount: 0,
+				references: [],
+			}),
+		);
+		mockRequests((param) => {
+			if (!param.url.includes('semanticscholar')) {
+				throw new Error(`repair가 예상 밖 요청을 보냈다: ${param.url}`);
+			}
+			const ids = (JSON.parse(param.body ?? '{}') as { ids: string[] }).ids;
+			return response(
+				200,
+				JSON.stringify(
+					ids.map((id) => ({
+						citationCount: 11,
+						externalIds: { ArXiv: id.replace(/^ARXIV:/, '') },
+						references: [{ externalIds: { ArXiv: '1706.03762' } }],
+					})),
+				),
+			);
+		});
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).repair();
+
+		const enriched = vault.storedPapers().find((s) => s.paper.title === '보강 안 된 논문');
+		assert.equal(enriched?.paper.citationCount, 11);
+		assert.deepEqual(enriched?.paper.references, ['arxiv:1706.03762']);
 	});
 
 	it('둘 다 멀쩡한 논문은 재시도도 재저장도 하지 않는다', async () => {
