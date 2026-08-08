@@ -228,29 +228,6 @@ export class SettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
-	// 구독을 저장하고, 바뀐 조건으로 최근 논문을 한 번 훑도록 예약한다.
-	//
-	// 예약이지 즉시 실행이 아니다 — 자동 수집이 돌고 있으면 큐에 들어가 끝난 뒤에 실행된다.
-	// 조건을 연달아 다듬어도 CollectAndSave.requestRecent가 아직 시작 안 한 recent끼리
-	// 합쳐주므로 편집할 때마다 arXiv를 두드리지 않는다.
-	private async saveSubscriptionsAndCollect(): Promise<void> {
-		await this.persistSubscriptions();
-		if (this.subscriptionsUnreadable) {
-			return; // 저장 자체를 건너뛴 상태라 수집할 것도 없다
-		}
-		// 이미 예약된 recent가 있으면 requestRecent가 거기 합쳐준다. 그 경우 새 진행률
-		// Notice를 또 띄우면 한 번의 수집에 여러 개가 쌓이므로, 예약만 갱신하고 조용히 끝낸다.
-		if (this.plugin.collectflow.hasPendingRecent) {
-			void this.plugin.collectflow.requestRecent('구독 변경 반영');
-			return;
-		}
-		void runCollectFlow('구독 변경 반영', this.plugin.collectflow.isBusy, () =>
-			this.runWithProgress('구독 변경 반영', (onStart) =>
-				this.plugin.collectflow.requestRecent('구독 변경 반영', onStart),
-			),
-		);
-	}
-
 	// 큐 상태 구독은 플러그인 수명 동안 한 번만 — display()마다 붙이면 리스너가 쌓인다.
 	// 리스너는 queueStatusEl이 있을 때만 그리므로, 설정 탭이 닫혀 있어도 안전하다.
 	private ensureQueueSubscription(): void {
@@ -945,7 +922,7 @@ export class SettingTab extends PluginSettingTab {
 						query: api.newConditionQuery.trim(),
 					});
 					api.newConditionQuery = '';
-					void this.saveSubscriptionsAndCollect();
+					void this.persistSubscriptions();
 					this.display();
 				}),
 			);

@@ -446,6 +446,28 @@ Backfill 상한이 사실상 없어지면서 "전량을 다 받은 뒤에 임베
   페이지네이션 내부 간격은 각 API 구현체가 스스로 챙기지만, 구독과 구독의 경계는
   `CollectAndSave`만 안다.
 
+### 9. 구독 추가 시 자동 수집 — 넣었다가 되돌림
+
+같은 날 작업 중, 5번(구독별 커서)의 연장으로 "구독을 추가하면 그 구독의 논문을
+자동으로 한 번 훑는다"(`SettingTab.saveSubscriptionsAndCollect` → `requestRecent`)
+배선을 「조건 추가」 버튼에 붙였었다. 최종 목표(구독 추가 = recent 1회 자동 실행)
+자체는 맞는 방향이라고 확인했지만, **되돌렸다**.
+
+이유: 지금 구독 UI는 조건을 **한 번에 하나씩만** 추가할 수 있는 임시 형태다
+(`api.newConditionQuery` 입력창 하나 + 추가 버튼, 최대 3개까지 반복 클릭). 완전한
+구독(조건 최대 3개 AND)을 만들려면 버튼을 여러 번 눌러야 하는데, 자동 트리거가
+붙어 있으면 **첫 번째 조건 하나만 넣은, 아직 완성되지 않은 구독**으로 곧바로
+arXiv를 두드리게 된다. "구독 추가 = 자동 수집"은 구독을 한 번에 완전하게 만드는
+최종 UI가 전제일 때만 맞는 설계이지, 지금의 단계적 입력 UI와는 안 맞는다.
+
+`SettingTab.saveSubscriptionsAndCollect()`를 삭제하고 「조건 추가」도 다른 세
+지점(API 추가/조건 삭제/API 삭제)과 같은 `persistSubscriptions()`(저장만)로
+되돌렸다. `CollectAndSave.requestRecent()`/`hasPendingRecent`(합침·큐 로직)는
+그대로 남겨둔다 — SettingTab이 안 부를 뿐 도메인 API로는 유효하고
+`test/collectAndSave.test.ts`가 직접 검증하고 있으므로, 최종 UI가 나오면 그
+저장 지점에서 다시 부르면 된다. 지금은 「최근 논문」/「Backfill」 버튼을 명시적으로
+눌러야만 수집이 시작된다.
+
 ### 검증
 
 `npm run build` / `npm test`(78 → **104/104**) / `npm run lint`(0 errors) 통과.

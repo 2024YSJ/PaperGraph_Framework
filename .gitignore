@@ -35,6 +35,9 @@ data.json
 /Secret.json
 /PaperGraph3D/
 /embedding_test/
+# Log.ts(임시 진단 로거, 삭제 예정)가 vault 플러그인 폴더에 남기는 파일. 위와 같은 이유로
+# 실제로 한 번 커밋됐다.
+/collect-log.md
 
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
