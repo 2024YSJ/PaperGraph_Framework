@@ -153,13 +153,33 @@ export class File {
 		});
 	}
 
-	// 여러 구독의 수집 커서를 한 번에 갈아 끼운다.
+	// Subscriptions.json에 대한 읽기-수정-쓰기를 한 번에 하나씩만 실행한다.
 	//
-	// 수집은 오래 걸리고 그동안 사용자는 구독을 편집할 수 있다. 수집 시작 시점에 읽어둔
-	// Subscriptions 객체를 끝에 통째로 저장하면, 그 사이에 추가된 구독이 낡은 목록으로
-	// 덮여 사라진다. 그래서 저장 직전에 다시 읽어 해당 구독의 updateTime만 바꾼다 —
-	// SettingTab의 persistSubscriptions가 반대 방향(apis만 갈아끼움)으로 같은 규칙을
-	// 지키는 것과 짝이다.
+	// updateApiCursors(수집 종료)와 SettingTab.persistSubscriptions(UI 저장)가 둘 다
+	// "읽고 -> 고치고 -> 쓴다" 패턴이다. 각자는 자기가 건드리는 필드만 바꾸고 나머지는
+	// 그대로 돌려주므로 서로의 변경을 덮지 않을 것 같지만, 두 호출이 정확히 겹치면
+	// (둘 다 읽고 → 둘 다 쓰면) 나중에 쓴 쪽이 앞선 변경을 통째로 지운다 — lost-update
+	// 창을 줄였을 뿐 원자성은 아니었다. 이 큐로 두 경로를 하나의 타임라인에 줄 세운다.
+	private static subscriptionsQueue: Promise<void> = Promise.resolve();
+
+	static mutateSubscriptions(
+		mutator: (subscriptions: Subscriptions) => void | Promise<void>,
+	): Promise<void> {
+		const result = File.subscriptionsQueue.then(async () => {
+			const subscriptions = await File.readSubscriptions();
+			await mutator(subscriptions);
+			await File.writeSubscriptions(subscriptions);
+		});
+		// 이번 변경이 실패해도 큐는 다음 변경으로 계속 넘어간다 — 한쪽의 실패가 이후
+		// 모든 구독 저장을 영원히 막으면 안 된다.
+		File.subscriptionsQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+
+	// 여러 구독의 수집 커서를 한 번에 갈아 끼운다.
 	//
 	// apiName만으로는 어느 구독인지 특정할 수 없다 — 같은 apiName을 조건만 다르게
 	// 여러 번 등록할 수 있어서(설정탭 "API 추가"), querys까지 같이 봐야 한다. 수집이
@@ -171,17 +191,17 @@ export class File {
 		if (updates.length === 0) {
 			return;
 		}
-		const subscriptions = await File.readSubscriptions();
-		for (const api of subscriptions.apis) {
-			const match = updates.find(
-				(update) =>
-					update.apiName === api.apiName && File.searchQueriesEqual(update.querys, api.querys),
-			);
-			if (match) {
-				api.updateTime = match.cursor;
+		await File.mutateSubscriptions((subscriptions) => {
+			for (const api of subscriptions.apis) {
+				const match = updates.find(
+					(update) =>
+						update.apiName === api.apiName && File.searchQueriesEqual(update.querys, api.querys),
+				);
+				if (match) {
+					api.updateTime = match.cursor;
+				}
 			}
-		}
-		await File.writeSubscriptions(subscriptions);
+		});
 	}
 
 	// API 구현체 등록부 — 이 코드베이스가 지원하는 API 목록의 유일한 진실.

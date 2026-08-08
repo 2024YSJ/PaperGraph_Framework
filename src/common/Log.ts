@@ -115,6 +115,19 @@ export class Log {
 		});
 	}
 
+	// ⚠️ 임시(삭제 예정) — 파일 기록 전용. 플러그인이 언로드될 때 부른다(main.ts onunload).
+	// 대기 중인 flush 타이머를 치우고 남은 버퍼를 최선을 다해(best-effort) 내보낸다 —
+	// 완료를 기다리지 않는다. unload는 짧게 끝나야 하고, 이 시점에 vault I/O가 얼마나
+	// 걸릴지 보장할 수 없기 때문이다. 마지막 몇 줄이 유실될 수 있지만, 그건 임시 진단
+	// 로거가 감수할 수 있는 손실이다.
+	static dispose(): void {
+		if (Log.flushTimer !== undefined) {
+			clearTimeout(Log.flushTimer);
+			Log.flushTimer = undefined;
+		}
+		void Log.flush();
+	}
+
 	// ⚠️ 임시(삭제 예정) — 파일 기록 전용. 로그 파일을 지운다. 없으면 아무 일도 안 한다.
 	static async clear(): Promise<void> {
 		const vault = Log.vault;

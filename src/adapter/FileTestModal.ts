@@ -184,21 +184,23 @@ export class FileTestModal extends Modal {
 							searchType: this.subSearchType.trim(),
 							query: this.subQuery.trim(),
 						};
-						const subscriptions = await File.readSubscriptions(); // 기존 구독에 누적
-						if (!Array.isArray(subscriptions.apis)) {
-							subscriptions.apis = [];
-						}
-						const firstApi = subscriptions.apis[0];
-						if (firstApi) {
-							firstApi.querys.push(query);
-						} else {
-							// 테스트는 arxiv API로 고정. createApi로 만들어야 저장→복원 왕복이 된다.
-							subscriptions.apis.push(File.createApi('arxiv', [query]));
-						}
-						// 커서(updateTime)는 이제 구독마다 독립이라(API.updateTime) 여기서 만질
-						// 값이 없다 — 새로 만든 구독은 기본값 0(아직 수집한 적 없음)으로 시작한다.
-						// secret은 File.writeSubscriptions가 저장에서 제외하므로 여기서 설정하지 않는다.
-						await File.writeSubscriptions(subscriptions);
+						// File.mutateSubscriptions로 큐에 태운다 — 수집 종료(File.updateApiCursors)와
+						// 동시에 저장해도 서로의 변경을 덮지 않는다.
+						await File.mutateSubscriptions((subscriptions) => {
+							if (!Array.isArray(subscriptions.apis)) {
+								subscriptions.apis = [];
+							}
+							const firstApi = subscriptions.apis[0];
+							if (firstApi) {
+								firstApi.querys.push(query);
+							} else {
+								// 테스트는 arxiv API로 고정. createApi로 만들어야 저장→복원 왕복이 된다.
+								// 커서(updateTime)는 구독마다 독립이라(API.updateTime) 여기서 만질 값이
+								// 없다 — 새로 만든 구독은 기본값 0(아직 수집한 적 없음)으로 시작한다.
+								subscriptions.apis.push(File.createApi('arxiv', [query]));
+							}
+							// secret은 File.writeSubscriptions가 저장에서 제외하므로 여기서 설정하지 않는다.
+						});
 						new Notice(`Subscriptions 저장됨: ${query.searchType}/${query.query}`);
 					} catch (error) {
 						new Notice(`Subscriptions 저장 실패: ${String(error)}`);

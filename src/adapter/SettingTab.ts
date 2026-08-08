@@ -371,9 +371,10 @@ export class SettingTab extends PluginSettingTab {
 			)
 			.addButton((button) =>
 				button.setButtonText('보정').onClick(() => {
-					void runCollectFlow('보정', this.plugin.collectflow.isBusy, () =>
-						this.plugin.collectflow.repair(),
-					);
+					void runCollectFlow('보정', this.plugin.collectflow.isBusy, async () => {
+						await this.plugin.collectflow.repair();
+						return this.formatRepairDetail();
+					});
 				}),
 			);
 
@@ -711,6 +712,30 @@ export class SettingTab extends PluginSettingTab {
 			: `${flow.collected}편 수집`;
 	}
 
+	// 보정은 진행률 Notice가 없어 runWithProgress를 안 거치므로, 완료 문구는 여기서 따로
+	// 만든다. lastRepairStats는 repair()가 void를 반환하는 대신 인스턴스에 남겨두는 값이다
+	// (run()의 lastStats와 같은 이유).
+	private formatRepairDetail(): string | undefined {
+		const stats = this.plugin.collectflow.lastRepairStats;
+		if (!stats) {
+			return undefined;
+		}
+		const parts: string[] = [];
+		if (stats.reembedded > 0) {
+			parts.push(`재임베딩 ${stats.reembedded}편`);
+		}
+		if (stats.citationsFixed > 0) {
+			parts.push(`인용수 보강 ${stats.citationsFixed}편`);
+		}
+		if (parts.length === 0) {
+			return '고칠 것 없음';
+		}
+		if (stats.reembedFailed > 0) {
+			parts.push(`${stats.reembedFailed}편은 여전히 실패`);
+		}
+		return parts.join(', ');
+	}
+
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는
 	// 다이어그램 계약상 void만 반환하고 Notice/DOM을 전혀 모르므로(CollectAndSave는
 	// Obsidian을 몰라야 한다 — 001 합의), 관측은 항상 미들웨어를 경유한다. UI(Notice
@@ -831,6 +856,10 @@ export class SettingTab extends PluginSettingTab {
 
 	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다.
 	//
+	// File.mutateSubscriptions로 읽기-수정-쓰기를 큐에 태운다 — 수집이 막 끝나며
+	// File.updateApiCursors가 같은 파일을 읽고 쓰는 시점과 겹칠 수 있는데, 직접
+	// read-then-write하면 나중에 쓰는 쪽이 앞선 변경을 통째로 지운다.
+	//
 	// draft.updateTime을 새로 만든 API 인스턴스에 그대로 실어야 한다 — File.createApi가
 	// 만드는 인스턴스는 기본값 0으로 시작하므로, 이걸 빼먹으면 조건 하나만 고쳐도 그
 	// 구독의 커서(수집 진행 상황)가 사라지고 처음부터 다시 훑게 된다. loadSubscriptions가
@@ -843,16 +872,16 @@ export class SettingTab extends PluginSettingTab {
 			return;
 		}
 		try {
-			const subscriptions = await File.readSubscriptions();
-			subscriptions.apis = this.apiDrafts.map((draft) => {
-				const api = File.createApi(
-					draft.apiName,
-					draft.conditions.map((c): SearchQuery => ({ searchType: c.searchType, query: c.query })),
-				);
-				api.updateTime = draft.updateTime;
-				return api;
+			await File.mutateSubscriptions((subscriptions) => {
+				subscriptions.apis = this.apiDrafts.map((draft) => {
+					const api = File.createApi(
+						draft.apiName,
+						draft.conditions.map((c): SearchQuery => ({ searchType: c.searchType, query: c.query })),
+					);
+					api.updateTime = draft.updateTime;
+					return api;
+				});
 			});
-			await File.writeSubscriptions(subscriptions);
 		} catch (e) {
 			new Notice(`구독 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
 		}

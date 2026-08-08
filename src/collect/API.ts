@@ -51,10 +51,16 @@ export interface API {
 	// "최근" 수집이 색인 지연을 놓치지 않으려면 커서보다 얼마나 뒤로 물러나 다시 훑어야
 	// 하는지 — 이 API가 얼마나 늦게 논문을 색인하는지는 이 API만 아는 사정이라 여기 둔다
 	// (ArxivAPI.ARXIV_RETRY의 재시도 간격을 ApiSupport가 아니라 여기 둔 것과 같은 이유:
-	// "3초는 arXiv의 사정이지 HTTP의 사정이 아니다"). CollectAndSave.run()이 recent 수집
-	// 구간을 계산할 때, 구독된 API들 중 가장 큰 값을 취해 "어느 하나도 못 보고 지나치지
-	// 않도록" 보수적으로 정한다.
+	// "3초는 arXiv의 사정이지 HTTP의 사정이 아니다"). CollectAndSave의 resolveWindow가
+	// 구독(이 API 인스턴스)마다 자기 커서(updateTime)와 이 값으로 각자의 recent 구간을
+	// 계산한다 — 구독마다 독립이라 다른 구독의 색인 지연에 끌려다니지 않는다.
 	readonly recentRescanWindowMs: number;
+
+	// 이 API에 연달아 요청을 보낼 때 지켜야 하는 최소 간격. CollectAndSave가 구독을
+	// 순차로 도는 루프에서, 한 구독의 마지막 요청과 다음 구독의 첫 요청 사이에도 이만큼
+	// 쉰다 — 두 구독이 우연히 같은 서비스(예: arXiv 두 개)면 그 사이에 쉬지 않을 이유가
+	// 없고, 다른 서비스라도 손해가 크지 않다.
+	readonly requestDelayMs: number;
 
 	// 이 API와 통신해 데이터를 가져오는 가장 근본적인 핵심 진입점(엔진). 날짜 조건 없이
 	// 현재 querys만으로 이 API에 실제로 접근하는 최소 단위의 통신을 수행한다.
@@ -164,6 +170,10 @@ export class ArxivAPI implements API {
 	// — 이 저장소에서 실측한 값은 아니고 이전 프로젝트의 관행을 이어받은 것이다
 	// (docs/devLog/004.md). 재현측이 나오면 이 상수만 조정하면 된다.
 	public readonly recentRescanWindowMs = 4 * 24 * 60 * 60 * 1000;
+
+	// PAGE_DELAY_MS(아래, 페이지 사이 간격)와 같은 값이다 — 이용약관이 요구하는 건 결국
+	// "arXiv에 대한 연속 요청 간격"이라, 페이지 사이든 구독 사이든 같은 규칙을 적용한다.
+	public readonly requestDelayMs = 3_000;
 
 	// ── arXiv 쿼리 문법 ──
 	// SearchQuery.searchType 허용값

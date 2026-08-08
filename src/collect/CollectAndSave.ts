@@ -33,16 +33,29 @@ interface CollectWindow {
 	advancesCursor: boolean;
 }
 
+// embedOrReuse가 서킷브레이커 대응에 필요한 만큼만 보는 조각. run()의 CollectStats와
+// repairNow()의 RepairStats가 둘 다 이 모양을 가지므로, 두 경로가 같은 브레이커 로직을
+// 공유할 수 있다(embedOrReuse 주석 참고) — 임베딩이 실패하는 방식은 수집 중이든 보정
+// 중이든 같은 사정(모델이 죽었다)이기 때문이다.
+interface EmbedBreakerStats {
+	// 서킷브레이커 쿨다운을 기다린 횟수, 그리고 이번 실행에서 임베딩을 포기했는지.
+	embedWaits: number;
+	embedGaveUp: boolean;
+}
+
 // 한 번의 수집 실행이 무엇을 했는지. 청크 단위로 처리하면서 누적한다.
-export interface CollectStats {
+export interface CollectStats extends EmbedBreakerStats {
 	collected: number;
 	// 벡터가 빈 채로 저장된 논문 수. 임베딩 실패는 수집을 멈추지 않지만([3] 정책과 같은
 	// 취지 — 메타데이터는 살린다), 조용히 넘어가면 사용자가 알 방법이 없어 집계해 알린다.
 	embedFailed: number;
-	// 서킷브레이커 쿨다운을 기다린 횟수, 그리고 이번 실행에서 임베딩을 포기했는지.
-	// embedOrReuse 주석 참고.
-	embedWaits: number;
-	embedGaveUp: boolean;
+}
+
+// 한 번의 보정 실행이 무엇을 했는지.
+export interface RepairStats extends EmbedBreakerStats {
+	reembedded: number;
+	reembedFailed: number;
+	citationsFixed: number;
 }
 
 // 큐에 들어간 작업의 종류. UI가 "무엇이 돌고 있는지"를 표시하는 데 쓴다.
@@ -82,9 +95,16 @@ export class CollectAndSave {
 	private queueListeners: ((state: CollectQueueState) => void)[] = [];
 	// 아직 시작하지 않은 recent 작업. 합침(coalescing) 대상이다 — 아래 requestRecent 참고.
 	private pendingRecent: Promise<void> | undefined;
+	// dispose() 이후 true. 이미 시작한 네트워크 요청은 취소할 수 없지만(requestUrl에
+	// 취소 수단이 없다 — ApiSupport.requestWithTimeout 주석 참고), 이 플래그가 서는
+	// 지점들(enqueue/collect/processChunk/repairNow)은 그 요청이 끝나는 대로 더 진행하지
+	// 않고 멈춘다.
+	private disposed = false;
 
 	// 직전 수집 실행의 집계. UI가 완료 문구를 만들 때 읽는다(run()은 void를 반환하므로).
 	lastStats: CollectStats | undefined;
+	// 직전 보정 실행의 집계. lastStats와 같은 이유로 존재한다(repairNow()도 void 반환).
+	lastRepairStats: RepairStats | undefined;
 
 	// 한 실행에서 서킷브레이커 쿨다운을 몇 번까지 기다려줄지. 이 횟수를 넘으면 모델이
 	// 회복 불가능한 상태라고 보고 임베딩을 포기한다 — embedOrReuse 주석 참고.
@@ -137,6 +157,12 @@ export class CollectAndSave {
 
 		const result = this.tail.then(async () => {
 			this.waitingJobs = this.waitingJobs.filter((waiting) => waiting !== job);
+			if (this.disposed) {
+				// 플러그인이 언로드된 뒤 줄에서 차례가 온 작업 — 시작하지 않는다.
+				Log.info('collect.queue', `건너뜀(언로드됨): ${job.label}`);
+				this.notifyQueue();
+				return;
+			}
 			this.activeJob = job;
 			onStart?.();
 			Log.info('collect.queue', `시작: ${job.label}`, { waiting: this.waitingJobs.length });
@@ -160,6 +186,13 @@ export class CollectAndSave {
 	// 등록 계열: 안전하게 동작한다.
 	setMiddleware(mw: Middleware): void {
 		this.middlewares.push(mw);
+	}
+
+	// Obsidian이 플러그인을 끄거나 리로드할 때 부른다(main.ts onunload). 지금 시도 중인
+	// requestUrl 호출은 끝까지 진행되지만(취소 불가), 그 이후로는 다음 구독으로 넘어가거나
+	// 다음 논문을 처리하거나 대기 중인 작업을 시작하지 않는다.
+	dispose(): void {
+		this.disposed = true;
 	}
 
 	// "구독이 바뀌었으니 최근 논문을 한 번 훑어라". 구독 편집 UI가 부른다.
@@ -282,6 +315,14 @@ export class CollectAndSave {
 	// ⚠️ 계약 변화: 'all' 미들웨어가 수집 전체가 아니라 **청크마다** 불린다. 청크 안에서
 	// in-place로 항목을 덜어내는(splice) 방식은 그대로 동작하지만, 청크를 가로지르는 중복
 	// 제거가 필요하면 미들웨어가 자체 상태를 들고 있어야 한다.
+	//
+	// ⚠️ 언로드(dispose) 신호를 여기서는 보지 않는다 — 이 청크는 이미 arXiv에서 받아온
+	// 페이지 하나다. 여기서 처리를 건너뛰면 이 청크의 논문들은 저장도 안 됐는데 API 쪽
+	// coverage.coveredThrough는 이미 이 지점을 지나쳤다고 기록해, 커서가 실제로 저장한
+	// 지점보다 앞서가는 영구 누락을 만든다. dispose()는 그 대신 "다음 구독을 시작하지
+	// 않는다"(collect() 참고)와 "다음 큐 작업을 시작하지 않는다"(enqueue 참고)는 안전한
+	// 경계에서만 멈춘다 — 이미 시작한 구독 하나는 자연스러운 완료(성공/실패/상한)까지
+	// 진행되도록 둔다.
 	private async processChunk(papers: Paper[], stats: CollectStats): Promise<void> {
 		await this.runMiddlewares('all', papers);
 
@@ -314,6 +355,12 @@ export class CollectAndSave {
 	//
 	// 미들웨어는 돌리지 않는다 — 다이어그램의 미들웨어 흐름은 수집(run) 경로에 대한 정의고,
 	// 보정은 저장된 값의 필드 몇 개를 고치는 작업이라 범위 밖으로 둔다.
+	//
+	// ⚠️ readAllPapers()로 코퍼스 전체를 메모리에 올린다 — run() 경로는 청크 스트리밍으로
+	// 이 비용을 없앴지만(CollectAndSave.prefillFromStore 참고), 보정은 "실패 플래그가 선
+	// 논문을 찾는다"는 게 본질적으로 전수 조사라 페이지로 나눠 받을 날짜 구간이 없다.
+	// 코퍼스가 아주 커지면 이 로드 자체가 무거워질 수 있다는 건 알려진 한계로 남겨둔다
+	// (별도 인덱스 없이는 못 줄인다).
 	private async repairNow(): Promise<void> {
 		// 재임베딩이 섞여 있으므로 run()과 같은 사전 체크 — 모델이 없으면 대상 논문 수만큼
 		// 조용히 실패만 반복하게 된다(CollectAndSave.run의 같은 체크 주석 참고).
@@ -324,45 +371,81 @@ export class CollectAndSave {
 		}
 
 		const papers = await File.readAllPapers();
-		const changed = new Set<Paper>();
+		const stats: RepairStats = {
+			reembedded: 0,
+			reembedFailed: 0,
+			citationsFixed: 0,
+			embedWaits: 0,
+			embedGaveUp: false,
+		};
 
-		// 1) 재임베딩. embed()는 순차 호출만 안전하다 — run()과 같은 계약.
+		// 1) 재임베딩. embedOrReuse()가 run() 경로와 같은 서킷브레이커 대응을 해준다 —
+		// 브레이커가 열려 있으면 쿨다운을 기다렸다 재개하고, 계속 안 풀리면 몇 번 뒤에는
+		// 포기한다(embedOrReuse 주석 참고). 보정은 실패한 논문만 모아 도는 경로라 오히려
+		// 브레이커가 열릴 확률이 가장 높은 곳이다 — 예전 코드는 이 대응이 없어 브레이커가
+		// 열리면 남은 논문 전부가 빈 catch로 몇 초 만에 조용히 실패했다.
+		//
+		// 논문마다 즉시 저장한다 — 끝에 한꺼번에 쓰면, 도중에 저장이 실패하거나 언로드되면
+		// 그때까지 고친 것까지 전부 사라진다.
 		this.embedding.resetCircuitBreaker();
 		for (const paper of papers) {
+			if (this.disposed) {
+				// 재임베딩 루프는 안전한 경계다 — 어느 논문에서 멈추든 나머지는 그냥
+				// "아직 고치지 못한 상태"로 남을 뿐, 잘못된 상태가 되는 게 아니다(run()의
+				// 커서/coverage 같은 순서 의존 개념이 보정에는 없다). 다음 보정이 이어받는다.
+				break;
+			}
 			if (paper.embeddingSucceeded) {
 				continue;
 			}
-			try {
-				Object.assign(paper, await this.embedding.embed(paper.title, paper.abstract));
-				changed.add(paper);
-			} catch {
-				// 또 실패 — 값이 이미 빈 상태 그대로이므로 다시 쓸 것도 없다. 플래그는
-				// false로 남아 다음 보정에서 또 시도된다.
+			await this.embedOrReuse(paper, stats);
+			if (paper.embeddingSucceeded) {
+				stats.reembedded += 1;
+				try {
+					await File.writePaper(paper);
+				} catch (error) {
+					Log.error('collect', '보정 중 논문 저장 실패', error, { sourceId: paper.sourceId });
+					throw error;
+				}
+			} else {
+				stats.reembedFailed += 1;
 			}
 		}
 
 		// 2) 재보강. 논문이 수집된 API별로 묶어 각 구현체의 EnrichCitations에 맡긴다
 		// (citationsKnown 필터는 그 안에 있다). 실패해도 throw하지 않는 [3] 정책 그대로.
-		const secret = await File.readSecret();
-		for (const apiName of File.supportedApiNames()) {
-			const targets = papers.filter(
-				(paper) => !paper.citationsKnown && paper.collectedApis.includes(apiName),
-			);
-			if (targets.length === 0) {
-				continue;
-			}
-			await File.createApi(apiName, [], secret).EnrichCitations(targets);
-			for (const paper of targets) {
-				if (paper.citationsKnown) {
-					changed.add(paper);
+		if (!this.disposed) {
+			const secret = await File.readSecret();
+			for (const apiName of File.supportedApiNames()) {
+				if (this.disposed) {
+					// API(서비스) 경계 — collect()가 구독 경계에서 멈추는 것과 같은 원칙.
+					break;
+				}
+				const targets = papers.filter(
+					(paper) => !paper.citationsKnown && paper.collectedApis.includes(apiName),
+				);
+				if (targets.length === 0) {
+					continue;
+				}
+				await File.createApi(apiName, [], secret).EnrichCitations(targets);
+				for (const paper of targets) {
+					if (paper.citationsKnown) {
+						stats.citationsFixed += 1;
+						try {
+							await File.writePaper(paper);
+						} catch (error) {
+							Log.error('collect', '보정 중 논문 저장 실패', error, {
+								sourceId: paper.sourceId,
+							});
+							throw error;
+						}
+					}
 				}
 			}
 		}
 
-		// 3) 실제로 값이 바뀐 논문만 재저장 — 전체 재저장은 updatedAt만 더럽힌다.
-		for (const paper of changed) {
-			await File.writePaper(paper);
-		}
+		Log.info('collect', '보정 완료', stats);
+		this.lastRepairStats = stats;
 	}
 
 	// ── 수집 범위 ──────────────────────────────────────────────────
@@ -428,7 +511,23 @@ export class CollectAndSave {
 		};
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
 
-		for (const api of apis) {
+		for (const [index, api] of apis.entries()) {
+			// 플러그인이 언로드됐으면 아직 시작하지 않은 구독은 시작하지 않는다. 이미
+			// 시작한 구독(index 0)은 여기 걸리지 않고 자연스럽게 끝까지 진행된다 — 그
+			// 구독의 coverage가 실제로 저장한 지점과 어긋나지 않게 하려면 중간에 끊으면
+			// 안 되기 때문이다(processChunk 주석 참고). 아직 손대지 않은 다음 구독은
+			// 통째로 건너뛰어도 안전하다 — 그 구독의 커서는 그대로 남고, 다음 실행이
+			// 처음부터 다시 훑을 뿐이다.
+			if (this.disposed) {
+				Log.info('collect', `언로드됨 — 남은 구독 ${apis.length - index}개는 건너뜀`);
+				break;
+			}
+			// 한 구독의 마지막 페이지 요청과 다음 구독의 첫 요청 사이에도 간격을 둔다.
+			// 페이지네이션 내부(fetchPage)의 딜레이는 각 API 구현체가 스스로 챙기지만,
+			// 구독과 구독의 경계는 이 루프만 안다.
+			if (index > 0) {
+				await delay(api.requestDelayMs);
+			}
 			const window = this.resolveWindow(mode, testOptions, api);
 			if (window.hours === undefined) {
 				await api.Backfill(window.from, window.to, options);
@@ -512,7 +611,7 @@ export class CollectAndSave {
 	//
 	// 저장본을 읽는 일은 prefillFromStore가 청크 단위로 이미 해뒀다 — 여기서 또 읽으면
 	// 같은 파일을 두 번 읽는 셈이다.
-	private async embedOrReuse(paper: Paper, stats: CollectStats): Promise<void> {
+	private async embedOrReuse(paper: Paper, stats: EmbedBreakerStats): Promise<void> {
 		if (paper.embeddingSucceeded) {
 			return;
 		}
