@@ -6,6 +6,7 @@ import { Log } from '../common/Log';
 import { API, type CollectOptions } from './API';
 import { delay } from './ApiSupport';
 import { Paper } from './Paper';
+import type { SearchQuery } from './SearchQuery';
 
 // run()의 실제 수집 범위는 원래 Subscriptions(API별 SearchQuery)에서 읽어와야 하지만,
 // 그게 구현되기 전까지 설정탭의 테스트 버튼이 직접 범위를 넘겨볼 수 있도록 임시로 받는
@@ -17,9 +18,14 @@ export interface CollectTestOptions {
 	to?: number;
 }
 
-// 이번 실행이 훑을 구간. hours가 있으면 SearchRecentPaper로, 없으면 Backfill로 부른다.
-// advancesCursor는 "이 실행 결과를 Subscriptions.updateTime에 반영해도 되는가" —
-// 테스트 경로(직접 범위를 준 경우)가 운영 커서를 오염시키지 않게 구분한다.
+// 한 API(구독)가 이번 실행에서 훑을 구간. hours가 있으면 SearchRecentPaper로, 없으면
+// Backfill로 부른다. advancesCursor는 "이 실행 결과를 그 API의 updateTime에 반영해도
+// 되는가" — 테스트 경로(직접 범위를 준 경우)가 운영 커서를 오염시키지 않게 구분한다.
+//
+// 구독마다 독립이다. Backfill/테스트 hours처럼 범위를 직접 주는 경로는 모든 구독에 같은
+// 구간을 적용하지만(사용자가 명시한 범위이므로), recent 자동 계산은 구독마다 자기
+// 커서(updateTime)와 자기 recentRescanWindowMs로 서로 다른 구간을 낸다 — resolveWindow
+// 참고.
 interface CollectWindow {
 	hours?: number;
 	from: number;
@@ -227,13 +233,8 @@ export class CollectAndSave {
 			);
 		}
 
-		const window = this.resolveWindow(mode, testOptions, apis);
 		Log.info('collect', `실행 시작 (${mode})`, {
-			from: new Date(window.from).toISOString(),
-			to: new Date(window.to).toISOString(),
-			hours: window.hours,
-			advancesCursor: window.advancesCursor,
-			apis: apis.map((api) => api.apiName),
+			apis: apis.map((api) => ({ apiName: api.apiName, updateTime: api.updateTime })),
 		});
 		this.embedding.resetCircuitBreaker();
 		const stats: CollectStats = {
@@ -243,7 +244,7 @@ export class CollectAndSave {
 			embedGaveUp: false,
 		};
 		let chunks = 0;
-		await this.collect(apis, window, (chunk) => {
+		const cursorUpdates = await this.collect(apis, mode, testOptions, (chunk) => {
 			chunks += 1;
 			return this.processChunk(chunk, stats);
 		});
@@ -261,9 +262,15 @@ export class CollectAndSave {
 		}
 		this.lastStats = stats;
 
-		if (window.advancesCursor) {
-			await this.advanceCursor(apis, window.to);
-		}
+		// 구독마다 독립 커서라 갱신 대상도 구독마다 다르다 — collect()가 advancesCursor인
+		// 구독만 골라 돌려준다(Backfill/테스트 hours로 돈 구독은 여기 안 낀다).
+		Log.info('collect', '수집 커서 갱신', {
+			updates: cursorUpdates.map((u) => ({
+				apiName: u.apiName,
+				cursor: new Date(u.cursor).toISOString(),
+			})),
+		});
+		await File.updateApiCursors(cursorUpdates);
 	}
 
 	// 청크 하나를 끝까지 처리한다: 미들웨어(all) -> loop { 임베딩 -> 미들웨어(forEach) -> 저장 }.
@@ -360,10 +367,14 @@ export class CollectAndSave {
 
 	// ── 수집 범위 ──────────────────────────────────────────────────
 
+	// 구독(api) 하나가 이번 실행에서 훑을 구간. Backfill/테스트 hours는 사용자가 직접
+	// 범위를 주는 경로라 모든 구독에 같은 구간이 나오지만(api를 실제로는 안 쓴다),
+	// recent 자동 계산만큼은 그 구독 고유의 커서(api.updateTime)와 재스캔 창
+	// (api.recentRescanWindowMs)을 쓴다 — 구독마다 색인 지연이 다를 수 있어서다.
 	private resolveWindow(
 		mode: 'recent' | 'backfill',
 		testOptions: CollectTestOptions | undefined,
-		apis: API[],
+		api: API,
 	): CollectWindow {
 		const now = Date.now();
 
@@ -388,37 +399,61 @@ export class CollectAndSave {
 			return { hours, from: now - hours * 60 * 60 * 1000, to: now, advancesCursor: false };
 		}
 
-		// "최근"의 실제 폭 = 구독된 API들의 색인 지연 중 가장 보수적인 값(recentRescanWindowMs
-		// 최댓값). 이 값을 API 계층으로 옮긴 이유는 API.ts의 recentRescanWindowMs 주석 참고.
-		// 커서가 없는 첫 실행도 같은 폭을 쓴다 — "최근"은 이제 24시간이 아니라 이 값이라는
-		// 개념 정정이다(코드만 반영, UI 문구·사용자 공지는 별도).
-		const recentWindowMs = Math.max(...apis.map((api) => api.recentRescanWindowMs));
-		const cursor = this.sub.updateTime;
-		const hasCursor = typeof cursor === 'number' && Number.isFinite(cursor) && cursor > 0;
-		const referencePoint = hasCursor ? cursor : now;
-		return { from: referencePoint - recentWindowMs, to: now, advancesCursor: true };
+		// "최근"의 실제 폭 = 이 구독이 속한 API의 색인 지연(recentRescanWindowMs). 예전에는
+		// Subscriptions 전체가 커서 하나를 공유해서, 여러 API를 묶으면 그중 가장 보수적인
+		// 값(Math.max) 하나로 전부를 다시 훑어야 했다 — 커서가 구독마다 독립이 된 지금은
+		// 그럴 필요가 없다. 커서가 없는 첫 실행도 같은 폭을 쓴다 — "최근"은 24시간이 아니라
+		// 이 값이라는 개념 정정이다.
+		const hasCursor = api.updateTime > 0;
+		const referencePoint = hasCursor ? api.updateTime : now;
+		return { from: referencePoint - api.recentRescanWindowMs, to: now, advancesCursor: true };
 	}
 
 	// API를 순차로 돌며 수집한다. 병렬로 부르면 같은 호스트에 동시 요청이 나가 arXiv의
-	// 요청 간격 권고를 깨뜨린다. 수집 자체의 실패([1] 정책)는 그대로 전파한다.
+	// 요청 간격 권고를 깨뜨린다. 수집 자체의 실패([1] 정책)는 그대로 전파한다 — 그러면
+	// 이 함수도 예외로 끝나고, 이미 처리한 구독의 cursorUpdates까지 호출자에게 도달하지
+	// 못한다. 즉 한 구독이 실패하면 이번 실행에서는 어떤 구독의 커서도 갱신되지 않는다
+	// (예전에도 advanceCursor를 전체 성공 후 한 번만 불렀던 것과 같은 보수적 동작).
 	//
 	// 논문을 모아서 받지 않고 청크가 나올 때마다 onChunk로 처리한다 — processChunk 주석 참고.
 	private async collect(
 		apis: API[],
-		window: CollectWindow,
+		mode: 'recent' | 'backfill',
+		testOptions: CollectTestOptions | undefined,
 		onChunk: (papers: Paper[]) => Promise<void>,
-	): Promise<void> {
+	): Promise<{ apiName: string; querys: SearchQuery[]; cursor: number }[]> {
 		const options: CollectOptions = {
 			prefill: (papers) => this.prefillFromStore(papers),
 			onChunk,
 		};
+		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
+
 		for (const api of apis) {
+			const window = this.resolveWindow(mode, testOptions, api);
 			if (window.hours === undefined) {
 				await api.Backfill(window.from, window.to, options);
 			} else {
 				await api.SearchRecentPaper(window.hours, options);
 			}
+			if (window.advancesCursor) {
+				cursorUpdates.push({
+					apiName: api.apiName,
+					querys: api.querys,
+					cursor: CollectAndSave.resolveCursor(api, window.to),
+				});
+			}
 		}
+		return cursorUpdates;
+	}
+
+	// 잘린(truncated) API는 그 지점까지만 인정한다. 요청한 구간의 끝(requestedTo)을
+	// 그대로 쓰면 실제로 못 본 구간을 봤다고 기록해 영구 누락이 된다 (004 문서).
+	private static resolveCursor(api: API, requestedTo: number): number {
+		const coverage = api.lastCoverage;
+		if (coverage !== undefined && coverage.truncated && coverage.coveredThrough < requestedTo) {
+			return coverage.coveredThrough;
+		}
+		return requestedTo;
 	}
 
 	// 저장본에 이미 있는 값을 청크에 얹는다. 재스캔 구간은 이전에 이미 처리한 논문을 다시
@@ -541,26 +576,4 @@ export class CollectAndSave {
 		paper.embeddingSucceeded = false;
 	}
 
-	// ── 커서 ───────────────────────────────────────────────────────
-
-	// 잘린(truncated) API가 하나라도 있으면 그 지점까지만 인정한다. 요청한 구간의 끝(to)을
-	// 그대로 저장하면 실제로 못 본 구간을 봤다고 기록해 영구 누락이 된다 (004 문서).
-	private async advanceCursor(apis: API[], to: number): Promise<void> {
-		let cursor = to;
-		for (const api of apis) {
-			const coverage = api.lastCoverage;
-			if (coverage !== undefined && coverage.truncated && coverage.coveredThrough < cursor) {
-				cursor = coverage.coveredThrough;
-			}
-		}
-		Log.info('collect', '수집 커서 갱신', {
-			requestedTo: new Date(to).toISOString(),
-			saved: new Date(cursor).toISOString(),
-			heldBack: cursor !== to,
-		});
-		// this.sub를 그대로 저장하면 안 된다 — 수집이 도는 동안 사용자가 추가한 구독이
-		// 시작 시점의 낡은 목록에 덮여 사라진다. 커서 필드만 갱신하는 경로를 쓴다.
-		this.sub.updateTime = cursor;
-		await File.updateSubscriptionCursor(cursor);
-	}
 }

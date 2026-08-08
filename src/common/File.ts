@@ -76,34 +76,41 @@ export class File {
 		return File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
-				// 저장된 apis는 평범한 객체({ apiName, querys })라 메서드가 없다. createApi로
-				// apiName에 맞는 구현 클래스를 인스턴스화해 메서드가 살아있는 API로 복원한다.
+				// 저장된 apis는 평범한 객체({ apiName, querys, updateTime })라 메서드가 없다.
+				// createApi로 apiName에 맞는 구현 클래스를 인스턴스화해 메서드가 살아있는
+				// API로 복원한다.
 				const data = raw as {
+					// 구버전 파일 호환용. 전역 커서 하나만 있던 시절의 필드 — 지금은 안 쓴다
+					// (updateTime은 이제 apis[].updateTime, 구독마다 독립). 이 필드가 있는데
+					// 밑의 apis[].updateTime이 없으면 마이그레이션 값으로 쓴다: 모든 구독이
+					// 예전과 같은 지점부터 이어서 훑게 해, 커서 형식이 바뀌었다고 갑자기
+					// 전체를 다시 backfill하지 않는다.
 					updateTime?: number;
-					apis?: { apiName: string; querys?: SearchQuery[] }[];
+					apis?: { apiName: string; querys?: SearchQuery[]; updateTime?: number }[];
 				};
+				const legacyCursor = typeof data.updateTime === 'number' ? data.updateTime : 0;
 				const subscriptions = new Subscriptions();
-				subscriptions.updateTime = data.updateTime ?? 0;
 				subscriptions.secret = secret;
-				subscriptions.apis = (data.apis ?? []).map((api) =>
-					File.createApi(
-						api.apiName,
-						(api.querys ?? []).map((query) => File.migrateSearchType(query)),
+				subscriptions.apis = (data.apis ?? []).map((apiData) => {
+					const api = File.createApi(
+						apiData.apiName,
+						(apiData.querys ?? []).map((query) => File.migrateSearchType(query)),
 						secret,
-					),
-				);
+					);
+					api.updateTime =
+						typeof apiData.updateTime === 'number' ? apiData.updateTime : legacyCursor;
+					return api;
+				});
 				return subscriptions;
 			},
 			() => {
 				// Subscriptions.json이 아직 없는 첫 실행(새로 설치한 환경) 기본값.
 				// 모든 필드를 실제로 채워야 한다 — 비워두면 `!` 단언 때문에 타입은 채워진
 				// 것처럼 보이지만 런타임 값은 undefined라, 호출자가 그대로 .map/.forEach하면
-				// 그 자리에서 터진다(설정탭이 실제로 이렇게 죽었었다). updateTime도 파일이
-				// 있을 때의 `?? 0`과 같은 값으로 맞춰 두 경로가 같은 모양을 내놓게 한다.
+				// 그 자리에서 터진다(설정탭이 실제로 이렇게 죽었었다).
 				const subscriptions = new Subscriptions();
 				subscriptions.secret = secret;
 				subscriptions.apis = [];
-				subscriptions.updateTime = 0;
 				return subscriptions;
 			},
 		);
@@ -132,22 +139,48 @@ export class File {
 		// 인스턴스 필드로 들고 있을 수 있고, TypeScript의 private은 컴파일 타임 표시일 뿐이라
 		// JSON.stringify가 전부 직렬화한다 — 실제로 ArxivAPI에 secret을 넘기기 시작하자
 		// 이 파일에 API 키가 평문으로 찍혔다. 저장할 필드를 여기서 명시적으로 골라내
-		// 구현체가 어떤 필드를 갖든 새지 않게 한다(복원에 필요한 건 apiName과 querys뿐이다).
+		// 구현체가 어떤 필드를 갖든 새지 않게 한다(복원에 필요한 건 apiName·querys·updateTime뿐이다).
+		//
+		// 커서(updateTime)를 구독 하나마다 따로 싣는다 — 전역 커서 한 값이던 시절과 달리,
+		// 구독이 배열의 어느 위치로 옮겨져도(추가/삭제/재배열) 그 구독 고유의 진행 상황이
+		// 함께 따라간다.
 		return File.writeConfig('Subscriptions.json', {
-			updateTime: subscriptions.updateTime,
-			apis: subscriptions.apis.map((api) => ({ apiName: api.apiName, querys: api.querys })),
+			apis: subscriptions.apis.map((api) => ({
+				apiName: api.apiName,
+				querys: api.querys,
+				updateTime: api.updateTime,
+			})),
 		});
 	}
 
-	// 수집 커서(updateTime)만 갈아끼운다.
+	// 여러 구독의 수집 커서를 한 번에 갈아 끼운다.
 	//
 	// 수집은 오래 걸리고 그동안 사용자는 구독을 편집할 수 있다. 수집 시작 시점에 읽어둔
 	// Subscriptions 객체를 끝에 통째로 저장하면, 그 사이에 추가된 구독이 낡은 목록으로
-	// 덮여 사라진다. 그래서 저장 직전에 다시 읽어 이 필드 하나만 바꾼다 — SettingTab의
-	// persistSubscriptions가 반대 방향(apis만 갈아끼움)으로 같은 규칙을 지키는 것과 짝이다.
-	static async updateSubscriptionCursor(cursor: number): Promise<void> {
+	// 덮여 사라진다. 그래서 저장 직전에 다시 읽어 해당 구독의 updateTime만 바꾼다 —
+	// SettingTab의 persistSubscriptions가 반대 방향(apis만 갈아끼움)으로 같은 규칙을
+	// 지키는 것과 짝이다.
+	//
+	// apiName만으로는 어느 구독인지 특정할 수 없다 — 같은 apiName을 조건만 다르게
+	// 여러 번 등록할 수 있어서(설정탭 "API 추가"), querys까지 같이 봐야 한다. 수집이
+	// 도는 동안 사용자가 하필 그 구독의 조건 자체를 바꾸면(드문 경우) 매칭이 안 돼 이번
+	// 갱신은 스킵된다 — 다음 실행이 예전 커서로 다시 훑을 뿐이라 데이터 유실은 아니다.
+	static async updateApiCursors(
+		updates: { apiName: string; querys: SearchQuery[]; cursor: number }[],
+	): Promise<void> {
+		if (updates.length === 0) {
+			return;
+		}
 		const subscriptions = await File.readSubscriptions();
-		subscriptions.updateTime = cursor;
+		for (const api of subscriptions.apis) {
+			const match = updates.find(
+				(update) =>
+					update.apiName === api.apiName && File.searchQueriesEqual(update.querys, api.querys),
+			);
+			if (match) {
+				api.updateTime = match.cursor;
+			}
+		}
 		await File.writeSubscriptions(subscriptions);
 	}
 

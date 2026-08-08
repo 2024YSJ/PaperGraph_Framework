@@ -36,6 +36,18 @@ export interface API {
 	readonly apiName: string;
 	querys: SearchQuery[];
 
+	// 이 구독(apiName+querys)의 수집 커서 — "recent 수집이 여기부터 이어서 훑으면 된다"는
+	// 지점(epoch ms). 0이면 아직 한 번도 수집한 적이 없다는 뜻.
+	//
+	// 구독마다 독립이다. 예전에는 Subscriptions 하나에 커서가 하나뿐이라(전역 updateTime),
+	// 새 구독을 추가해도 그 구독은 "최근"만 보고 과거를 영영 못 봤고, 여러 API를 묶을 때도
+	// 서로 다른 색인 지연을 무시하고 가장 보수적인 값(Math.max) 하나로 전부를 다시 훑어야
+	// 했다. 커서를 API 인스턴스에 실어 apis[] 배열 항목과 함께 저장하면(File.writeSubscriptions
+	// 참고) 이 문제가 없어진다 — 구독이 배열 어디로 옮겨져도(추가/삭제) 커서가 그 구독을
+	// 계속 따라간다. 값을 정하는 건 CollectAndSave의 책임이므로 여기서는 그냥 필드로 둔다
+	// (readonly가 아닌 이유는 그 갱신 때문).
+	updateTime: number;
+
 	// "최근" 수집이 색인 지연을 놓치지 않으려면 커서보다 얼마나 뒤로 물러나 다시 훑어야
 	// 하는지 — 이 API가 얼마나 늦게 논문을 색인하는지는 이 API만 아는 사정이라 여기 둔다
 	// (ArxivAPI.ARXIV_RETRY의 재시도 간격을 ApiSupport가 아니라 여기 둔 것과 같은 이유:
@@ -91,7 +103,7 @@ export interface CollectOptions {
 
 // 직전 날짜 구간 수집이 실제로 어디까지 훑었는지.
 //
-// CollectAndSave.run()이 수집 커서(Subscriptions.updateTime)를 저장할 때 요청한 구간의
+// CollectAndSave.run()이 수집 커서(API.updateTime)를 저장할 때 요청한 구간의
 // 끝(window.to)을 그냥 쓰면 안 된다 — 상한에 걸려 잘렸으면 거기까지 간 게 아니어서,
 // 못 본 구간을 봤다고 기록하게 된다. truncated면 coveredThrough를 저장하고 다음 패스가
 // 거기서부터 이어받아야 한다.
@@ -143,6 +155,9 @@ interface S2BatchElement {
 export class ArxivAPI implements API {
 	public readonly apiName = 'arxiv';
 	public querys: SearchQuery[];
+	// 기본 0(아직 수집한 적 없음). File.readSubscriptions가 저장된 값(또는 구버전 전역
+	// 커서에서 마이그레이션한 값)으로 갈아끼운다.
+	public updateTime = 0;
 
 	// arXiv는 논문을 실시간이 아니라 배치로 공지한다. 특히 금요일 마감 이후 제출분은
 	// 월요일에야 뜨는 주말 갭이 있어, 최소 그 갭(~3일)을 덮어야 한다. 4일로 여유를 더 뒀다

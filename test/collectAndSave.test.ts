@@ -131,10 +131,13 @@ function writeSubscriptionsFile(queries: string[], updateTime?: number): void {
 	vault.files.set(
 		`${PLUGIN_DIR}/Subscriptions.json`,
 		JSON.stringify({
-			updateTime,
+			// 커서(updateTime)는 구독마다 독립이다 — 여기서는 넘겨받은 값을 모든 항목에
+			// 똑같이 싣는다. 지금까지의 커서 테스트는 전부 구독 하나짜리(queries.length===1)라
+			// "그 하나의 커서"라는 의미로 그대로 통한다.
 			apis: queries.map((query) => ({
 				apiName: 'arxiv',
 				querys: [{ searchType: 'keyword', query }],
+				updateTime,
 			})),
 		}),
 	);
@@ -169,10 +172,13 @@ function requestedWindow(): { from: string; to: string } {
 	return { from: matched[1] ?? '', to: matched[2] ?? '' };
 }
 
+// 구독이 하나뿐인 테스트에서 "그 구독의 커서"를 읽는다. 커서가 구독마다 독립이 된 뒤로
+// 파일에 top-level updateTime이 없다 — apis[0].updateTime을 본다.
 function storedSubscriptions(): { updateTime?: number } {
 	const raw = vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`);
 	assert.ok(raw !== undefined, 'Subscriptions.json이 저장되지 않았다');
-	return JSON.parse(raw) as { updateTime?: number };
+	const data = JSON.parse(raw) as { apis?: { updateTime?: number }[] };
+	return { updateTime: data.apis?.[0]?.updateTime };
 }
 
 beforeEach(() => {
@@ -644,6 +650,94 @@ describe('CollectAndSave.run — 커서', () => {
 		);
 		assert.equal(new Date(updateTime).getUTCFullYear(), 2025);
 	});
+
+	it('구독마다 독립된 커서로 서로 다른 구간을 훑는다', async () => {
+		// 새 구독(cursor=0)과 이미 진행 중이던 구독(cursor=일주일 전)을 함께 등록한다.
+		// 예전(전역 커서 하나)이었다면 둘 다 같은 구간을 훑거나, 둘 중 하나가 서로의
+		// 진행 상황에 끌려다녔다.
+		const advancedCursor = Date.now() - 7 * 24 * 60 * 60 * 1000;
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'brand-new' }], updateTime: 0 },
+					{
+						apiName: 'arxiv',
+						querys: [{ searchType: 'keyword', query: 'already-running' }],
+						updateTime: advancedCursor,
+					},
+				],
+			}),
+		);
+		arxivOnly(feed([], 0));
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).run('recent');
+
+		const requests = recordedRequests().filter((r) => r.url.includes('arxiv.org'));
+		const windowFor = (query: string): { from: string; to: string } => {
+			const url = requests.find((r) => decodeURIComponent(r.url).includes(query))?.url ?? '';
+			const q = decodeURIComponent(url).replace(/\+/g, ' ');
+			const matched = /submittedDate:\[(\d{12}) TO (\d{12})\]/.exec(q);
+			assert.ok(matched, `${query} 요청에 날짜 구간이 없다: ${q}`);
+			return { from: matched[1] ?? '', to: matched[2] ?? '' };
+		};
+
+		// 새 구독은 "지금"에서 4일 물러난 지점부터, 진행 중이던 구독은 자기 커서(일주일 전)
+		// 에서 4일 물러난 지점부터 — 서로 다른 from이어야 한다.
+		const newSub = windowFor('brand-new');
+		const runningSub = windowFor('already-running');
+		assert.notEqual(newSub.from, runningSub.from, '두 구독이 같은 구간을 훑었다');
+
+		// 저장된 결과도 각자의 커서로 따로 갱신된다.
+		const stored = JSON.parse(
+			vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}',
+		) as { apis: { querys: { query: string }[]; updateTime: number }[] };
+		const cursorFor = (query: string): number | undefined =>
+			stored.apis.find((api) => api.querys[0]?.query === query)?.updateTime;
+
+		assert.ok((cursorFor('brand-new') ?? 0) > 0, '새 구독의 커서가 안 움직였다');
+		assert.ok(
+			(cursorFor('already-running') ?? 0) > advancedCursor,
+			'진행 중이던 구독의 커서가 안 움직였다',
+		);
+	});
+
+	it('한 구독이 실패해도 앞서 성공한 구독의 커서는 갱신되지 않는다 — 보수적 동작', async () => {
+		// collect()는 예외가 나면 그때까지 모은 cursorUpdates를 호출자에게 못 넘긴다.
+		// 부분 갱신을 허용하면 실패한 구독을 재시도할 때 성공했던 구독까지 다시 도는
+		// 낭비는 없지만, "이번 실행이 정말 끝까지 끝났다"는 보장이 흐려진다 — 기존
+		// advanceCursor의 전체-성공-후-일괄 방식을 그대로 유지한다.
+		let call = 0;
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			call += 1;
+			if (call === 1) {
+				return response(200, feed([], 0)); // 첫 구독은 성공
+			}
+			return response(500, 'boom'); // 두 번째 구독은 실패
+		});
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'succeeds' }], updateTime: 0 },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'fails' }], updateTime: 0 },
+				],
+			}),
+		);
+		const { embedding } = fakeEmbedding();
+
+		await assert.rejects(() => collectFlow(embedding).run('recent'));
+
+		const stored = JSON.parse(
+			vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}',
+		) as { apis: { querys: { query: string }[]; updateTime: number }[] };
+		const succeeded = stored.apis.find((api) => api.querys[0]?.query === 'succeeds');
+		assert.equal(succeeded?.updateTime, 0, '실패한 실행인데 일부 구독의 커서가 갱신됐다');
+	});
 });
 
 // ── 재스캔 시 이미 아는 인용수는 S2에 다시 묻지 않는다 (knownCitations) ─────
@@ -978,11 +1072,6 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 		assert.deepEqual(subscriptions.apis, []);
 	});
 
-	it('updateTime도 undefined로 두지 않는다 — 파일이 있을 때와 같은 모양이어야 한다', async () => {
-		const subscriptions = await File.readSubscriptions();
-		assert.equal(subscriptions.updateTime, 0);
-	});
-
 	it('모르는 apiName이 저장돼 있으면 조용히 넘기지 않고 throw한다', async () => {
 		// 이 버전이 모르는 API로 저장된 파일(팀원이 새 API를 추가한 브랜치에서 저장 등).
 		// 조용히 빈 목록을 돌려주면 그 위에 저장이 일어나 기존 구독이 사라지므로,
@@ -992,6 +1081,114 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 			JSON.stringify({ updateTime: 123, apis: [{ apiName: 'pubmed', querys: [] }] }),
 		);
 		await assert.rejects(() => File.readSubscriptions(), /Unknown apiName: pubmed/);
+	});
+});
+
+// ── 구독별 커서 ─────────────────────────────────────────────────────
+// 커서(updateTime)는 Subscriptions 전체가 아니라 구독(API 인스턴스)마다 따로 갖는다.
+// 새 구독을 추가해도 다른 구독의 진행 상황을 건드리지 않고, 구독이 배열에서 옮겨져도
+// (추가/삭제) 커서가 그 구독을 계속 따라가야 한다.
+describe('File.readSubscriptions/writeSubscriptions — 구독별 커서', () => {
+	it('구독마다 커서를 따로 저장하고 따로 복원한다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 111 },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }], updateTime: 222 },
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis[0]?.updateTime, 111);
+		assert.equal(subscriptions.apis[1]?.updateTime, 222);
+	});
+
+	it('구버전 파일(전역 updateTime 하나)을 읽으면 모든 구독이 그 값을 커서로 물려받는다', async () => {
+		// 커서 형식이 바뀌었다고 갑자기 전체를 다시 backfill하면 안 된다 — 마이그레이션은
+		// "예전과 같은 지점부터 이어서 훑는다"가 목표다.
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				updateTime: 999,
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }] },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }] },
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis[0]?.updateTime, 999);
+		assert.equal(subscriptions.apis[1]?.updateTime, 999);
+	});
+
+	it('구독을 추가해도 기존 구독의 커서는 그대로 저장된다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'old' }], updateTime: 555 },
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'new' }]));
+		await File.writeSubscriptions(subscriptions);
+
+		const reread = await File.readSubscriptions();
+		assert.equal(reread.apis[0]?.updateTime, 555, '기존 구독의 커서가 바뀌었다');
+		assert.equal(reread.apis[1]?.updateTime, 0, '새 구독은 아직 수집한 적 없는 상태여야 한다');
+	});
+
+	describe('File.updateApiCursors', () => {
+		it('apiName+querys가 일치하는 구독만 커서를 갱신한다', async () => {
+			vault.files.set(
+				`${PLUGIN_DIR}/Subscriptions.json`,
+				JSON.stringify({
+					apis: [
+						{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 1 },
+						{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }], updateTime: 2 },
+					],
+				}),
+			);
+
+			await File.updateApiCursors([
+				{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], cursor: 100 },
+			]);
+
+			const subscriptions = await File.readSubscriptions();
+			assert.equal(subscriptions.apis[0]?.updateTime, 100, '대상 구독의 커서가 안 바뀌었다');
+			assert.equal(subscriptions.apis[1]?.updateTime, 2, '대상 아닌 구독의 커서가 바뀌었다');
+		});
+
+		it('수집 도중 추가된 구독을 덮어쓰지 않는다 — lost-update 회귀', async () => {
+			vault.files.set(
+				`${PLUGIN_DIR}/Subscriptions.json`,
+				JSON.stringify({
+					apis: [
+						{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 0 },
+					],
+				}),
+			);
+
+			// 수집이 도는 동안(File.updateApiCursors를 부르기 전에) 사용자가 구독을 추가했다고
+			// 가정한다.
+			const midFlight = await File.readSubscriptions();
+			midFlight.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'added-mid-run' }]));
+			await File.writeSubscriptions(midFlight);
+
+			await File.updateApiCursors([
+				{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], cursor: 42 },
+			]);
+
+			const after = await File.readSubscriptions();
+			const queries = after.apis.flatMap((api) => api.querys.map((q) => q.query));
+			assert.ok(queries.includes('added-mid-run'), '수집 중 추가된 구독이 사라졌다');
+			assert.equal(after.apis[0]?.updateTime, 42);
+		});
 	});
 });
 

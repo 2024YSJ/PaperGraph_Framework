@@ -195,7 +195,8 @@ export class FileTestModal extends Modal {
 							// 테스트는 arxiv API로 고정. createApi로 만들어야 저장→복원 왕복이 된다.
 							subscriptions.apis.push(File.createApi('arxiv', [query]));
 						}
-						subscriptions.updateTime = Date.now();
+						// 커서(updateTime)는 이제 구독마다 독립이라(API.updateTime) 여기서 만질
+						// 값이 없다 — 새로 만든 구독은 기본값 0(아직 수집한 적 없음)으로 시작한다.
 						// secret은 File.writeSubscriptions가 저장에서 제외하므로 여기서 설정하지 않는다.
 						await File.writeSubscriptions(subscriptions);
 						new Notice(`Subscriptions 저장됨: ${query.searchType}/${query.query}`);

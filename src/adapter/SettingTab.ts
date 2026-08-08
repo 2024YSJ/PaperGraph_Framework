@@ -179,6 +179,11 @@ interface ApiDraft {
 	conditions: { searchType: ConditionType; query: string }[];
 	newConditionType: ConditionType;
 	newConditionQuery: string;
+	// 이 구독의 수집 커서(API.updateTime). persistSubscriptions가 apiDrafts로부터 API
+	// 인스턴스를 다시 만들 때 그대로 실어 보내야 한다 — 안 그러면 File.createApi가 만든
+	// 새 인스턴스가 기본값 0으로 시작해, UI에서 조건 하나만 고쳐도 그 구독의 진행 상황이
+	// 전부 사라지고 처음부터 다시 훑게 된다.
+	updateTime: number;
 }
 
 // 한 구독(API 하나)에 걸 수 있는 조건 수 상한 — 004의 "조건 최대 3개, 전부 AND" 규칙.
@@ -643,6 +648,7 @@ export class SettingTab extends PluginSettingTab {
 							conditions: [],
 							newConditionType: 'keyword',
 							newConditionQuery: '',
+							updateTime: 0, // 새 구독 — 아직 수집한 적 없음
 						});
 						// 여기서는 수집을 걸지 않는다 — 방금 추가한 API는 조건이 0개라
 						// 수집하면 "querys is empty"로 반드시 실패한다. 조건이 하나라도
@@ -787,6 +793,7 @@ export class SettingTab extends PluginSettingTab {
 				})),
 				newConditionType: 'keyword',
 				newConditionQuery: '',
+				updateTime: api.updateTime,
 			}));
 			this.subscriptionsUnreadable = false;
 		} catch (e) {
@@ -822,8 +829,12 @@ export class SettingTab extends PluginSettingTab {
 		await File.writeSecret(secret);
 	}
 
-	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다 —
-	// updateTime(수집 커서)을 UI 저장이 덮어쓰면 다음 수집 구간이 틀어진다.
+	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다.
+	//
+	// draft.updateTime을 새로 만든 API 인스턴스에 그대로 실어야 한다 — File.createApi가
+	// 만드는 인스턴스는 기본값 0으로 시작하므로, 이걸 빼먹으면 조건 하나만 고쳐도 그
+	// 구독의 커서(수집 진행 상황)가 사라지고 처음부터 다시 훑게 된다. loadSubscriptions가
+	// draft를 만들 때 이미 저장된 updateTime을 담아 두고, 여기서는 그 값을 그대로 돌려준다.
 	private async persistSubscriptions(): Promise<void> {
 		if (this.subscriptionsUnreadable) {
 			new Notice(
@@ -833,12 +844,14 @@ export class SettingTab extends PluginSettingTab {
 		}
 		try {
 			const subscriptions = await File.readSubscriptions();
-			subscriptions.apis = this.apiDrafts.map((draft) =>
-				File.createApi(
+			subscriptions.apis = this.apiDrafts.map((draft) => {
+				const api = File.createApi(
 					draft.apiName,
 					draft.conditions.map((c): SearchQuery => ({ searchType: c.searchType, query: c.query })),
-				),
-			);
+				);
+				api.updateTime = draft.updateTime;
+				return api;
+			});
 			await File.writeSubscriptions(subscriptions);
 		} catch (e) {
 			new Notice(`구독 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
