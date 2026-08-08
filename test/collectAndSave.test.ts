@@ -11,7 +11,14 @@ import type { Middleware } from '../src/common/Middleware';
 import { Paper } from '../src/collect/Paper';
 import { S2_SECRET_PROVIDER } from '../src/collect/API';
 import { mockRequests, recordedRequests, response } from './stubs/obsidian';
-import { entries, entry, feed, installDomParser, withFastTimers } from './helpers/arxivFixtures';
+import {
+	entries,
+	entry,
+	feed,
+	installDomParser,
+	queryParams,
+	withFastTimers,
+} from './helpers/arxivFixtures';
 import { VaultStub } from './helpers/vaultStub';
 
 // 네트워크(requestUrl)와 Vault만 대역이고 나머지는 전부 실제 코드가 도는 통합 테스트.
@@ -24,6 +31,10 @@ installDomParser();
 // File은 init()으로 받은 경로를 그대로 쓰므로 테스트에서는 아무 값이나 상관없다.
 const PLUGIN_DIR = 'test-plugin-dir/papergraph3d';
 
+// Backfill 테스트가 쓰는 구간. 값 자체에 의미는 없고 유효한 범위이기만 하면 된다.
+const FROM_MS = Date.UTC(2025, 0, 1);
+const TO_MS = Date.UTC(2025, 0, 31);
+
 let vault: VaultStub;
 
 // ── 대역 Embedding ───────────────────────────────────────────────────
@@ -35,7 +46,19 @@ interface EmbeddingSpy {
 	resetCount: number;
 	installed: boolean;
 	failOn?: (title: string) => boolean;
+	// 연속 실패 몇 번에 브레이커가 열리는지, 열리면 남은 쿨다운은 얼마인지.
+	// 0이면 아예 안 열린다(대부분의 테스트가 신경 쓸 필요 없는 기본값).
+	tripCooldownMs: number;
+	// true면 기다려도 안 풀린다(모델이 회복 불가능한 상태). false면 호출자가 쿨다운을
+	// 확인하고 기다린 것으로 보고 풀린다 — 실제로는 시간이 지나 끝나는 것인데,
+	// withFastTimers가 대기를 0ms로 만들어 시계로는 재현할 수 없다.
+	cooldownPersists: boolean;
+	// 지금 남은 쿨다운(ms). 테스트가 직접 만질 일은 없다 — 실패가 쌓이면 열린다.
+	cooldownMs: number;
 }
+
+// 실제 Embedding과 같은 값 (Embedding.FAILURE_LIMIT).
+const FAKE_FAILURE_LIMIT = 3;
 
 function fakeEmbedding(overrides: Partial<EmbeddingSpy> = {}): {
 	spy: EmbeddingSpy;
@@ -46,16 +69,35 @@ function fakeEmbedding(overrides: Partial<EmbeddingSpy> = {}): {
 		maxConcurrent: 0,
 		resetCount: 0,
 		installed: true,
+		tripCooldownMs: 0,
+		cooldownPersists: false,
+		cooldownMs: 0,
 		...overrides,
 	};
 	let inFlight = 0;
+	let consecutiveFailures = 0;
 
 	const embedding = {
 		isModelInstalled: () => Promise.resolve(spy.installed),
 		resetCircuitBreaker: () => {
 			spy.resetCount += 1;
+			spy.cooldownMs = 0;
+			consecutiveFailures = 0;
+		},
+		get breakerCooldownRemainingMs(): number {
+			const remaining = spy.cooldownMs;
+			if (!spy.cooldownPersists) {
+				// 호출자가 이 값을 보고 기다릴 것이므로, 그 뒤에는 풀린 상태가 된다.
+				spy.cooldownMs = 0;
+				consecutiveFailures = 0;
+			}
+			return remaining;
 		},
 		embed: async (title: string) => {
+			// 브레이커가 열려 있으면 실제 Embedding도 시도조차 않고 즉시 throw한다.
+			if (spy.cooldownMs > 0) {
+				throw new Error('PaperGraph3D: 임베딩이 반복 실패해 잠시 중단된 상태입니다.');
+			}
 			inFlight += 1;
 			spy.maxConcurrent = Math.max(spy.maxConcurrent, inFlight);
 			spy.calls.push(title);
@@ -63,8 +105,14 @@ function fakeEmbedding(overrides: Partial<EmbeddingSpy> = {}): {
 			await Promise.resolve();
 			inFlight -= 1;
 			if (spy.failOn?.(title) === true) {
+				// 연속 실패가 쌓이면 브레이커가 열린다 — 실제 Embedding.recordFailure와 같은 규칙.
+				consecutiveFailures += 1;
+				if (spy.tripCooldownMs > 0 && consecutiveFailures >= FAKE_FAILURE_LIMIT) {
+					spy.cooldownMs = spy.tripCooldownMs;
+				}
 				throw new Error(`임베딩 실패: ${title}`);
 			}
+			consecutiveFailures = 0;
 			return {
 				embedding: [0.1, 0.2, 0.3],
 				embeddingModel: 'test-model',
@@ -1089,5 +1137,126 @@ describe('CollectAndSave — 수집 중 추가된 구독 보존', () => {
 			`수집 중 추가된 구독이 커서 저장에 덮여 사라졌다: ${JSON.stringify(queries)}`,
 		);
 		assert.ok(queries.includes('original'), '기존 구독까지 사라졌다');
+	});
+});
+
+// ── 청크 단위 점진 저장 ────────────────────────────────────────────────
+// Backfill 상한이 사라지면서 "전량을 다 받은 뒤에 저장"은 못 쓰게 됐다. 수만 편을
+// 메모리에 들고 있어야 하고, 마지막에 실패하면 그때까지 받은 게 전부 사라진다.
+describe('CollectAndSave — 청크 단위로 저장한다', () => {
+	it('수집 도중 네트워크가 끊겨도 그 전까지 받은 청크는 이미 저장돼 있다', async () => {
+		writeSubscriptionsFile(['partial']);
+		const { embedding } = fakeEmbedding();
+
+		// 1·2페이지는 정상(각 100건), 3페이지에서 500. 500은 재시도 대상이 아니라 즉시 throw다.
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			const start = Number(queryParams(param.url).get('start'));
+			if (start >= 200) {
+				return response(500, 'boom');
+			}
+			return response(200, feed(entries(100, start), 500));
+		});
+
+		await assert.rejects(() =>
+			withFastTimers(() =>
+				collectFlow(embedding).run('backfill', { from: FROM_MS, to: TO_MS }),
+			),
+		);
+
+		// 예전 구조라면 여기서 0편이었다 — 전량을 모은 뒤에야 저장했기 때문이다.
+		assert.equal(
+			vault.storedPapers().length,
+			200,
+			'실패 전에 받은 청크가 저장되지 않았다 — 점진 저장이 동작하지 않는다',
+		);
+	});
+
+	it('페이지가 나뉘어도 all 미들웨어가 청크마다 불리고 총합은 전체 편수와 같다', async () => {
+		writeSubscriptionsFile(['chunked']);
+		const { embedding } = fakeEmbedding();
+
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			const start = Number(queryParams(param.url).get('start'));
+			// 총 250건: 100 + 100 + 50
+			const remaining = Math.max(0, 250 - start);
+			return response(200, feed(entries(Math.min(100, remaining), start), 250));
+		});
+
+		const chunkSizes: number[] = [];
+		const observer: Middleware = {
+			type: 'all',
+			run: (context) => {
+				chunkSizes.push((context as Paper[]).length);
+			},
+		};
+
+		await withFastTimers(() =>
+			collectFlow(embedding, [observer]).run('backfill', { from: FROM_MS, to: TO_MS }),
+		);
+
+		assert.ok(chunkSizes.length > 1, `청크가 하나뿐이다: ${chunkSizes.join(',')}`);
+		assert.equal(
+			chunkSizes.reduce((sum, n) => sum + n, 0),
+			250,
+			'청크 합계가 전체 편수와 다르다',
+		);
+		assert.equal(vault.storedPapers().length, 250);
+	});
+});
+
+// ── 임베딩 서킷브레이커 ────────────────────────────────────────────────
+// 브레이커가 열리면 embed()는 시도조차 안 하고 즉시 throw한다. 그대로 두면 남은 논문이
+// 몇 초 만에 전부 빈 벡터로 저장된다.
+describe('CollectAndSave — 임베딩 서킷브레이커', () => {
+	it('브레이커가 열리면 쿨다운을 기다렸다 재개한다 — 남은 논문을 즉시 실패로 흘리지 않는다', async () => {
+		arxivOnly(feed(entries(6), 6));
+		writeSubscriptionsFile(['breaker']);
+
+		// 앞 3편이 연달아 실패해 브레이커가 열리고, 기다리면 풀린다.
+		const failing = new Set(['Paper 0', 'Paper 1', 'Paper 2']);
+		const { embedding, spy } = fakeEmbedding({
+			failOn: (title) => failing.has(title),
+			tripCooldownMs: 60_000,
+			cooldownPersists: false,
+		});
+
+		await withFastTimers(() => collectFlow(embedding).run('recent', { hours: 24 }));
+
+		// 기다린 뒤 나머지가 정상적으로 임베딩됐어야 한다 — 브레이커가 열렸다고 남은
+		// 논문을 전부 빈 벡터로 흘려보내면 안 된다.
+		assert.deepEqual(spy.calls, ['Paper 0', 'Paper 1', 'Paper 2', 'Paper 3', 'Paper 4', 'Paper 5']);
+		const succeeded = vault.storedPapers().filter((s) => s.paper.embeddingSucceeded);
+		assert.equal(succeeded.length, 3, '쿨다운 후 임베딩이 재개되지 않았다');
+	});
+
+	it('계속 열려 있으면 무한정 기다리지 않고 포기하되, 메타데이터는 저장한다', async () => {
+		arxivOnly(feed(entries(8), 8));
+		writeSubscriptionsFile(['breaker-stuck']);
+
+		// 전부 실패하고 기다려도 안 풀린다 = 모델이 회복 불가능한 상태.
+		const { embedding, spy } = fakeEmbedding({
+			failOn: () => true,
+			tripCooldownMs: 60_000,
+			cooldownPersists: true,
+		});
+
+		await withFastTimers(() => collectFlow(embedding).run('recent', { hours: 24 }));
+
+		// 브레이커가 열린 뒤로는 embed를 더 부르지 않는다. 논문마다 1분씩 서면 수집이
+		// 사실상 멈추므로, 몇 번 기다려보고 포기해야 한다.
+		assert.equal(
+			spy.calls.length,
+			FAKE_FAILURE_LIMIT,
+			`브레이커가 열린 뒤에도 계속 시도했다: ${spy.calls.length}회`,
+		);
+		// 임베딩은 실패했어도 논문 자체는 저장된다(보정 패스가 벡터를 채운다).
+		assert.equal(vault.storedPapers().length, 8, '임베딩 실패로 논문까지 버려졌다');
+		assert.ok(vault.storedPapers().every((stored) => !stored.paper.embeddingSucceeded));
 	});
 });

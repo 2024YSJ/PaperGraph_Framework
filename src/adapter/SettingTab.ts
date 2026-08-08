@@ -694,7 +694,15 @@ export class SettingTab extends PluginSettingTab {
 				this.activeFlow = undefined;
 			}
 		}
-		return flow.collected !== undefined ? `${flow.collected}편 수집` : undefined;
+		if (flow.collected === undefined) {
+			return undefined;
+		}
+		// 임베딩 실패는 수집을 멈추지 않으므로, 알리지 않으면 사용자는 벡터가 빈 논문이
+		// 쌓인 걸 모른다. 복구 방법(보정)까지 같이 말한다.
+		const failed = this.plugin.collectflow.lastStats?.embedFailed ?? 0;
+		return failed > 0
+			? `${flow.collected}편 수집, 그중 ${failed}편 임베딩 실패 — 「보정」으로 재시도하세요`
+			: `${flow.collected}편 수집`;
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는
@@ -711,6 +719,9 @@ export class SettingTab extends PluginSettingTab {
 		this.diagnosticsRegistered = true;
 		// 미들웨어는 플러그인 수명 내내 등록된 채로 남는다. 갱신 대상은 항상 "지금 실행 중인
 		// 흐름"이고, 그게 없으면(예: 보정처럼 진행률을 안 쓰는 작업) 아무 일도 하지 않는다.
+		// 'all'은 이제 수집 전체가 아니라 **청크마다** 불린다(CollectAndSave.processChunk).
+		// 그래서 총계를 갈아끼우지 않고 더한다 — 분모가 수집이 진행되면서 커지는 형태다.
+		// 갈아끼우면 청크가 바뀔 때마다 "0/100"으로 되돌아간다.
 		this.plugin.collectflow.setMiddleware({
 			type: 'all',
 			run: (context) => {
@@ -719,9 +730,8 @@ export class SettingTab extends PluginSettingTab {
 				if (!flow) {
 					return;
 				}
-				flow.collected = papers.length;
-				flow.done = 0;
-				flow.total = papers.length;
+				flow.total = (flow.total < 0 ? 0 : flow.total) + papers.length;
+				flow.collected = (flow.collected ?? 0) + papers.length;
 				this.updateProgress(flow);
 			},
 		});

@@ -499,10 +499,19 @@ export class Embedding {
 	// 아직 없어 아무도 resetCircuitBreaker()를 호출해주지 않아도, 이 쿨다운이 없으면 한 번
 	// 트립된 뒤로 영구히 실패만 반환하게 된다 (003-embedding-model.md 참고).
 	private breakerBlocksAttempt(): boolean {
+		return this.breakerCooldownRemainingMs > 0;
+	}
+
+	// 지금 embed()를 부르면 시도조차 못 하고 실패할 때, 남은 쿨다운(ms). 아니면 0.
+	//
+	// 호출자가 "지금은 불러봐야 소용없다"를 알아야 하는 이유: 트립된 상태에서 embed()는
+	// 즉시 throw하므로, 남은 논문이 수천 편이면 몇 초 만에 전부 빈 벡터로 저장된다.
+	// 이 값을 보고 한 번 기다렸다 재개하면 "수천 편 조용한 실패"가 "한 번의 정지"가 된다.
+	get breakerCooldownRemainingMs(): number {
 		if (this.consecutiveFailures < Embedding.FAILURE_LIMIT || this.breakerTrippedAt === undefined) {
-			return false;
+			return 0;
 		}
-		return Date.now() - this.breakerTrippedAt < Embedding.BREAKER_COOLDOWN_MS;
+		return Math.max(0, Embedding.BREAKER_COOLDOWN_MS - (Date.now() - this.breakerTrippedAt));
 	}
 
 	private recordSuccess(): void {

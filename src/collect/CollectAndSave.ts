@@ -3,7 +3,8 @@ import { Embedding } from './Embedding';
 import { Middleware } from '../common/Middleware';
 import { File } from '../common/File';
 import { Log } from '../common/Log';
-import { API } from './API';
+import { API, type CollectOptions } from './API';
+import { delay } from './ApiSupport';
 import { Paper } from './Paper';
 
 // run()의 실제 수집 범위는 원래 Subscriptions(API별 SearchQuery)에서 읽어와야 하지만,
@@ -24,6 +25,18 @@ interface CollectWindow {
 	from: number;
 	to: number;
 	advancesCursor: boolean;
+}
+
+// 한 번의 수집 실행이 무엇을 했는지. 청크 단위로 처리하면서 누적한다.
+export interface CollectStats {
+	collected: number;
+	// 벡터가 빈 채로 저장된 논문 수. 임베딩 실패는 수집을 멈추지 않지만([3] 정책과 같은
+	// 취지 — 메타데이터는 살린다), 조용히 넘어가면 사용자가 알 방법이 없어 집계해 알린다.
+	embedFailed: number;
+	// 서킷브레이커 쿨다운을 기다린 횟수, 그리고 이번 실행에서 임베딩을 포기했는지.
+	// embedOrReuse 주석 참고.
+	embedWaits: number;
+	embedGaveUp: boolean;
 }
 
 // 큐에 들어간 작업의 종류. UI가 "무엇이 돌고 있는지"를 표시하는 데 쓴다.
@@ -63,6 +76,13 @@ export class CollectAndSave {
 	private queueListeners: ((state: CollectQueueState) => void)[] = [];
 	// 아직 시작하지 않은 recent 작업. 합침(coalescing) 대상이다 — 아래 requestRecent 참고.
 	private pendingRecent: Promise<void> | undefined;
+
+	// 직전 수집 실행의 집계. UI가 완료 문구를 만들 때 읽는다(run()은 void를 반환하므로).
+	lastStats: CollectStats | undefined;
+
+	// 한 실행에서 서킷브레이커 쿨다운을 몇 번까지 기다려줄지. 이 횟수를 넘으면 모델이
+	// 회복 불가능한 상태라고 보고 임베딩을 포기한다 — embedOrReuse 주석 참고.
+	private static readonly MAX_BREAKER_WAITS = 2;
 
 	get isBusy(): boolean {
 		return this.activeJob !== undefined;
@@ -215,21 +235,57 @@ export class CollectAndSave {
 			advancesCursor: window.advancesCursor,
 			apis: apis.map((api) => api.apiName),
 		});
-		const papers = await this.collect(apis, window);
-		Log.info('collect', '수집 완료 — 임베딩/저장 시작', { papers: papers.length });
+		this.embedding.resetCircuitBreaker();
+		const stats: CollectStats = {
+			collected: 0,
+			embedFailed: 0,
+			embedWaits: 0,
+			embedGaveUp: false,
+		};
+		let chunks = 0;
+		await this.collect(apis, window, (chunk) => {
+			chunks += 1;
+			return this.processChunk(chunk, stats);
+		});
+		if (chunks === 0) {
+			// 한 편도 안 걸린 실행에서도 'all'은 빈 배열로 한 번 불린다. 미들웨어가 실행마다
+			// 반드시 한 번은 호출된다는 보장이 없으면, 실행 단위로 초기화하는 미들웨어가
+			// "논문이 0편인 실행"에서 조용히 건너뛰어진다.
+			await this.processChunk([], stats);
+		}
 
-		// 'all' 미들웨어는 수집 결과 전체를 한 번 받는다. 받는 배열은 아래 루프가 그대로
-		// 쓰는 바로 그 배열이라, 미들웨어가 in-place로 항목을 덜어내면(splice 등) 이후
-		// 임베딩·저장 단계가 줄어든 목록을 본다 — 중복 제거가 이 자리에 미들웨어로 붙는다.
-		// (Middleware.run은 void를 반환하므로 새 배열을 돌려주는 방식은 쓸 수 없다.)
+		Log.info('collect', '임베딩/저장 완료', stats);
+		if (stats.embedFailed > 0) {
+			// 조용히 넘어가면 사용자는 벡터가 빈 논문이 쌓인 걸 모른다. 보정으로 복구된다.
+			Log.warn('collect', '임베딩에 실패한 논문이 있다 — 보정 패스로 재시도할 수 있다', stats);
+		}
+		this.lastStats = stats;
+
+		if (window.advancesCursor) {
+			await this.advanceCursor(apis, window.to);
+		}
+	}
+
+	// 청크 하나를 끝까지 처리한다: 미들웨어(all) -> loop { 임베딩 -> 미들웨어(forEach) -> 저장 }.
+	//
+	// 다이어그램의 흐름을 청크 단위로 한 번씩 도는 형태다. 전량을 모아 한 번에 도는 예전
+	// 방식은 Backfill 상한이 사라지면서 못 쓰게 됐다 — 5만 편을 다 받을 때까지 한 편도
+	// 저장되지 않고, 마지막에 실패하면 전부 버려진다.
+	//
+	// ⚠️ 계약 변화: 'all' 미들웨어가 수집 전체가 아니라 **청크마다** 불린다. 청크 안에서
+	// in-place로 항목을 덜어내는(splice) 방식은 그대로 동작하지만, 청크를 가로지르는 중복
+	// 제거가 필요하면 미들웨어가 자체 상태를 들고 있어야 한다.
+	private async processChunk(papers: Paper[], stats: CollectStats): Promise<void> {
 		await this.runMiddlewares('all', papers);
 
-		this.embedding.resetCircuitBreaker();
 		for (const paper of papers) {
 			// ⚠️ 반드시 순차 실행. embedOrReuse()가 실제로 새 임베딩을 계산할 때
 			// embed()는 세션/서킷브레이커 상태를 락 없이 공유하므로 Promise.all 등으로
 			// 병렬 호출하면 안 된다 (003 문서 "동시성 가정" 참고).
-			await this.embedOrReuse(paper);
+			await this.embedOrReuse(paper, stats);
+			if (!paper.embeddingSucceeded) {
+				stats.embedFailed += 1;
+			}
 			await this.runMiddlewares('forEach', paper);
 			// 저장 실패는 [1] 정책대로 전파하되, 어느 논문에서 끊겼는지는 남긴다 —
 			// 이게 없으면 "수집은 됐는데 파일이 일부만 있다"의 원인을 못 찾는다.
@@ -239,12 +295,7 @@ export class CollectAndSave {
 				Log.error('collect', '논문 저장 실패', error, { sourceId: paper.sourceId });
 				throw error;
 			}
-		}
-
-		Log.info('collect', '임베딩/저장 완료', { papers: papers.length });
-
-		if (window.advancesCursor) {
-			await this.advanceCursor(apis, window.to);
+			stats.collected += 1;
 		}
 	}
 
@@ -351,20 +402,49 @@ export class CollectAndSave {
 	// API를 순차로 돌며 수집한다. 병렬로 부르면 같은 호스트에 동시 요청이 나가 arXiv의
 	// 요청 간격 권고를 깨뜨린다. 수집 자체의 실패([1] 정책)는 그대로 전파한다.
 	//
-	// knownCitations를 수집 전에 한 번 읽어 모든 API 호출에 넘긴다 — 재스캔이 이전에 이미
-	// 보강을 끝낸 논문을 다시 잡아와도 S2 등 외부 API를 다시 두드리지 않게 하려는 목적이다
-	// (API.ts의 knownCitations 계약 참고).
-	private async collect(apis: API[], window: CollectWindow): Promise<Paper[]> {
-		const knownCitations = await File.readKnownCitations();
-		const collected: Paper[] = [];
+	// 논문을 모아서 받지 않고 청크가 나올 때마다 onChunk로 처리한다 — processChunk 주석 참고.
+	private async collect(
+		apis: API[],
+		window: CollectWindow,
+		onChunk: (papers: Paper[]) => Promise<void>,
+	): Promise<void> {
+		const options: CollectOptions = {
+			prefill: (papers) => this.prefillFromStore(papers),
+			onChunk,
+		};
 		for (const api of apis) {
-			const papers =
-				window.hours === undefined
-					? await api.Backfill(window.from, window.to, knownCitations)
-					: await api.SearchRecentPaper(window.hours, knownCitations);
-			collected.push(...papers);
+			if (window.hours === undefined) {
+				await api.Backfill(window.from, window.to, options);
+			} else {
+				await api.SearchRecentPaper(window.hours, options);
+			}
 		}
-		return collected;
+	}
+
+	// 저장본에 이미 있는 값을 청크에 얹는다. 재스캔 구간은 이전에 이미 처리한 논문을 다시
+	// 잡아오는데, 그 논문들에 대해 S2를 다시 두드리거나 임베딩을 다시 계산할 이유가 없다.
+	//
+	// 예전에는 수집 시작 전에 File.readKnownCitations()로 **코퍼스 전체**를 읽어 인용수
+	// 맵을 만들고, 그와 별개로 논문마다 readStoredPaper를 또 불렀다 — 같은 파일을 두 번
+	// 읽으면서 비용이 코퍼스 크기에 비례해 늘었다. 지금은 청크에 속한 논문만 한 번씩 읽어
+	// 인용수와 임베딩을 동시에 채운다. 전체 스캔이 사라지고 읽기 횟수는 늘지 않는다.
+	private async prefillFromStore(papers: Paper[]): Promise<void> {
+		for (const paper of papers) {
+			const stored = await File.readStoredPaper(paper);
+			if (!stored) {
+				continue;
+			}
+			if (stored.citationsKnown) {
+				paper.citationCount = stored.citationCount;
+				paper.citationsKnown = true;
+			}
+			if (stored.embeddingSucceeded) {
+				paper.embedding = stored.embedding;
+				paper.embeddingModel = stored.embeddingModel;
+				paper.embeddingSource = stored.embeddingSource;
+				paper.embeddingSucceeded = true;
+			}
+		}
 	}
 
 	// ── 미들웨어 ───────────────────────────────────────────────────
@@ -389,18 +469,47 @@ export class CollectAndSave {
 
 	// ── 논문 한 편 ─────────────────────────────────────────────────
 
-	// 저장된 논문이 이미 임베딩에 성공했으면 그 벡터를 재사용하고, 아니면 새로 임베딩한다.
-	// 재스캔 창(resolveWindow의 recentRescanWindowMs) 때문에 recent 수집은 매번 최근
-	// 논문을 다시 훑는데, 이 확인이 없으면 같은 논문을 실행마다 다시 임베딩하게 된다 —
-	// 파이프라인에서 가장 비싼 단계라 낭비가 크다. File.writePaperAt의 보존 규칙과
-	// 별개로(그건 안전망), 여기서 건너뛰어야 애초에 비용 자체가 안 든다.
-	private async embedOrReuse(paper: Paper): Promise<void> {
-		const stored = await File.readStoredPaper(paper);
-		if (stored?.embeddingSucceeded) {
-			paper.embedding = stored.embedding;
-			paper.embeddingModel = stored.embeddingModel;
-			paper.embeddingSource = stored.embeddingSource;
-			paper.embeddingSucceeded = true;
+	// 이미 벡터가 있으면 새로 계산하지 않는다. 재스캔 창(resolveWindow의
+	// recentRescanWindowMs) 때문에 recent 수집은 매번 최근 논문을 다시 훑는데, 이 확인이
+	// 없으면 같은 논문을 실행마다 다시 임베딩하게 된다 — 파이프라인에서 가장 비싼 단계라
+	// 낭비가 크다. File.writePaperAt의 보존 규칙과 별개로(그건 안전망), 여기서 건너뛰어야
+	// 애초에 비용 자체가 안 든다.
+	//
+	// 저장본을 읽는 일은 prefillFromStore가 청크 단위로 이미 해뒀다 — 여기서 또 읽으면
+	// 같은 파일을 두 번 읽는 셈이다.
+	private async embedOrReuse(paper: Paper, stats: CollectStats): Promise<void> {
+		if (paper.embeddingSucceeded) {
+			return;
+		}
+
+		// 서킷브레이커가 열려 있으면 embed()는 시도조차 안 하고 즉시 throw한다. 그대로
+		// 두면 남은 수천 편이 몇 초 만에 전부 빈 벡터로 저장된다 — 쿨다운을 한 번 기다려
+		// 모델이 회복할 기회를 준다.
+		//
+		// 다만 무한정 기다릴 수도 없다: 모델이 정말 망가진 상태라면 논문마다 1분씩 서게
+		// 되어 수집이 사실상 멈춘다. 몇 번 기다려도 안 되면 이번 실행에서는 임베딩을
+		// 포기하고 메타데이터만 저장한다 — 벡터는 보정 패스가 채운다.
+		if (!stats.embedGaveUp) {
+			const cooldownMs = this.embedding.breakerCooldownRemainingMs;
+			if (cooldownMs > 0) {
+				if (stats.embedWaits >= CollectAndSave.MAX_BREAKER_WAITS) {
+					stats.embedGaveUp = true;
+					Log.warn('collect', '임베딩이 계속 실패해 이번 실행에서는 포기한다 — 메타데이터만 저장', {
+						waits: stats.embedWaits,
+					});
+				} else {
+					stats.embedWaits += 1;
+					Log.warn('collect', '임베딩 서킷브레이커 열림 — 쿨다운을 기다린다', {
+						cooldownMs,
+						wait: stats.embedWaits,
+					});
+					await delay(cooldownMs);
+				}
+			}
+		}
+
+		if (stats.embedGaveUp) {
+			CollectAndSave.markEmbeddingFailed(paper);
 			return;
 		}
 		await this.embedOne(paper);
@@ -419,11 +528,17 @@ export class CollectAndSave {
 				sourceId: paper.sourceId,
 				error: error instanceof Error ? error.message : String(error),
 			});
-			paper.embedding = [];
-			paper.embeddingModel = '';
-			paper.embeddingSource = '';
-			paper.embeddingSucceeded = false;
+			CollectAndSave.markEmbeddingFailed(paper);
 		}
+	}
+
+	// "임베딩 안 됨"을 Paper에 명시적으로 남긴다. Paper.embedding이 non-nullable이라 빈
+	// 배열로 채우되, embeddingSucceeded=false가 보정 패스의 재시도 대상 표식이 된다.
+	private static markEmbeddingFailed(paper: Paper): void {
+		paper.embedding = [];
+		paper.embeddingModel = '';
+		paper.embeddingSource = '';
+		paper.embeddingSucceeded = false;
 	}
 
 	// ── 커서 ───────────────────────────────────────────────────────

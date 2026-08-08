@@ -33,9 +33,13 @@ const CONSOLE_PREFIX = '[PaperGraph]';
 export const LOG_FILE_NAME = 'collect-log.md';
 
 // 파일이 무한정 커지지 않게 하는 상한. 넘으면 앞쪽(오래된 쪽)을 잘라낸다 — 진단에 필요한
-// 건 대개 마지막 실행이라 뒤쪽을 남긴다.
-const MAX_LOG_BYTES = 2 * 1024 * 1024;
-const TRIM_TO_BYTES = 1 * 1024 * 1024;
+// 건 대개 마지막 실행이라 뒤쪽을 남긴다. 진단용 임시물이므로 넉넉히 잡을 이유가 없다.
+const MAX_LOG_BYTES = 512 * 1024;
+const TRIM_TO_BYTES = 256 * 1024;
+
+// 버퍼를 비우는 조건: 이만큼 쌓이면 즉시, 아니면 이 간격마다.
+const FLUSH_AT_LINES = 100;
+const FLUSH_INTERVAL_MS = 2_000;
 
 // 무엇이 들어와도 사람이 읽을 수 있는 한 줄로. 객체를 그냥 String()에 넣으면
 // "[object Object]"가 되어 아무 정보도 안 남으므로 JSON을 먼저 시도한다.
@@ -62,9 +66,12 @@ export class Log {
 	// 더럽히는 파일 쪽이지 콘솔이 아니다.
 	private static fileEnabled = true;
 
-	// append를 직렬화하는 체인. read-modify-write라 동시에 두 개가 돌면 서로를 덮어쓴다.
+	// 파일 쓰기를 직렬화하는 체인. read-modify-write라 동시에 두 개가 돌면 서로를 덮어쓴다.
 	// 수집은 순차 실행이지만 EnrichCitations 등 비동기 경로가 섞이므로 여기서 보장한다.
 	private static queue: Promise<void> = Promise.resolve();
+	// 아직 파일에 안 쓴 줄들 (scheduleFlush/flush 참고).
+	private static buffer: string[] = [];
+	private static flushTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// File.init과 같은 시점(main.ts init)에 불린다. 부르지 않으면 콘솔로만 나간다 —
 	// 로깅이 초기화 순서 때문에 터지는 일은 없어야 한다.
@@ -114,7 +121,13 @@ export class Log {
 		if (!vault) {
 			return;
 		}
-		// 큐에 실려 있던 append가 삭제 뒤에 도착해 파일을 되살리지 않도록 순서를 맞춘다.
+		// 아직 안 쓴 줄까지 버린다 — 안 그러면 지운 직후 다음 flush가 파일을 되살린다.
+		Log.buffer.length = 0;
+		if (Log.flushTimer !== undefined) {
+			clearTimeout(Log.flushTimer);
+			Log.flushTimer = undefined;
+		}
+		// 큐에 실려 있던 쓰기가 삭제 뒤에 도착해 파일을 되살리지 않도록 순서를 맞춘다.
 		Log.queue = Log.queue.then(async () => {
 			try {
 				const path = Log.filePath();
@@ -145,8 +158,12 @@ export class Log {
 			consoleMethod(`${CONSOLE_PREFIX} ${line}`, data);
 		}
 
-		if (Log.fileEnabled) {
-			void Log.append(line);
+		// debug는 파일에 남기지 않는다. 페이지마다 요청/응답 두 줄이 찍히는 arxiv.page가
+		// 전부 debug라, 대용량 Backfill이면 이것만으로 로그 파일이 수십 MB가 된다. 상세
+		// 추적이 필요하면 콘솔에서 보면 된다(콘솔에는 항상 나간다).
+		if (Log.fileEnabled && level !== 'debug') {
+			Log.buffer.push(line);
+			Log.scheduleFlush();
 		}
 	}
 
@@ -178,20 +195,45 @@ export class Log {
 		return error === undefined ? undefined : describe(error);
 	}
 
-	// ⚠️ 임시(삭제 예정) — vault에 파일을 남기는 유일한 지점. 프로덕션 기능이 아니라
-	// 원격 사용자에게서 로그를 받아보려고 넣은 테스트용 장치다.
-	private static append(line: string): Promise<void> {
+	// ⚠️ 임시(삭제 예정) — 아래 두 개가 vault에 파일을 남기는 유일한 지점. 프로덕션
+	// 기능이 아니라 원격 사용자에게서 로그를 받아보려고 넣은 테스트용 장치다.
+
+	// 모아 뒀다 한 번에 쓴다. adapter에는 append가 없어 매번 파일 전체를 읽고 다시 써야
+	// 하는데(read-modify-write), 줄마다 그러면 파일이 커질수록 한 줄 쓰는 비용이 파일
+	// 크기에 비례해 늘어난다. 수집 한 번에 수천 줄이 나올 수 있으므로 반드시 묶어야 한다.
+	private static scheduleFlush(): void {
+		if (Log.buffer.length >= FLUSH_AT_LINES) {
+			void Log.flush();
+			return;
+		}
+		if (Log.flushTimer !== undefined) {
+			return;
+		}
+		Log.flushTimer = setTimeout(() => {
+			Log.flushTimer = undefined;
+			void Log.flush();
+		}, FLUSH_INTERVAL_MS);
+	}
+
+	private static flush(): Promise<void> {
 		const vault = Log.vault;
-		if (!vault) {
+		if (!vault || Log.buffer.length === 0) {
 			return Promise.resolve();
 		}
+		// 버퍼를 먼저 비워, 쓰는 동안 들어온 줄이 다음 flush로 넘어가게 한다.
+		const lines = Log.buffer.splice(0, Log.buffer.length);
+		if (Log.flushTimer !== undefined) {
+			clearTimeout(Log.flushTimer);
+			Log.flushTimer = undefined;
+		}
+
 		Log.queue = Log.queue.then(async () => {
 			try {
 				const path = Log.filePath();
 				const existing = (await vault.adapter.exists(path))
 					? await vault.adapter.read(path)
 					: '';
-				let next = `${existing}${line}\n`;
+				let next = `${existing}${lines.join('\n')}\n`;
 				if (next.length > MAX_LOG_BYTES) {
 					// 잘린 지점이 줄 중간이면 첫 줄이 깨지므로 다음 줄바꿈까지 버린다.
 					const cut = next.length - TRIM_TO_BYTES;
