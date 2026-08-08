@@ -1,6 +1,7 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { File } from '../common/File';
+import { Log } from '../common/Log';
 import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
@@ -133,21 +134,27 @@ function isoDateInput(ms: number): string {
 // 호출부가 진단용 미들웨어로 건수를 따로 관측해 넘긴다 — 조건에 맞는 논문이 0편이라
 // 정상 종료된 것과 실제 오류를 구분하지 못하면 "성공 Notice는 떴는데 파일이 없다"는
 // 혼란이 생긴다.
+// 수집 계열 실행 하나를 요청한다. 실행 자체는 CollectAndSave의 직렬 큐가 맡으므로
+// 여기서는 잠그지 않는다 — 이미 다른 수집이 돌고 있으면 거절하는 대신 줄을 서고, 그
+// 사실만 사용자에게 알린다. (버튼을 비활성화하는 방식은 쓸 수 없다: display()가 다시
+// 그리면서 새 버튼을 만들면 잠금이 통째로 사라진다.)
 async function runCollectFlow(
 	label: string,
-	button: { setDisabled(disabled: boolean): unknown },
+	busy: boolean,
 	action: () => Promise<string | void>,
 ): Promise<void> {
-	button.setDisabled(true);
+	if (busy) {
+		new Notice(`${label}을(를) 대기열에 넣었습니다. 진행 중인 작업이 끝나면 실행됩니다.`);
+	}
+	Log.info('ui', `${label} 요청`, { queued: busy });
 	try {
 		const detail = await action();
 		new Notice(`${label}을(를) 마쳤습니다.${detail ? ` (${detail})` : ''}`);
+		Log.info('ui', `${label} 완료`, { detail });
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
 		new Notice(`${label} 실패: ${message}`);
-		console.error(`[PaperGraph3D] ${label} 실패`, e);
-	} finally {
-		button.setDisabled(false);
+		Log.error('ui', `${label} 실패`, e);
 	}
 }
 
@@ -177,6 +184,17 @@ interface ApiDraft {
 // 한 구독(API 하나)에 걸 수 있는 조건 수 상한 — 004의 "조건 최대 3개, 전부 AND" 규칙.
 const MAX_CONDITIONS_PER_API = 3;
 
+// 수집 요청 하나의 진행 상태. 큐 때문에 "요청했지만 아직 시작 안 한" 흐름이 동시에 여러 개
+// 있을 수 있어서, 인스턴스 필드가 아니라 요청마다 하나씩 만든다(runWithProgress 주석 참고).
+interface ProgressFlow {
+	label: string;
+	total: number; // -1이면 아직 모름
+	done: number;
+	started: boolean; // 큐에서 빠져나와 실제로 실행이 시작됐는가
+	collected: number | undefined; // 'all' 미들웨어가 알려준 수집 편수
+	notice: Notice | undefined;
+}
+
 // 구독 UI는 Subscriptions.json과 실시간 동기화된다: 열 때 읽어와 복원하고, 추가/삭제
 // 때마다 즉시 저장한다. 스타일은 임시지만 삭제 대상이 아니다 — CollectAndSave.run()이
 // 읽는 Subscriptions.json을 만드는 유일한 입력 경로다(확정 UI는 시각화 이후 별도 작업).
@@ -190,26 +208,80 @@ export class SettingTab extends PluginSettingTab {
 	// 저장된 구독을 읽지 못한 상태인가. 읽기에 실패했는데 저장을 허용하면, 화면의 빈
 	// 목록이 그대로 디스크를 덮어써 읽지 못했을 뿐 멀쩡히 있던 구독이 사라진다.
 	private subscriptionsUnreadable = false;
-	// 직전 run() 호출이 실제로 수집한 논문 수. run()은 다이어그램 계약상 void를
-	// 반환하므로, 'all' 미들웨어로 관측해 여기 담아둔다 — collectDiagnostics() 참고.
-	private lastCollectedCount: number | undefined;
 	private diagnosticsRegistered = false;
-	// 진행률 표시용. Notice는 버튼 핸들러가 만들어 여기 보관하고, 미들웨어는 이 필드가
-	// 있을 때만 갱신한다 — run()/repair() 자체는 Notice를 전혀 모른다(아래
-	// ensureCollectDiagnostics 주석 참고). Backfill/보정처럼 이 필드를 안 쓰는 실행 중에는
-	// undefined로 남아 미들웨어가 아무 것도 하지 않는다.
-	private progressNotice: Notice | undefined;
-	private progressDone = 0;
-	private progressTotal = 0;
+	// 지금 실제로 실행 중인 흐름. 미들웨어('all'/'forEach')는 이것만 갱신한다 — 큐가 한
+	// 번에 하나만 돌리므로 갱신 대상이 모호하지 않다. 없으면(보정처럼 진행률을 안 쓰는
+	// 작업, 또는 아무것도 안 도는 중) 미들웨어가 걸려도 아무 일도 하지 않는다.
+	private activeFlow: ProgressFlow | undefined;
+	// 큐 상태를 보여주는 자리. display()가 다시 그릴 때마다 새로 만들어지므로, 갱신은
+	// 항상 이 참조를 통해서 한다(없으면 아무 일도 안 함).
+	private queueStatusEl: HTMLElement | undefined;
+	private queueSubscribed = false;
 
 	constructor(app: App, plugin: PaperGraph3D) {
 		super(app, plugin);
 		this.plugin = plugin;
 	}
 
+	// 구독을 저장하고, 바뀐 조건으로 최근 논문을 한 번 훑도록 예약한다.
+	//
+	// 예약이지 즉시 실행이 아니다 — 자동 수집이 돌고 있으면 큐에 들어가 끝난 뒤에 실행된다.
+	// 조건을 연달아 다듬어도 CollectAndSave.requestRecent가 아직 시작 안 한 recent끼리
+	// 합쳐주므로 편집할 때마다 arXiv를 두드리지 않는다.
+	private async saveSubscriptionsAndCollect(): Promise<void> {
+		await this.persistSubscriptions();
+		if (this.subscriptionsUnreadable) {
+			return; // 저장 자체를 건너뛴 상태라 수집할 것도 없다
+		}
+		// 이미 예약된 recent가 있으면 requestRecent가 거기 합쳐준다. 그 경우 새 진행률
+		// Notice를 또 띄우면 한 번의 수집에 여러 개가 쌓이므로, 예약만 갱신하고 조용히 끝낸다.
+		if (this.plugin.collectflow.hasPendingRecent) {
+			void this.plugin.collectflow.requestRecent('구독 변경 반영');
+			return;
+		}
+		void runCollectFlow('구독 변경 반영', this.plugin.collectflow.isBusy, () =>
+			this.runWithProgress('구독 변경 반영', (onStart) =>
+				this.plugin.collectflow.requestRecent('구독 변경 반영', onStart),
+			),
+		);
+	}
+
+	// 큐 상태 구독은 플러그인 수명 동안 한 번만 — display()마다 붙이면 리스너가 쌓인다.
+	// 리스너는 queueStatusEl이 있을 때만 그리므로, 설정 탭이 닫혀 있어도 안전하다.
+	private ensureQueueSubscription(): void {
+		if (this.queueSubscribed) {
+			return;
+		}
+		this.queueSubscribed = true;
+		this.plugin.collectflow.onQueueChange(() => this.renderQueueStatus());
+	}
+
+	// 지금 무엇이 돌고 어떤 게 줄 서 있는지. display()가 다시 그린 직후에도 반드시 한 번
+	// 불러야 한다 — 안 그러면 재렌더된 화면이 실제 상태와 어긋난 채로 남는다.
+	private renderQueueStatus(): void {
+		const el = this.queueStatusEl;
+		if (!el) {
+			return;
+		}
+		const { active, waiting } = this.plugin.collectflow.queueState;
+		el.empty();
+		if (!active) {
+			el.createSpan({ text: '대기 중인 수집 작업 없음' });
+			return;
+		}
+		el.createSpan({
+			text:
+				waiting.length === 0
+					? `실행 중: ${active.label}`
+					: `실행 중: ${active.label} — 대기 ${waiting.length}건 (${waiting.map((job) => job.label).join(', ')})`,
+		});
+	}
+
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+		// empty()로 방금 버린 DOM을 계속 가리키고 있으면 갱신이 허공에 그려진다.
+		this.queueStatusEl = undefined;
 
 		// 저장된 구독은 비동기로만 읽을 수 있는데 display()는 동기다. 첫 렌더에서 로드를
 		// 걸어두고 끝나면 다시 그린다 — 이후 렌더부터는 캐시된 드래프트를 그대로 쓴다.
@@ -221,6 +293,7 @@ export class SettingTab extends PluginSettingTab {
 		// 미들웨어 등록은 한 번만 — 매번 등록하면 열 때마다 'all' 미들웨어가 쌓여 같은
 		// run() 호출에 대해 lastCollectedCount가 여러 번(마지막 값은 같아도) 덮어써진다.
 		this.ensureCollectDiagnostics();
+		this.ensureQueueSubscription();
 
 		new Setting(containerEl)
 			.setName('파이프라인 테스트')
@@ -243,9 +316,11 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('최근 논문')
 					.setCta()
 					.onClick(() => {
-						void runCollectFlow('최근 논문 수집', button, () => this.runWithProgress(() =>
-							this.plugin.collectflow.run('recent'),
-						));
+						void runCollectFlow('최근 논문 수집', this.plugin.collectflow.isBusy, () =>
+							this.runWithProgress('최근 논문 수집', (onStart) =>
+								this.plugin.collectflow.run('recent', undefined, onStart),
+							),
+						);
 					}),
 			)
 			.addButton((button) =>
@@ -280,17 +355,57 @@ export class SettingTab extends PluginSettingTab {
 							// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 							// "종료일 당일 포함"으로 맞춘다.
 							const to = toMidnight + 24 * 60 * 60 * 1000;
-							await runCollectFlow('Backfill', button, () => this.runWithProgress(() =>
-								this.plugin.collectflow.run('backfill', { from, to }),
-							));
+							await runCollectFlow('Backfill', this.plugin.collectflow.isBusy, () =>
+								this.runWithProgress('Backfill', (onStart) =>
+									this.plugin.collectflow.run('backfill', { from, to }, onStart),
+								),
+							);
 						},
 					).open();
 				}),
 			)
 			.addButton((button) =>
 				button.setButtonText('보정').onClick(() => {
-					void runCollectFlow('보정', button, () => this.plugin.collectflow.repair());
+					void runCollectFlow('보정', this.plugin.collectflow.isBusy, () =>
+						this.plugin.collectflow.repair(),
+					);
 				}),
+			);
+
+		// 큐 상태. 수집 버튼을 잠그는 대신 "지금 무엇이 돌고 무엇이 줄 서 있는지"를 보여준다.
+		new Setting(containerEl).setName('수집 대기열').then((setting) => {
+			this.queueStatusEl = setting.descEl;
+			this.renderQueueStatus();
+		});
+
+		// ⚠️ 임시 진단 UI — 삭제 예정. 수집이 조용히 끊기는 원인을 잡으려고 넣은
+		// 테스트/디버깅용이며, 프로덕션 기능이 아니다. 원인이 잡히면 이 Setting 블록을
+		// 통째로 지운다 (src/common/Log.ts 상단 "지우는 법" 참고).
+		new Setting(containerEl)
+			.setName('수집 로그 (임시 진단용)')
+			.setDesc(
+				'수집 과정을 기록합니다. 수집이 중간에 멈추면 여기부터 확인하세요. ' +
+					'콘솔은 Ctrl+Shift+I → Console 탭에서 보고, 로그 레벨을 "All levels"(Verbose 포함)로 ' +
+					'바꿔야 상세 기록까지 보입니다. ' +
+					`파일 기록을 켜면 ${Log.filePath()} 에도 쌓이므로 그 파일만 보내도 진단할 수 있습니다.`,
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setTooltip('파일로도 기록')
+					.setValue(Log.isFileEnabled())
+					.onChange((value) => {
+						Log.setFileEnabled(value);
+						new Notice(value ? '수집 로그를 파일에도 기록합니다.' : '수집 로그를 콘솔에만 남깁니다.');
+					}),
+			)
+			.addButton((button) =>
+				button
+					.setButtonText('로그 파일 삭제')
+					.setWarning()
+					.onClick(async () => {
+						await Log.clear();
+						new Notice('수집 로그 파일을 삭제했습니다.');
+					}),
 			);
 
 		new Setting(containerEl)
@@ -529,6 +644,9 @@ export class SettingTab extends PluginSettingTab {
 							newConditionType: 'keyword',
 							newConditionQuery: '',
 						});
+						// 여기서는 수집을 걸지 않는다 — 방금 추가한 API는 조건이 0개라
+						// 수집하면 "querys is empty"로 반드시 실패한다. 조건이 하나라도
+						// 붙는 시점(조건 추가)에 예약한다.
 						void this.persistSubscriptions();
 						this.display();
 					}),
@@ -539,37 +657,50 @@ export class SettingTab extends PluginSettingTab {
 		}
 	}
 
-	// run()을 진행률 로딩 바와 함께 실행한다. Notice 생성·표시·정리는 전부 여기(UI 계층)
-	// 안에 있고, run()에는 이 존재 자체가 전달되지 않는다 — 미들웨어가 채우는 필드
-	// (progressDone/progressTotal)를 폴링하듯 반영할 뿐이다. 실패해도(throw) 진행 중이던
-	// Notice는 반드시 치운다 — 안 그러면 다음 실행이 시작되기 전까지 화면에 남는다.
-	private async runWithProgress(action: () => Promise<void>): Promise<string | void> {
-		this.lastCollectedCount = undefined;
-		this.progressDone = 0;
-		this.progressTotal = 0;
-		this.progressNotice = new Notice(this.renderProgressFragment(), 0);
+	// 수집 요청 하나를 진행률 Notice와 함께 실행한다.
+	//
+	// 큐 때문에 "요청했지만 아직 시작 안 한" 상태가 생기므로, 진행 상태는 인스턴스 필드가
+	// 아니라 요청마다 만드는 ProgressFlow에 담는다. 예전처럼 필드 하나를 공유하면 두 번째
+	// 요청이 첫 번째의 총계를 0으로 리셋해 "29/0편" 같은 표시가 나온다(친구가 겪은 증상).
+	//
+	// CollectAndSave에는 이 존재가 전달되지 않는다 — 도메인은 Obsidian을 몰라야 한다
+	// (001 합의). 작업이 실제로 시작됐다는 사실만 onStart 콜백으로 되돌려받는다.
+	private async runWithProgress(
+		label: string,
+		action: (onStart: () => void) => Promise<void>,
+	): Promise<string | void> {
+		const flow: ProgressFlow = {
+			label,
+			// -1 = "총계 미정". 총 편수는 수집이 끝나야('all' 미들웨어) 알 수 있고, 0으로
+			// 두면 아직 오지 않은 총계를 실제 값처럼 "N/0편"으로 찍게 된다.
+			total: -1,
+			done: 0,
+			started: false,
+			collected: undefined,
+			notice: undefined,
+		};
+		flow.notice = new Notice(this.renderProgress(flow), 0);
 		try {
-			await action();
+			await action(() => {
+				flow.started = true;
+				// 큐가 한 번에 하나만 실행하므로, 시작한 흐름이 곧 미들웨어가 갱신할 대상이다.
+				this.activeFlow = flow;
+				this.updateProgress(flow);
+			});
 		} finally {
-			this.progressNotice?.hide();
-			this.progressNotice = undefined;
+			flow.notice?.hide();
+			flow.notice = undefined;
+			if (this.activeFlow === flow) {
+				this.activeFlow = undefined;
+			}
 		}
-		const count = this.readLastCollectedCount();
-		return count !== undefined ? `${count}편 수집` : undefined;
-	}
-
-	// this.lastCollectedCount를 직접 읽으면 tsc가 `= undefined` 대입 이후 await로
-	// 넘어간 지점까지 그 좁혀진(undefined-only) 타입을 그대로 밀어붙여, 실제로는 미들웨어가
-	// 값을 채워도 이후 비교를 항상 never로 오판한다(필드가 비동기 콜백으로 바뀔 수 있다는
-	// 걸 정적 분석은 모른다). 함수 호출 뒤로 감싸면 선언된 반환 타입만 보고 좁히지 않는다.
-	private readLastCollectedCount(): number | undefined {
-		return this.lastCollectedCount;
+		return flow.collected !== undefined ? `${flow.collected}편 수집` : undefined;
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는
 	// 다이어그램 계약상 void만 반환하고 Notice/DOM을 전혀 모르므로(CollectAndSave는
 	// Obsidian을 몰라야 한다 — 001 합의), 관측은 항상 미들웨어를 경유한다. UI(Notice
-	// 생성·표시 문자열)는 이 안이 아니라 버튼 핸들러와 renderProgressFragment()에만 있다.
+	// 생성·표시 문자열)는 이 안이 아니라 renderProgress()에만 있다.
 	//
 	// ⚠️ 등록 순서 전제: 중복 제거 미들웨어가 나중에 'all'로 붙으면 이 진단보다 먼저
 	// 실행돼야 줄어든 개수가 총계로 잡힌다. 지금은 이 진단이 유일한 'all'이라 문제없다.
@@ -578,36 +709,58 @@ export class SettingTab extends PluginSettingTab {
 			return;
 		}
 		this.diagnosticsRegistered = true;
+		// 미들웨어는 플러그인 수명 내내 등록된 채로 남는다. 갱신 대상은 항상 "지금 실행 중인
+		// 흐름"이고, 그게 없으면(예: 보정처럼 진행률을 안 쓰는 작업) 아무 일도 하지 않는다.
 		this.plugin.collectflow.setMiddleware({
 			type: 'all',
 			run: (context) => {
 				const papers = context as Paper[];
-				this.lastCollectedCount = papers.length;
-				this.progressDone = 0;
-				this.progressTotal = papers.length;
-				this.updateProgressNotice();
+				const flow = this.activeFlow;
+				if (!flow) {
+					return;
+				}
+				flow.collected = papers.length;
+				flow.done = 0;
+				flow.total = papers.length;
+				this.updateProgress(flow);
 			},
 		});
 		this.plugin.collectflow.setMiddleware({
 			type: 'forEach',
 			run: () => {
-				this.progressDone += 1;
-				this.updateProgressNotice();
+				const flow = this.activeFlow;
+				if (!flow) {
+					return;
+				}
+				flow.done += 1;
+				this.updateProgress(flow);
 			},
 		});
 	}
 
-	// progressNotice가 있을 때만 갱신한다 — Backfill/보정처럼 진행률 Notice를 안 띄운
-	// 실행에서는 이 필드가 undefined라 미들웨어가 걸려도 아무 일도 하지 않는다.
-	private updateProgressNotice(): void {
-		this.progressNotice?.setMessage(this.renderProgressFragment());
+	private updateProgress(flow: ProgressFlow): void {
+		flow.notice?.setMessage(this.renderProgress(flow));
 	}
 
-	private renderProgressFragment(): DocumentFragment {
-		const total = Math.max(this.progressTotal, 1); // <progress max="0">는 부정형(indeterminate)이 된다
+	// 세 단계로 다르게 말한다: 큐에서 대기 중 / 받아오는 중(총계 미정) / 처리 중(N/M).
+	// 총계를 모르는 동안 분모를 아는 척하지 않는 게 핵심이다.
+	private renderProgress(flow: ProgressFlow): DocumentFragment {
+		const known = flow.total >= 0;
 		return createFragment((el) => {
-			el.createDiv({ text: `수집한 논문 처리 중... (${this.progressDone}/${this.progressTotal}편)` });
-			el.createEl('progress', { attr: { value: this.progressDone, max: total } });
+			let text: string;
+			if (!flow.started) {
+				text = `${flow.label} — 대기 중... (진행 중인 작업이 끝나면 시작합니다)`;
+			} else if (!known) {
+				text = `${flow.label} — arXiv에서 수집 중... (총 편수는 아직 알 수 없습니다)`;
+			} else {
+				text = `${flow.label} — 수집한 논문 처리 중... (${flow.done}/${flow.total}편)`;
+			}
+			el.createDiv({ text });
+			// max가 0/음수면 <progress>는 부정형(indeterminate)이 된다 — 총계를 모르는
+			// 동안 정확히 그 표시를 원한다.
+			el.createEl('progress', {
+				attr: known ? { value: flow.done, max: Math.max(flow.total, 1) } : {},
+			});
 		});
 	}
 
@@ -687,6 +840,7 @@ export class SettingTab extends PluginSettingTab {
 			.setName(api.apiName)
 			.setHeading()
 			.addButton((button) =>
+				// 삭제는 수집을 걸지 않는다 — 훑을 대상이 줄어드는 변경이라 새로 받아올 게 없다.
 				button.setButtonText('API 삭제').onClick(() => {
 					this.apiDrafts = this.apiDrafts.filter((item) => item !== api);
 					void this.persistSubscriptions();
@@ -739,7 +893,7 @@ export class SettingTab extends PluginSettingTab {
 						query: api.newConditionQuery.trim(),
 					});
 					api.newConditionQuery = '';
-					void this.persistSubscriptions();
+					void this.saveSubscriptionsAndCollect();
 					this.display();
 				}),
 			);

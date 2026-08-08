@@ -2,6 +2,7 @@ import { Subscriptions } from './Subscriptions';
 import { Embedding } from './Embedding';
 import { Middleware } from '../common/Middleware';
 import { File } from '../common/File';
+import { Log } from '../common/Log';
 import { API } from './API';
 import { Paper } from './Paper';
 
@@ -25,23 +26,168 @@ interface CollectWindow {
 	advancesCursor: boolean;
 }
 
+// 큐에 들어간 작업의 종류. UI가 "무엇이 돌고 있는지"를 표시하는 데 쓴다.
+export type CollectJobKind = 'recent' | 'backfill' | 'repair';
+
+export interface CollectJob {
+	kind: CollectJobKind;
+	// 사람이 읽는 이름("Backfill" 등). UI 문구를 도메인이 정하는 게 아니라, 호출자가
+	// 자기가 만든 작업에 이름을 붙여 보내면 그대로 되돌려준다.
+	label: string;
+}
+
+// 큐 상태 한 장. 실행 중인 작업과 대기 중인 작업 수.
+export interface CollectQueueState {
+	active: CollectJob | undefined;
+	waiting: CollectJob[];
+}
+
 export class CollectAndSave {
 	sub!: Subscriptions;
 	embedding!: Embedding;
 	middlewares: Middleware[] = [];
+
+	// ── 직렬 작업 큐 ───────────────────────────────────────────────
+	//
+	// 수집 작업은 절대 겹치면 안 된다: Embedding이 세션/서킷브레이커를 락 없이 공유하고
+	// (Embedding.embed의 "동시 호출 안전하지 않음" 경고), 커서도 하나뿐이다. 그렇다고
+	// 두 번째 요청을 거절할 수는 없다 — 자동 수집이 도는 중에도 사용자가 구독을 추가하거나
+	// Backfill을 실행할 수 있어야 하고, 그것들은 "무시"가 아니라 "다음 차례"가 되어야 한다.
+	//
+	// 큐를 UI가 아니라 여기 두는 이유: UI의 잠금은 설정 탭이 다시 그려지는 순간 사라지고,
+	// 나중에 TaskManager/스케줄러가 수집을 부르면 아무것도 막지 못한다. "겹치면 안 된다"는
+	// 것은 이 클래스의 사정이므로 이 클래스가 지킨다.
+	private tail: Promise<void> = Promise.resolve();
+	private activeJob: CollectJob | undefined;
+	private waitingJobs: CollectJob[] = [];
+	private queueListeners: ((state: CollectQueueState) => void)[] = [];
+	// 아직 시작하지 않은 recent 작업. 합침(coalescing) 대상이다 — 아래 requestRecent 참고.
+	private pendingRecent: Promise<void> | undefined;
+
+	get isBusy(): boolean {
+		return this.activeJob !== undefined;
+	}
+
+	get queueState(): CollectQueueState {
+		return { active: this.activeJob, waiting: [...this.waitingJobs] };
+	}
+
+	// 아직 시작 안 한 recent가 줄에 있는가. 호출자가 "이미 예약돼 있으니 또 알릴 필요 없다"를
+	// 판단하는 데 쓴다 — requestRecent는 합쳐주지만, 합쳐졌다는 사실을 모르면 UI는 요청한
+	// 횟수만큼 진행률 Notice를 띄우게 된다.
+	get hasPendingRecent(): boolean {
+		return this.pendingRecent !== undefined;
+	}
+
+	// 큐가 변할 때마다(입큐/시작/종료) 불린다. UI가 버튼 상태와 안내 문구를 갱신한다.
+	onQueueChange(listener: (state: CollectQueueState) => void): void {
+		this.queueListeners.push(listener);
+	}
+
+	private notifyQueue(): void {
+		const state = this.queueState;
+		for (const listener of this.queueListeners) {
+			try {
+				listener(state);
+			} catch (error) {
+				// UI 리스너의 버그가 수집을 멈추게 두지 않는다.
+				Log.error('collect', '큐 상태 리스너 실패', error);
+			}
+		}
+	}
+
+	// 작업 하나를 큐 끝에 붙이고, 그 작업의 완료를 기다릴 수 있는 Promise를 돌려준다.
+	//
+	// 반환 Promise는 작업의 실패를 그대로 전달하지만, 큐를 잇는 체인(tail)은 실패를 삼킨다 —
+	// 한 작업이 실패했다고 뒤에 줄 선 작업까지 취소되면 안 되기 때문이다.
+	private enqueue(job: CollectJob, task: () => Promise<void>, onStart?: () => void): Promise<void> {
+		this.waitingJobs.push(job);
+		Log.info('collect.queue', `입큐: ${job.label}`, {
+			kind: job.kind,
+			waiting: this.waitingJobs.length,
+			busy: this.isBusy,
+		});
+		this.notifyQueue();
+
+		const result = this.tail.then(async () => {
+			this.waitingJobs = this.waitingJobs.filter((waiting) => waiting !== job);
+			this.activeJob = job;
+			onStart?.();
+			Log.info('collect.queue', `시작: ${job.label}`, { waiting: this.waitingJobs.length });
+			this.notifyQueue();
+			try {
+				await task();
+				Log.info('collect.queue', `완료: ${job.label}`);
+			} finally {
+				this.activeJob = undefined;
+				this.notifyQueue();
+			}
+		});
+
+		this.tail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
 
 	// 등록 계열: 안전하게 동작한다.
 	setMiddleware(mw: Middleware): void {
 		this.middlewares.push(mw);
 	}
 
-	// 실행 계열.
+	// "구독이 바뀌었으니 최근 논문을 한 번 훑어라". 구독 편집 UI가 부른다.
+	//
+	// 아직 시작하지 않은 recent가 큐에 있으면 거기에 합친다 — 조건을 연달아 다듬으면
+	// 편집할 때마다 수집이 예약될 텐데, recent는 실행 시점에 구독을 다시 읽으므로
+	// (run()의 첫 줄) 한 번만 돌아도 전부 반영된다.
+	//
+	// 합침은 "아직 시작 안 한" 작업까지만이다. 이미 실행 중인 recent는 시작 시점의 구독
+	// 목록으로 돌고 있어서 방금 추가된 구독을 보지 못한다 — 그 경우엔 새 작업을 예약해야 한다.
+	requestRecent(label = '최근 논문 수집', onStart?: () => void): Promise<void> {
+		if (this.pendingRecent !== undefined) {
+			return this.pendingRecent;
+		}
+		const pending = this.enqueue({ kind: 'recent', label }, () => this.runNow('recent'), () => {
+			// 시작하는 순간 합침 대상에서 빠진다.
+			if (this.pendingRecent === pending) {
+				this.pendingRecent = undefined;
+			}
+			onStart?.();
+		});
+		this.pendingRecent = pending;
+		return pending;
+	}
+
+	// 실행 계열. 큐를 거쳐 직렬로 실행된다 — 이미 돌고 있는 작업이 있으면 그 뒤에 선다.
+	// requestRecent와 달리 합치지 않는다: 호출자가 명시적으로 요청한 실행이라 임의로
+	// 하나로 묶으면 "누른 만큼 돈다"는 기대가 깨진다.
+	//
+	// onStart는 "줄에서 빠져나와 실제로 시작했다"는 신호다. 큐가 생기면서 요청 시점과 실행
+	// 시점이 갈라졌고, UI는 그 둘을 다르게 표시해야 한다(대기 중 / 수집 중).
+	run(
+		mode: 'recent' | 'backfill',
+		testOptions?: CollectTestOptions,
+		onStart?: () => void,
+	): Promise<void> {
+		const label = mode === 'recent' ? '최근 논문 수집' : 'Backfill';
+		return this.enqueue({ kind: mode, label }, () => this.runNow(mode, testOptions), onStart);
+	}
+
+	repair(onStart?: () => void): Promise<void> {
+		return this.enqueue({ kind: 'repair', label: '보정' }, () => this.repairNow(), onStart);
+	}
+
+	// 실제 수집 몸통 — 큐가 한 번에 하나만 부른다.
 	//
 	// 흐름 (다이어그램 명시):
 	//   전체 데이터 수집 -> 미들웨어(all) -> loop { 임베딩 -> 미들웨어(forEach) -> 데이터 저장 }
-	// 이 흐름 제어는 run() 안에서만 하고, 세부 함수가 미들웨어를 직접 호출하지 않는다.
-	// mode로 backfill과 최근 논문 수집을 구분해 run() 내부 if문으로 분기한다.
-	async run(mode: 'recent' | 'backfill', testOptions?: CollectTestOptions): Promise<void> {
+	// 이 흐름 제어는 여기서만 하고, 세부 함수가 미들웨어를 직접 호출하지 않는다.
+	// mode로 backfill과 최근 논문 수집을 구분해 내부 if문으로 분기한다.
+	private async runNow(
+		mode: 'recent' | 'backfill',
+		testOptions?: CollectTestOptions,
+	): Promise<void> {
 		this.sub = await File.readSubscriptions();
 		const apis = this.sub.apis ?? [];
 		if (apis.length === 0) {
@@ -62,7 +208,15 @@ export class CollectAndSave {
 		}
 
 		const window = this.resolveWindow(mode, testOptions, apis);
+		Log.info('collect', `실행 시작 (${mode})`, {
+			from: new Date(window.from).toISOString(),
+			to: new Date(window.to).toISOString(),
+			hours: window.hours,
+			advancesCursor: window.advancesCursor,
+			apis: apis.map((api) => api.apiName),
+		});
 		const papers = await this.collect(apis, window);
+		Log.info('collect', '수집 완료 — 임베딩/저장 시작', { papers: papers.length });
 
 		// 'all' 미들웨어는 수집 결과 전체를 한 번 받는다. 받는 배열은 아래 루프가 그대로
 		// 쓰는 바로 그 배열이라, 미들웨어가 in-place로 항목을 덜어내면(splice 등) 이후
@@ -77,15 +231,24 @@ export class CollectAndSave {
 			// 병렬 호출하면 안 된다 (003 문서 "동시성 가정" 참고).
 			await this.embedOrReuse(paper);
 			await this.runMiddlewares('forEach', paper);
-			await File.writePaper(paper);
+			// 저장 실패는 [1] 정책대로 전파하되, 어느 논문에서 끊겼는지는 남긴다 —
+			// 이게 없으면 "수집은 됐는데 파일이 일부만 있다"의 원인을 못 찾는다.
+			try {
+				await File.writePaper(paper);
+			} catch (error) {
+				Log.error('collect', '논문 저장 실패', error, { sourceId: paper.sourceId });
+				throw error;
+			}
 		}
+
+		Log.info('collect', '임베딩/저장 완료', { papers: papers.length });
 
 		if (window.advancesCursor) {
 			await this.advanceCursor(apis, window.to);
 		}
 	}
 
-	// 보정 패스 — run()과 별개의 사이클. 저장된 논문 전체를 훑어 실패 플래그가 선 것만
+	// 보정 패스 몸통 — runNow()와 별개의 사이클. 저장된 논문 전체를 훑어 실패 플래그가 선 것만
 	// 다시 시도한다: embeddingSucceeded=false는 재임베딩, citationsKnown=false는 S2 재보강.
 	//
 	// 큐를 두지 않는 이유: 실패 논문이 이미 디스크에 플래그로 남아 있어 파일 자체가 재시도
@@ -93,7 +256,7 @@ export class CollectAndSave {
 	//
 	// 미들웨어는 돌리지 않는다 — 다이어그램의 미들웨어 흐름은 수집(run) 경로에 대한 정의고,
 	// 보정은 저장된 값의 필드 몇 개를 고치는 작업이라 범위 밖으로 둔다.
-	async repair(): Promise<void> {
+	private async repairNow(): Promise<void> {
 		// 재임베딩이 섞여 있으므로 run()과 같은 사전 체크 — 모델이 없으면 대상 논문 수만큼
 		// 조용히 실패만 반복하게 된다(CollectAndSave.run의 같은 체크 주석 참고).
 		if (!(await this.embedding.isModelInstalled())) {
@@ -219,7 +382,7 @@ export class CollectAndSave {
 			try {
 				await mw.run(context);
 			} catch (error) {
-				console.error(`[PaperGraph3D] '${type}' 미들웨어 실패 — 계속 진행합니다.`, error);
+				Log.error('collect', `'${type}' 미들웨어 실패 — 계속 진행합니다`, error);
 			}
 		}
 	}
@@ -248,10 +411,14 @@ export class CollectAndSave {
 			// EmbeddingResult의 4필드가 Paper의 임베딩 4필드와 이름까지 대응하도록
 			// 설계돼 있어 그대로 얹으면 된다 (003 문서).
 			Object.assign(paper, await this.embedding.embed(paper.title, paper.abstract));
-		} catch {
+		} catch (error) {
 			// 실패해도 저장은 한다. 스킵하면 "이 논문이 임베딩에 실패했다"는 사실이 어디에도
 			// 남지 않아 나중에 재임베딩 대상을 찾을 수 없다 — SettingTab의 테스트 버튼이 내린
 			// 것과 같은 판단((b) 선택, 003 문서). 가짜 벡터는 만들지 않는다.
+			Log.warn('collect', '임베딩 실패 — 플래그만 남기고 계속', {
+				sourceId: paper.sourceId,
+				error: error instanceof Error ? error.message : String(error),
+			});
 			paper.embedding = [];
 			paper.embeddingModel = '';
 			paper.embeddingSource = '';
@@ -271,7 +438,14 @@ export class CollectAndSave {
 				cursor = coverage.coveredThrough;
 			}
 		}
+		Log.info('collect', '수집 커서 갱신', {
+			requestedTo: new Date(to).toISOString(),
+			saved: new Date(cursor).toISOString(),
+			heldBack: cursor !== to,
+		});
+		// this.sub를 그대로 저장하면 안 된다 — 수집이 도는 동안 사용자가 추가한 구독이
+		// 시작 시점의 낡은 목록에 덮여 사라진다. 커서 필드만 갱신하는 경로를 쓴다.
 		this.sub.updateTime = cursor;
-		await File.writeSubscriptions(this.sub);
+		await File.updateSubscriptionCursor(cursor);
 	}
 }

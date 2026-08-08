@@ -393,30 +393,117 @@ describe('날짜 구간 수집 — 페이지네이션과 커버리지', () => {
 		assert.equal(api.lastCoverage?.truncated, false);
 	});
 
-	it('상한(MAX_PAGES)에 걸리면 truncated로 표시하고 실제로 훑은 지점까지만 인정한다', async () => {
-		// 매 페이지가 꽉 차고 totalResults도 크게 보고 → 20페이지에서 강제 중단
+	// 라운드당 상한(MAX_PAGES=20페이지=2000건)에 걸려도 Backfill은 거기서 끝내지 않는다.
+	// 잘린 지점부터 새 구간으로 다시 훑기를 반복해 요청한 범위를 완주해야 한다.
+	// 아래 목은 실제 arXiv처럼 submittedDate 필터를 해석해, 이어받기가 정말로 남은
+	// 구간만 가져오는지 검사한다(필터를 무시하는 목은 이걸 증명하지 못한다).
+	describe('라운드 이어받기 — 상한을 넘겨도 구간을 완주한다', () => {
+		// 2025-01-02부터 1분 간격으로 제출된 논문 corpusSize편.
+		function mockArxivCorpus(corpusSize: number): void {
+			const base = Date.UTC(2025, 0, 2, 0, 0);
+			const at = (i: number): number => base + i * 60_000;
+
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					return response(200, '[]');
+				}
+				const params = queryParams(param.url);
+				const range = /submittedDate:\[(\d{12}) TO (\d{12})\]/.exec(
+					params.get('search_query') ?? '',
+				);
+				assert.ok(range, 'Backfill 요청에는 항상 제출일 구간 필터가 있어야 한다');
+				const parse = (s: string): number =>
+					Date.UTC(
+						Number(s.slice(0, 4)),
+						Number(s.slice(4, 6)) - 1,
+						Number(s.slice(6, 8)),
+						Number(s.slice(8, 10)),
+						Number(s.slice(10, 12)),
+					);
+				// arXiv의 범위는 양끝 포함 — 경계 논문이 다음 라운드에 또 걸리는 원인이다.
+				const lo = parse(range[1]!);
+				const hi = parse(range[2]!);
+
+				const matched: number[] = [];
+				for (let i = 0; i < corpusSize; i += 1) {
+					if (at(i) >= lo && at(i) <= hi) {
+						matched.push(i);
+					}
+				}
+				const start = Number(params.get('start'));
+				const page = matched.slice(start, start + 100);
+				return response(
+					200,
+					feed(
+						page.map((i) =>
+							entry({
+								id: `http://arxiv.org/abs/2501.${String(i).padStart(5, '0')}v1`,
+								title: `Paper ${i}`,
+								published: new Date(at(i)).toISOString(),
+							}),
+						),
+						matched.length,
+					),
+				);
+			});
+		}
+
+		it('2000건을 넘겨도 끊지 않고 요청한 범위를 전부 가져온다', async () => {
+			mockArxivCorpus(2500);
+
+			const api = new ArxivAPI([KEYWORD]);
+			const papers = await withFastTimers(() => api.Backfill(FROM, TO));
+
+			// 라운드 1에서 2000건, 이어받아 나머지 500건. 한 편도 잃지 않아야 한다.
+			assert.equal(papers.length, 2500);
+			assert.equal(new Set(papers.map((p) => p.sourceId)).size, 2500);
+
+			const coverage = api.lastCoverage;
+			assert.ok(coverage);
+			// 완주했으므로 잘리지 않았고, 커서는 요청한 끝까지 인정된다.
+			assert.equal(coverage.truncated, false);
+			assert.equal(coverage.coveredThrough, TO);
+			// 페이지 수는 라운드에 걸쳐 누적된다(20 + 나머지).
+			assert.ok(coverage.pages > 20, `pages=${coverage.pages}`);
+		});
+
+		it('이어받기 경계에서 생긴 중복은 sourceId로 걸러낸다', async () => {
+			// 경계 분(分)의 논문은 [A TO B]가 양끝을 포함하는 탓에 반드시 두 번 온다.
+			// 그래도 최종 결과에 중복이 남으면 안 된다.
+			mockArxivCorpus(2100);
+
+			const api = new ArxivAPI([KEYWORD]);
+			const papers = await withFastTimers(() => api.Backfill(FROM, TO));
+
+			const ids = papers.map((p) => p.sourceId);
+			assert.equal(ids.length, new Set(ids).size, '중복 논문이 남아 있다');
+			assert.equal(papers.length, 2100);
+		});
+	});
+
+	it('커서가 전진하지 않으면 무한 루프에 빠지지 않고 truncated로 끝낸다', async () => {
+		// 필터를 무시하고 항상 같은 구간을 돌려주는 목 — 이어받아도 커서가 그대로다.
+		// 실제로는 한 분에 2000건이 몰린 경우에 해당한다. 여기서 멈추지 못하면 무한 루프다.
 		mockRequests((param) => {
 			if (param.url.includes('semanticscholar')) {
 				return response(200, '[]');
 			}
 			const start = Number(queryParams(param.url).get('start'));
-			// 페이지가 진행될수록 제출일이 늦어진다(ascending 가정과 같은 모양)
-			const day = Math.min(28, 1 + Math.floor(start / 100));
-			return response(200, feed(entries(100, start, day), 99_999));
+			return response(200, feed(entries(100, start, 20), 99_999));
 		});
 
 		const api = new ArxivAPI([KEYWORD]);
 		const papers = await withFastTimers(() => api.Backfill(FROM, TO));
 
-		assert.equal(papers.length, 2000);
-		assert.equal(arxivRequests().length, 20);
+		// 라운드 1(20페이지) + 진행 없음을 확인하는 라운드 2(20페이지)에서 종료.
+		assert.equal(arxivRequests().length, 40);
+		assert.equal(papers.length, 2000); // 2라운드는 같은 논문이라 중복 제거됨
 
 		const coverage = api.lastCoverage;
 		assert.ok(coverage);
-		assert.equal(coverage.truncated, true);
-		assert.equal(coverage.pages, 20);
 		// 커서는 windowTo가 아니라 마지막으로 실제 확인한 제출 시각이어야 한다.
 		// 이걸 windowTo로 저장하면 못 본 구간이 영구 누락된다.
+		assert.equal(coverage.truncated, true);
 		assert.ok(coverage.coveredThrough < TO);
 		assert.equal(new Date(coverage.coveredThrough).toISOString().slice(0, 10), '2025-01-20');
 	});
@@ -590,5 +677,36 @@ describe('[3] 정책 — S2 인용수 보강은 실패해도 수집을 깨지 �
 
 		await new ArxivAPI([KEYWORD]).SearchBase();
 		assert.equal(s2Requests()[0]?.headers, undefined);
+	});
+});
+
+// ── 응답 없는 요청 ────────────────────────────────────────────────────
+// Obsidian requestUrl에는 타임아웃 옵션이 없다(RequestUrlParam에 필드 자체가 없음).
+// 시한을 걸지 않으면 응답이 안 오는 요청 하나가 Promise를 영원히 붙들어, 에러도 Notice도
+// 없이 수집 전체가 멈춘다 — 스로틀 중인 서버에서 실제로 겪은 증상이다.
+describe('요청 타임아웃 — 응답이 안 와도 멈추지 않는다', () => {
+	it('시한을 넘기면 재시도하고, 끝내 응답이 없으면 에러로 끝낸다', async () => {
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			// 영원히 resolve하지 않는다 = 서버가 연결만 잡고 응답을 안 주는 상태.
+			return new Promise<never>(() => {
+				/* 의도적으로 아무것도 하지 않는다 */
+			});
+		});
+
+		const api = new ArxivAPI([KEYWORD]);
+
+		// withFastTimers가 setTimeout 지연을 0으로 만들어 60초를 기다리지 않는다.
+		await assert.rejects(
+			() => withFastTimers(() => api.SearchBase()),
+			// 타임아웃은 재시도 가능 계열이라 시도를 다 소진한 뒤 "temporary"로 끝난다.
+			/응답 없음\(timeout\).*temporary/,
+		);
+
+		// 기본 재시도 횟수(3회)만큼 실제로 다시 시도했어야 한다 — 한 번 멈추고 포기하면
+		// 일시적 장애에서 불필요하게 실패한다.
+		assert.equal(arxivRequests().length, 3);
 	});
 });

@@ -8,6 +8,7 @@ import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
 import { File } from './common/File';
+import { Log } from './common/Log';
 import { SettingTab } from './adapter/SettingTab';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 
@@ -77,6 +78,9 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.pca = new PCA();
 		this.visualflow.visual = new Visualization();
 		File.init(this.app.vault, this.manifest.dir ?? '');
+		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
+		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
+		Log.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();

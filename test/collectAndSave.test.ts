@@ -965,3 +965,129 @@ describe('File.readSecret/writeSecret — provider별 키 보존', () => {
 		assert.equal(final.getKey(S2_SECRET_PROVIDER), 's2-key');
 	});
 });
+
+// ── 직렬 작업 큐 ──────────────────────────────────────────────────────
+// 수집 작업은 절대 겹치면 안 되지만(Embedding이 세션/서킷브레이커를 락 없이 공유), 자동
+// 수집이 도는 중에도 사용자가 구독을 추가하거나 Backfill을 실행할 수 있어야 한다. 그래서
+// 두 번째 요청은 거절이 아니라 큐에 들어가 순서대로 실행된다.
+describe('CollectAndSave — 직렬 작업 큐', () => {
+	it('실행 중에 다른 작업을 요청하면 거절하지 않고 줄을 세운다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['queued']);
+
+		const timeline: string[] = [];
+		const { embedding, spy } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		const first = flow.run('recent', { hours: 24 }, () => timeline.push('start:A'));
+		const second = flow.run('backfill', { from: Date.now() - 86_400_000, to: Date.now() }, () =>
+			timeline.push('start:B'),
+		);
+
+		// 입큐는 동기다: 요청하자마자 둘 다 줄에 서 있고, 아직 아무것도 시작하지 않았다.
+		// (거절됐다면 두 번째가 아예 줄에 없을 것이다.)
+		assert.deepEqual(
+			flow.queueState.waiting.map((job) => job.kind),
+			['recent', 'backfill'],
+		);
+		assert.equal(timeline.length, 0, `아직 아무것도 시작하면 안 된다: ${timeline.join(',')}`);
+
+		await Promise.all([first, second]);
+
+		assert.deepEqual(timeline, ['start:A', 'start:B'], '요청한 순서대로 실행되지 않았다');
+		// 겹쳤다면 두 작업의 임베딩이 동시에 in-flight가 된다 — Embedding이 락 없이 세션을
+		// 공유하므로 이게 큐가 막아야 할 실제 위험이다.
+		assert.equal(spy.maxConcurrent, 1, '두 작업의 임베딩이 겹쳤다');
+		assert.equal(flow.isBusy, false);
+		assert.equal(flow.queueState.waiting.length, 0);
+	});
+
+	it('한 작업이 실패해도 큐의 다음 작업은 실행된다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['after-failure']);
+		const { embedding, spy } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		// 범위 없는 Backfill은 resolveWindow에서 확실히 실패한다.
+		const failing = flow.run('backfill');
+		const following = flow.run('recent', { hours: 24 });
+
+		await assert.rejects(() => failing, /수집할 구간\(from\/to\)이 필요합니다/);
+		await following;
+		assert.ok(spy.calls.length > 0, '앞 작업의 실패로 뒤 작업까지 취소됐다');
+	});
+
+	it('아직 시작하지 않은 requestRecent는 하나로 합친다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['coalesce']);
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		// 첫 작업이 큐를 점유한 동안, 구독을 연달아 세 번 바꿨다고 가정한다.
+		const blocking = flow.run('backfill', { from: Date.now() - 86_400_000, to: Date.now() });
+		const a = flow.requestRecent();
+		const b = flow.requestRecent();
+		const c = flow.requestRecent();
+
+		assert.equal(a, b, 'recent 요청이 합쳐지지 않았다');
+		assert.equal(b, c);
+		assert.equal(flow.queueState.waiting.filter((job) => job.kind === 'recent').length, 1);
+
+		await Promise.all([blocking, a, b, c]);
+	});
+
+	it('이미 실행 중인 recent에는 합치지 않는다 — 그 작업은 새 구독을 못 본다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['running']);
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		// 실행이 시작된 시점에 새 recent를 요청한다.
+		let queuedDuringRun: Promise<void> | undefined;
+		const running = flow.requestRecent('첫 번째', () => {
+			queuedDuringRun = flow.requestRecent('구독 변경 반영');
+		});
+
+		await running;
+		assert.ok(queuedDuringRun !== undefined, '실행 중 요청이 만들어지지 않았다');
+		assert.notEqual(queuedDuringRun, running, '실행 중인 작업에 합쳐져 새 구독이 무시된다');
+		await queuedDuringRun;
+	});
+});
+
+// ── 커서 저장이 구독을 덮어쓰지 않는다 ────────────────────────────────
+describe('CollectAndSave — 수집 중 추가된 구독 보존', () => {
+	it('수집이 끝나도 그 사이에 추가된 구독이 사라지지 않는다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['original']);
+		const { embedding } = fakeEmbedding();
+
+		// 'all' 미들웨어는 수집이 끝나고 커서 저장 전에 불린다 — 사용자가 수집 도중에
+		// 구독을 추가하는 상황을 이 시점에 재현한다.
+		const addSubscriptionMidRun: Middleware = {
+			type: 'all',
+			run: async () => {
+				const subscriptions = await File.readSubscriptions();
+				subscriptions.apis = [
+					...subscriptions.apis,
+					File.createApi('arxiv', [{ searchType: 'keyword', query: 'added-during-run' }]),
+				];
+				await File.writeSubscriptions(subscriptions);
+			},
+		};
+
+		await collectFlow(embedding, [addSubscriptionMidRun]).run('recent');
+
+		const stored = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys?: { query: string }[] }[];
+		};
+		const queries = (stored.apis ?? []).flatMap((api) =>
+			(api.querys ?? []).map((q) => q.query),
+		);
+		assert.ok(
+			queries.includes('added-during-run'),
+			`수집 중 추가된 구독이 커서 저장에 덮여 사라졌다: ${JSON.stringify(queries)}`,
+		);
+		assert.ok(queries.includes('original'), '기존 구독까지 사라졌다');
+	});
+});

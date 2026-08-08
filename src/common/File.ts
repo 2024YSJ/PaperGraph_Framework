@@ -139,6 +139,18 @@ export class File {
 		});
 	}
 
+	// 수집 커서(updateTime)만 갈아끼운다.
+	//
+	// 수집은 오래 걸리고 그동안 사용자는 구독을 편집할 수 있다. 수집 시작 시점에 읽어둔
+	// Subscriptions 객체를 끝에 통째로 저장하면, 그 사이에 추가된 구독이 낡은 목록으로
+	// 덮여 사라진다. 그래서 저장 직전에 다시 읽어 이 필드 하나만 바꾼다 — SettingTab의
+	// persistSubscriptions가 반대 방향(apis만 갈아끼움)으로 같은 규칙을 지키는 것과 짝이다.
+	static async updateSubscriptionCursor(cursor: number): Promise<void> {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.updateTime = cursor;
+		await File.writeSubscriptions(subscriptions);
+	}
+
 	// API 구현체 등록부 — 이 코드베이스가 지원하는 API 목록의 유일한 진실.
 	// 새 API 추가 = 여기 한 줄 + import. 구독 UI의 드롭다운(supportedApiNames)과
 	// createApi가 같은 목록을 보므로 "UI는 받는데 복원은 못 하는 이름"이 생길 수 없다.
