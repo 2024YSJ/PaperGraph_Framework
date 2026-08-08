@@ -82,6 +82,7 @@ export class Visualization {
 		const forceGraph = new ForceGraph3D(container, { controlType: 'orbit' });
 		forceGraph
 			.graphData({ nodes: graph.nodes, links: graph.links })
+			.enableNodeDrag(false) // 노드를 잡아 끌지 못하게(좌표 고정 유지)
 			.nodeRelSize(NODE_REL_SIZE)
 			.nodeVal((n) => (n as GraphNode).size ?? 1)
 			.nodeColor((n) => (n as GraphNode).color ?? NODE_COLOR)
