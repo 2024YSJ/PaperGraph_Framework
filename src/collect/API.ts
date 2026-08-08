@@ -105,6 +105,17 @@ export interface CollectOptions {
 	// 호출자가 청크를 받는 즉시 저장하고 버릴 것을 전제로 한 계약이다. 안 주면 예전처럼
 	// 전량을 모아서 반환한다(단발 조회나 테스트처럼 규모가 작을 때 쓴다).
 	onChunk?: (papers: Paper[]) => Promise<void>;
+
+	// 이 구간(from~to)에 실제로 몇 편이 있는지 arXiv가 알려주는 즉시(첫 페이지 응답) 한
+	// 번만 불린다. 진행률 UI가 "지금까지 받은 페이지 수"가 아니라 진짜 총계를 분모로
+	// 쓸 수 있게 하려는 용도다 — 이 값이 없으면 청크가 도착할 때마다 총계 자체가 같이
+	// 늘어나는 것처럼 보인다(청크 스트리밍으로 바뀌며 생긴 표시 버그).
+	//
+	// 상한(MAX_PAGES)에 걸려 여러 라운드로 나뉘어도 이 값은 **첫 라운드에서 한 번만**
+	// 보고된다 — 이후 라운드는 좁아진 남은 구간의 건수라 원래 요청한 전체 구간의
+	// 총계가 아니다(collectRounds 주석 참고). 구간에 결과가 없거나 arXiv가 총계를
+	// 못 읽어주면(-1) 호출되지 않는다.
+	onTotal?: (total: number) => void;
 }
 
 // 직전 날짜 구간 수집이 실제로 어디까지 훑었는지.
@@ -329,22 +340,27 @@ export class ArxivAPI implements API {
 		const collected: Paper[] = [];
 		let total = 0;
 
-		await this.collectRounds(from, to, async (chunk) => {
-			// 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아올 수 있다. 호출자가 이미
-			// 아는 값을 여기서 먼저 채워두면, 아래 EnrichCitations의 기존 필터
-			// (`if (citationsKnown) continue`)가 이 논문들을 자연히 건너뛴다 — S2를 다시
-			// 두드리지 않는다. 모르는 논문(이번에 새로 걸린 것)만 실제로 보강한다.
-			if (options?.prefill) {
-				await options.prefill(chunk);
-			}
-			await runQuietly(() => this.EnrichCitations(chunk), 'collectWindow.EnrichCitations');
-			total += chunk.length;
-			if (options?.onChunk) {
-				await options.onChunk(chunk);
-			} else {
-				collected.push(...chunk);
-			}
-		});
+		await this.collectRounds(
+			from,
+			to,
+			async (chunk) => {
+				// 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아올 수 있다. 호출자가 이미
+				// 아는 값을 여기서 먼저 채워두면, 아래 EnrichCitations의 기존 필터
+				// (`if (citationsKnown) continue`)가 이 논문들을 자연히 건너뛴다 — S2를 다시
+				// 두드리지 않는다. 모르는 논문(이번에 새로 걸린 것)만 실제로 보강한다.
+				if (options?.prefill) {
+					await options.prefill(chunk);
+				}
+				await runQuietly(() => this.EnrichCitations(chunk), 'collectWindow.EnrichCitations');
+				total += chunk.length;
+				if (options?.onChunk) {
+					await options.onChunk(chunk);
+				} else {
+					collected.push(...chunk);
+				}
+			},
+			options?.onTotal,
+		);
 
 		Log.info('arxiv.window', '구간 수집 종료', { papers: total, coverage: this.coverage });
 		return collected;
@@ -365,6 +381,7 @@ export class ArxivAPI implements API {
 		from: number,
 		to: number,
 		emit: (papers: Paper[]) => Promise<void>,
+		onTotal?: (total: number) => void,
 	): Promise<void> {
 		// 이어받기는 반드시 중복을 만든다: formatDate가 분 단위로 자르고 buildDateFilter의
 		// 범위가 양끝 포함([A TO B])이라, 경계 분의 논문이 다음 라운드에 또 걸린다.
@@ -386,22 +403,30 @@ export class ArxivAPI implements API {
 
 			const dateFilter = ArxivAPI.buildDateFilter(cursor, to);
 			let received = 0;
-			await this.collectPaged(dateFilter, cursor, to, async (page) => {
-				received += page.length;
-				// 중복은 여기서 걸러 내보낸다 — 호출자가 같은 논문을 두 번 저장하지 않도록.
-				const fresh = page.filter((paper) => {
-					if (seen.has(paper.sourceId)) {
-						duplicates += 1;
-						return false;
+			await this.collectPaged(
+				dateFilter,
+				cursor,
+				to,
+				async (page) => {
+					received += page.length;
+					// 중복은 여기서 걸러 내보낸다 — 호출자가 같은 논문을 두 번 저장하지 않도록.
+					const fresh = page.filter((paper) => {
+						if (seen.has(paper.sourceId)) {
+							duplicates += 1;
+							return false;
+						}
+						seen.add(paper.sourceId);
+						return true;
+					});
+					if (fresh.length > 0) {
+						unique += fresh.length;
+						await emit(fresh);
 					}
-					seen.add(paper.sourceId);
-					return true;
-				});
-				if (fresh.length > 0) {
-					unique += fresh.length;
-					await emit(fresh);
-				}
-			});
+				},
+				// 첫 라운드의 총계만 "요청한 전체 구간"을 뜻한다 — 이후 라운드는 전달하지
+				// 않아, 호출자가 좁아진 남은 구간의 건수를 전체 총계로 오해하지 않게 한다.
+				round === 0 ? onTotal : undefined,
+			);
 			// collectPaged는 항상 this.coverage를 채우고 돌아온다.
 			const roundCoverage = this.coverage as CollectionCoverage;
 
@@ -464,6 +489,7 @@ export class ArxivAPI implements API {
 		windowFrom: number,
 		windowTo: number,
 		emit: (papers: Paper[]) => Promise<void>,
+		onTotal?: (total: number) => void,
 	): Promise<void> {
 		let emitted = 0;
 		let latestPublishedMs: number | undefined;
@@ -479,6 +505,11 @@ export class ArxivAPI implements API {
 
 			const start = page * ArxivAPI.PAGE_SIZE;
 			const result = await this.fetchPage(dateFilter, start, ArxivAPI.PAGE_SIZE, 'ascending');
+			// 첫 페이지에서 총계를 알자마자 보고한다 — 나머지 페이지(최대 20개, ~1분)를
+			// 다 받을 때까지 기다리면 진행률 UI가 그동안 총계를 모르는 채로 있어야 한다.
+			if (page === 0 && result.totalResults >= 0) {
+				onTotal?.(result.totalResults);
+			}
 			if (result.papers.length > 0) {
 				emitted += result.papers.length;
 				await emit(result.papers);

@@ -299,8 +299,8 @@ export class SettingTab extends PluginSettingTab {
 					.setCta()
 					.onClick(() => {
 						void runCollectFlow('최근 논문 수집', this.plugin.collectflow.isBusy, () =>
-							this.runWithProgress('최근 논문 수집', (onStart) =>
-								this.plugin.collectflow.run('recent', undefined, onStart),
+							this.runWithProgress('최근 논문 수집', (onStart, onTotal) =>
+								this.plugin.collectflow.run('recent', undefined, onStart, onTotal),
 							),
 						);
 					}),
@@ -338,8 +338,8 @@ export class SettingTab extends PluginSettingTab {
 							// "종료일 당일 포함"으로 맞춘다.
 							const to = toMidnight + 24 * 60 * 60 * 1000;
 							await runCollectFlow('Backfill', this.plugin.collectflow.isBusy, () =>
-								this.runWithProgress('Backfill', (onStart) =>
-									this.plugin.collectflow.run('backfill', { from, to }, onStart),
+								this.runWithProgress('Backfill', (onStart, onTotal) =>
+									this.plugin.collectflow.run('backfill', { from, to }, onStart, onTotal),
 								),
 							);
 						},
@@ -648,15 +648,16 @@ export class SettingTab extends PluginSettingTab {
 	// 요청이 첫 번째의 총계를 0으로 리셋해 "29/0편" 같은 표시가 나온다(친구가 겪은 증상).
 	//
 	// CollectAndSave에는 이 존재가 전달되지 않는다 — 도메인은 Obsidian을 몰라야 한다
-	// (001 합의). 작업이 실제로 시작됐다는 사실만 onStart 콜백으로 되돌려받는다.
+	// (001 합의). 작업이 실제로 시작됐다는 사실만 onStart 콜백으로, 총계는 onTotal
+	// 콜백으로 되돌려받는다.
 	private async runWithProgress(
 		label: string,
-		action: (onStart: () => void) => Promise<void>,
+		action: (onStart: () => void, onTotal: (subtotal: number) => void) => Promise<void>,
 	): Promise<string | void> {
 		const flow: ProgressFlow = {
 			label,
-			// -1 = "총계 미정". 총 편수는 수집이 끝나야('all' 미들웨어) 알 수 있고, 0으로
-			// 두면 아직 오지 않은 총계를 실제 값처럼 "N/0편"으로 찍게 된다.
+			// -1 = "총계 미정". run()이 onTotal로 알려주기 전까지는 분모를 아는 척하지
+			// 않는다 — 0으로 두면 아직 안 온 총계를 실제 값처럼 "N/0편"으로 찍게 된다.
 			total: -1,
 			done: 0,
 			started: false,
@@ -665,12 +666,20 @@ export class SettingTab extends PluginSettingTab {
 		};
 		flow.notice = new Notice(this.renderProgress(flow), 0);
 		try {
-			await action(() => {
-				flow.started = true;
-				// 큐가 한 번에 하나만 실행하므로, 시작한 흐름이 곧 미들웨어가 갱신할 대상이다.
-				this.activeFlow = flow;
-				this.updateProgress(flow);
-			});
+			await action(
+				() => {
+					flow.started = true;
+					// 큐가 한 번에 하나만 실행하므로, 시작한 흐름이 곧 미들웨어가 갱신할 대상이다.
+					this.activeFlow = flow;
+					this.updateProgress(flow);
+				},
+				(subtotal) => {
+					// 구독마다 최대 한 번씩 불린다 — 값을 더해야 여러 구독을 합친 전체
+					// 총계가 된다(청크 도착 순서에 상관없이 각자 자기 몫만 보고한다).
+					flow.total = (flow.total < 0 ? 0 : flow.total) + subtotal;
+					this.updateProgress(flow);
+				},
+			);
 		} finally {
 			flow.notice?.hide();
 			flow.notice = undefined;
@@ -728,8 +737,10 @@ export class SettingTab extends PluginSettingTab {
 		// 미들웨어는 플러그인 수명 내내 등록된 채로 남는다. 갱신 대상은 항상 "지금 실행 중인
 		// 흐름"이고, 그게 없으면(예: 보정처럼 진행률을 안 쓰는 작업) 아무 일도 하지 않는다.
 		// 'all'은 이제 수집 전체가 아니라 **청크마다** 불린다(CollectAndSave.processChunk).
-		// 그래서 총계를 갈아끼우지 않고 더한다 — 분모가 수집이 진행되면서 커지는 형태다.
-		// 갈아끼우면 청크가 바뀔 때마다 "0/100"으로 되돌아간다.
+		// 총계(flow.total)는 여기서 건드리지 않는다 — runWithProgress에 넘긴 onTotal
+		// 콜백이 arXiv가 알려준 진짜 총계로 채운다. 예전에는 여기서 청크 크기를 계속
+		// 더해 "총계"를 흉내 냈는데, 그러면 분모 자체가 청크가 도착할 때마다 100, 200,
+		// 300으로 계속 늘어나는 것처럼 보였다(사용자 리포트로 발견).
 		this.plugin.collectflow.setMiddleware({
 			type: 'all',
 			run: (context) => {
@@ -738,7 +749,6 @@ export class SettingTab extends PluginSettingTab {
 				if (!flow) {
 					return;
 				}
-				flow.total = (flow.total < 0 ? 0 : flow.total) + papers.length;
 				flow.collected = (flow.collected ?? 0) + papers.length;
 				this.updateProgress(flow);
 			},

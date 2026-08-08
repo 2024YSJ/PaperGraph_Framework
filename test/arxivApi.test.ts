@@ -508,6 +508,116 @@ describe('날짜 구간 수집 — 페이지네이션과 커버리지', () => {
 		assert.equal(new Date(coverage.coveredThrough).toISOString().slice(0, 10), '2025-01-20');
 	});
 
+	// CollectOptions.onTotal — 진행률 UI가 "지금까지 받은 페이지 수"가 아니라 진짜
+	// 총계를 분모로 쓸 수 있게 첫 페이지 응답에서 한 번 알려준다.
+	describe('CollectOptions.onTotal — 진짜 총계를 한 번만 보고한다', () => {
+		it('첫 페이지 응답에서 곧바로 총계를 알려준다 — 전체를 다 받을 때까지 기다리지 않는다', async () => {
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					return response(200, '[]');
+				}
+				const start = Number(queryParams(param.url).get('start'));
+				// 총 250건: 100 + 100 + 50, 3페이지에 걸쳐 받는다.
+				const remaining = Math.max(0, 250 - start);
+				return response(200, feed(entries(Math.min(100, remaining), start), 250));
+			});
+
+			const totals: number[] = [];
+			const api = new ArxivAPI([KEYWORD]);
+			await withFastTimers(() =>
+				api.Backfill(FROM, TO, { onTotal: (total) => totals.push(total) }),
+			);
+
+			// 페이지가 3개인데도 한 번만, 그것도 250(진짜 총계)으로 불려야 한다 — 받은
+			// 페이지 수(100/200/300)를 총계로 착각하면 안 된다.
+			assert.deepEqual(totals, [250]);
+		});
+
+		it('여러 라운드로 나뉘어도(상한 초과) 총계는 첫 라운드 값 그대로, 한 번만 보고된다', async () => {
+			const base = Date.UTC(2025, 0, 2, 0, 0);
+			const at = (i: number): number => base + i * 60_000;
+			const corpusSize = 2500;
+
+			mockRequests((param) => {
+				if (param.url.includes('semanticscholar')) {
+					return response(200, '[]');
+				}
+				const params = queryParams(param.url);
+				const range = /submittedDate:\[(\d{12}) TO (\d{12})\]/.exec(
+					params.get('search_query') ?? '',
+				);
+				assert.ok(range);
+				const parse = (s: string): number =>
+					Date.UTC(
+						Number(s.slice(0, 4)),
+						Number(s.slice(4, 6)) - 1,
+						Number(s.slice(6, 8)),
+						Number(s.slice(8, 10)),
+						Number(s.slice(10, 12)),
+					);
+				const lo = parse(range[1]!);
+				const hi = parse(range[2]!);
+				const matched: number[] = [];
+				for (let i = 0; i < corpusSize; i += 1) {
+					if (at(i) >= lo && at(i) <= hi) {
+						matched.push(i);
+					}
+				}
+				const start = Number(params.get('start'));
+				const page = matched.slice(start, start + 100);
+				return response(
+					200,
+					feed(
+						page.map((i) =>
+							entry({
+								id: `http://arxiv.org/abs/2501.${String(i).padStart(5, '0')}v1`,
+								published: new Date(at(i)).toISOString(),
+							}),
+						),
+						// 라운드 2부터는 dateFilter가 좁아져 matched.length(남은 건수)가
+						// 2500보다 작아진다 — onTotal이 이 값을 보고하면 버그다.
+						matched.length,
+					),
+				);
+			});
+
+			const totals: number[] = [];
+			const api = new ArxivAPI([KEYWORD]);
+			await withFastTimers(() =>
+				api.Backfill(FROM, TO, { onTotal: (total) => totals.push(total) }),
+			);
+
+			// 라운드가 여러 개 돌았을 텐데(2500건은 2000건 상한을 넘음) 첫 라운드의
+			// 진짜 총계(2500) 한 번만 보고돼야 한다.
+			assert.deepEqual(totals, [2500]);
+		});
+
+		it('구간에 결과가 하나도 없으면 총계 0으로 보고한다', async () => {
+			// totalResults(0)도 "arXiv가 읽어준 값"이라 -1(못 읽음)과는 다르다 — 0/0으로
+			// 표시되는 게 "아직 모름"보다 정확하다.
+			arxivOnly(feed([], 0));
+
+			const totals: number[] = [];
+			const api = new ArxivAPI([KEYWORD]);
+			await withFastTimers(() =>
+				api.Backfill(FROM, TO, { onTotal: (total) => totals.push(total) }),
+			);
+
+			assert.deepEqual(totals, [0]);
+		});
+
+		it('arXiv가 총계를 못 읽어주면(-1) 부르지 않는다', async () => {
+			arxivOnly(feed(entries(1))); // totalResults 태그 없음 -> -1 폴백
+			const totals: number[] = [];
+			const api = new ArxivAPI([KEYWORD]);
+			await withFastTimers(() =>
+				api.Backfill(FROM, TO, { onTotal: (total) => totals.push(total) }),
+			);
+
+			assert.deepEqual(totals, []);
+		});
+	});
+
 	it('빈/역전 구간은 요청조차 하지 않고 즉시 끝낸다', async () => {
 		arxivOnly(feed([entry()], 1));
 

@@ -224,13 +224,23 @@ export class CollectAndSave {
 	//
 	// onStart는 "줄에서 빠져나와 실제로 시작했다"는 신호다. 큐가 생기면서 요청 시점과 실행
 	// 시점이 갈라졌고, UI는 그 둘을 다르게 표시해야 한다(대기 중 / 수집 중).
+	//
+	// onTotal은 구독(API 인스턴스)마다 최대 한 번씩, 그 구독이 이번 구간에 몇 편을
+	// 갖고 있는지 arXiv 응답으로 알게 되는 즉시 불린다(API.CollectOptions.onTotal 참고).
+	// 여러 구독을 순회하므로 총 여러 번 불릴 수 있다 — 호출자가 값을 누적해야 전체
+	// 총계가 된다.
 	run(
 		mode: 'recent' | 'backfill',
 		testOptions?: CollectTestOptions,
 		onStart?: () => void,
+		onTotal?: (subtotal: number) => void,
 	): Promise<void> {
 		const label = mode === 'recent' ? '최근 논문 수집' : 'Backfill';
-		return this.enqueue({ kind: mode, label }, () => this.runNow(mode, testOptions), onStart);
+		return this.enqueue(
+			{ kind: mode, label },
+			() => this.runNow(mode, testOptions, onTotal),
+			onStart,
+		);
 	}
 
 	repair(onStart?: () => void): Promise<void> {
@@ -246,6 +256,7 @@ export class CollectAndSave {
 	private async runNow(
 		mode: 'recent' | 'backfill',
 		testOptions?: CollectTestOptions,
+		onTotal?: (subtotal: number) => void,
 	): Promise<void> {
 		this.sub = await File.readSubscriptions();
 		const apis = this.sub.apis ?? [];
@@ -277,10 +288,16 @@ export class CollectAndSave {
 			embedGaveUp: false,
 		};
 		let chunks = 0;
-		const cursorUpdates = await this.collect(apis, mode, testOptions, (chunk) => {
-			chunks += 1;
-			return this.processChunk(chunk, stats);
-		});
+		const cursorUpdates = await this.collect(
+			apis,
+			mode,
+			testOptions,
+			(chunk) => {
+				chunks += 1;
+				return this.processChunk(chunk, stats);
+			},
+			onTotal,
+		);
 		if (chunks === 0) {
 			// 한 편도 안 걸린 실행에서도 'all'은 빈 배열로 한 번 불린다. 미들웨어가 실행마다
 			// 반드시 한 번은 호출된다는 보장이 없으면, 실행 단위로 초기화하는 미들웨어가
@@ -504,10 +521,12 @@ export class CollectAndSave {
 		mode: 'recent' | 'backfill',
 		testOptions: CollectTestOptions | undefined,
 		onChunk: (papers: Paper[]) => Promise<void>,
+		onTotal?: (subtotal: number) => void,
 	): Promise<{ apiName: string; querys: SearchQuery[]; cursor: number }[]> {
 		const options: CollectOptions = {
 			prefill: (papers) => this.prefillFromStore(papers),
 			onChunk,
+			onTotal,
 		};
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
 
