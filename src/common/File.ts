@@ -276,6 +276,12 @@ export class File {
 		await File.writePaperAt(paper, File.resolvePaperPath(paper));
 	}
 
+	// 논문의 .md 노트 경로(콘텐츠 트리 기준). 경로는 publicationDate/title/sourceId로 결정된다.
+	// 시각화에서 노드 클릭 시 노트를 여는 등에 쓴다.
+	static paperNotePath(paper: Paper): string {
+		return `${File.resolvePaperPath(paper)}.md`;
+	}
+
 	// 이 Paper가 저장될 자리에 이미 저장돼 있는 논문을 읽는다. 없으면 null. 저장 경로가
 	// publicationDate/title/sourceId로 결정되므로, 넘긴 paper의 이 필드들이 실제 저장본과
 	// 같아야 같은 파일을 찾는다 — run()이 "이미 임베딩된 논문인가"를 판단할 때 쓴다.

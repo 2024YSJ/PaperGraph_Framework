@@ -4,6 +4,11 @@ import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
 import { PCA } from './visualize/PCA';
 import { Visualization } from './visualize/Visualization';
+import {
+	CitationColorMiddleware,
+	CitationEdgeMiddleware,
+	OpenNoteOnClickMiddleware,
+} from './visualize/VisualMiddlewares';
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
@@ -77,6 +82,12 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow = new VisualizationFlow();
 		this.visualflow.pca = new PCA();
 		this.visualflow.visual = new Visualization();
+		// 피인용수에 따라 노드 색(파랑/주황)을 칠하는 시각화 미들웨어 등록.
+		this.visualflow.setMiddleware(new CitationColorMiddleware());
+		// 노드 클릭 시 해당 논문 .md 노트를 여는 시각화 미들웨어 등록.
+		this.visualflow.setMiddleware(new OpenNoteOnClickMiddleware(this.app));
+		// 논문 간 인용 관계를 엣지로 그리는 시각화 미들웨어 등록.
+		this.visualflow.setMiddleware(new CitationEdgeMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
 		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
 		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
@@ -104,9 +115,9 @@ export default class PaperGraph3D extends Plugin {
 
 		let leaf = workspace.getLeavesOfType(VIEW_TYPE_PAPERGRAPH3D)[0];
 		if (!leaf) {
-			const rightLeaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
-			await rightLeaf.setViewState({ type: VIEW_TYPE_PAPERGRAPH3D, active: true });
-			leaf = rightLeaf;
+			// 사이드 패널이 아니라 현재(메인) 탭에서 연다.
+			leaf = workspace.getLeaf(false);
+			await leaf.setViewState({ type: VIEW_TYPE_PAPERGRAPH3D, active: true });
 		}
 
 		await workspace.revealLeaf(leaf);
