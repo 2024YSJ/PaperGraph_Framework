@@ -19,6 +19,7 @@ export interface KeyValidationResult {
 // 저비용 엔드포인트로 키 유효성만 확인한다.
 export interface KeyValidator {
 	provider: string; // Secret의 provider 키와 동일 체계(S2_SECRET_PROVIDER 등)
+	label: string; // 설정 탭 드롭다운에 보여줄 사람이 읽는 이름
 	validate(key: string): Promise<KeyValidationResult>;
 }
 
@@ -33,6 +34,7 @@ const S2_VALIDATION_ENDPOINT = 'https://api.semanticscholar.org/graph/v1/paper/s
 
 export const S2_KEY_VALIDATOR: KeyValidator = {
 	provider: S2_SECRET_PROVIDER,
+	label: 'Semantic Scholar',
 	async validate(key: string): Promise<KeyValidationResult> {
 		try {
 			// maxAttempts: 1 — 검증은 재시도할 필요가 없다. 401/403은 몇 번을 다시 불러도
