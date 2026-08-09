@@ -8,6 +8,7 @@ import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
 import { File } from './common/File';
+import { Log } from './common/Log';
 import { SettingTab } from './adapter/SettingTab';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 
@@ -77,6 +78,9 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.pca = new PCA();
 		this.visualflow.visual = new Visualization();
 		File.init(this.app.vault, this.manifest.dir ?? '');
+		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
+		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
+		Log.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
@@ -108,5 +112,14 @@ export default class PaperGraph3D extends Plugin {
 		await workspace.revealLeaf(leaf);
 	}
 
-	onunload() {}
+	// 플러그인이 꺼지거나 리로드될 때. 이미 나간 requestUrl 호출은 취소할 수 없지만
+	// (CollectAndSave.dispose 주석 참고), 그 뒤로 큐에서 새 작업을 시작하거나 다음
+	// 구독으로 넘어가는 것은 여기서 멈춘다 — 안 그러면 언로드 후에도 백그라운드에서
+	// 수집이 계속 돈다.
+	onunload() {
+		this.collectflow?.dispose();
+		// ⚠️ 임시 진단 코드 — 삭제 예정. flush 타이머가 안 치워지면 언로드 후에도 타이머가
+		// 남아 다음 로드 때 두 개의 타이머가 같은 파일을 두고 경쟁하게 된다.
+		Log.dispose();
+	}
 }

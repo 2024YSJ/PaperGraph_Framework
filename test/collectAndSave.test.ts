@@ -11,7 +11,14 @@ import type { Middleware } from '../src/common/Middleware';
 import { Paper } from '../src/collect/Paper';
 import { S2_SECRET_PROVIDER } from '../src/collect/API';
 import { mockRequests, recordedRequests, response } from './stubs/obsidian';
-import { entries, entry, feed, installDomParser, withFastTimers } from './helpers/arxivFixtures';
+import {
+	entries,
+	entry,
+	feed,
+	installDomParser,
+	queryParams,
+	withFastTimers,
+} from './helpers/arxivFixtures';
 import { VaultStub } from './helpers/vaultStub';
 
 // 네트워크(requestUrl)와 Vault만 대역이고 나머지는 전부 실제 코드가 도는 통합 테스트.
@@ -24,6 +31,10 @@ installDomParser();
 // File은 init()으로 받은 경로를 그대로 쓰므로 테스트에서는 아무 값이나 상관없다.
 const PLUGIN_DIR = 'test-plugin-dir/papergraph3d';
 
+// Backfill 테스트가 쓰는 구간. 값 자체에 의미는 없고 유효한 범위이기만 하면 된다.
+const FROM_MS = Date.UTC(2025, 0, 1);
+const TO_MS = Date.UTC(2025, 0, 31);
+
 let vault: VaultStub;
 
 // ── 대역 Embedding ───────────────────────────────────────────────────
@@ -35,7 +46,19 @@ interface EmbeddingSpy {
 	resetCount: number;
 	installed: boolean;
 	failOn?: (title: string) => boolean;
+	// 연속 실패 몇 번에 브레이커가 열리는지, 열리면 남은 쿨다운은 얼마인지.
+	// 0이면 아예 안 열린다(대부분의 테스트가 신경 쓸 필요 없는 기본값).
+	tripCooldownMs: number;
+	// true면 기다려도 안 풀린다(모델이 회복 불가능한 상태). false면 호출자가 쿨다운을
+	// 확인하고 기다린 것으로 보고 풀린다 — 실제로는 시간이 지나 끝나는 것인데,
+	// withFastTimers가 대기를 0ms로 만들어 시계로는 재현할 수 없다.
+	cooldownPersists: boolean;
+	// 지금 남은 쿨다운(ms). 테스트가 직접 만질 일은 없다 — 실패가 쌓이면 열린다.
+	cooldownMs: number;
 }
+
+// 실제 Embedding과 같은 값 (Embedding.FAILURE_LIMIT).
+const FAKE_FAILURE_LIMIT = 3;
 
 function fakeEmbedding(overrides: Partial<EmbeddingSpy> = {}): {
 	spy: EmbeddingSpy;
@@ -46,16 +69,35 @@ function fakeEmbedding(overrides: Partial<EmbeddingSpy> = {}): {
 		maxConcurrent: 0,
 		resetCount: 0,
 		installed: true,
+		tripCooldownMs: 0,
+		cooldownPersists: false,
+		cooldownMs: 0,
 		...overrides,
 	};
 	let inFlight = 0;
+	let consecutiveFailures = 0;
 
 	const embedding = {
 		isModelInstalled: () => Promise.resolve(spy.installed),
 		resetCircuitBreaker: () => {
 			spy.resetCount += 1;
+			spy.cooldownMs = 0;
+			consecutiveFailures = 0;
+		},
+		get breakerCooldownRemainingMs(): number {
+			const remaining = spy.cooldownMs;
+			if (!spy.cooldownPersists) {
+				// 호출자가 이 값을 보고 기다릴 것이므로, 그 뒤에는 풀린 상태가 된다.
+				spy.cooldownMs = 0;
+				consecutiveFailures = 0;
+			}
+			return remaining;
 		},
 		embed: async (title: string) => {
+			// 브레이커가 열려 있으면 실제 Embedding도 시도조차 않고 즉시 throw한다.
+			if (spy.cooldownMs > 0) {
+				throw new Error('PaperGraph3D: 임베딩이 반복 실패해 잠시 중단된 상태입니다.');
+			}
 			inFlight += 1;
 			spy.maxConcurrent = Math.max(spy.maxConcurrent, inFlight);
 			spy.calls.push(title);
@@ -63,8 +105,14 @@ function fakeEmbedding(overrides: Partial<EmbeddingSpy> = {}): {
 			await Promise.resolve();
 			inFlight -= 1;
 			if (spy.failOn?.(title) === true) {
+				// 연속 실패가 쌓이면 브레이커가 열린다 — 실제 Embedding.recordFailure와 같은 규칙.
+				consecutiveFailures += 1;
+				if (spy.tripCooldownMs > 0 && consecutiveFailures >= FAKE_FAILURE_LIMIT) {
+					spy.cooldownMs = spy.tripCooldownMs;
+				}
 				throw new Error(`임베딩 실패: ${title}`);
 			}
+			consecutiveFailures = 0;
 			return {
 				embedding: [0.1, 0.2, 0.3],
 				embeddingModel: 'test-model',
@@ -83,10 +131,13 @@ function writeSubscriptionsFile(queries: string[], updateTime?: number): void {
 	vault.files.set(
 		`${PLUGIN_DIR}/Subscriptions.json`,
 		JSON.stringify({
-			updateTime,
+			// 커서(updateTime)는 구독마다 독립이다 — 여기서는 넘겨받은 값을 모든 항목에
+			// 똑같이 싣는다. 지금까지의 커서 테스트는 전부 구독 하나짜리(queries.length===1)라
+			// "그 하나의 커서"라는 의미로 그대로 통한다.
 			apis: queries.map((query) => ({
 				apiName: 'arxiv',
 				querys: [{ searchType: 'keyword', query }],
+				updateTime,
 			})),
 		}),
 	);
@@ -121,10 +172,13 @@ function requestedWindow(): { from: string; to: string } {
 	return { from: matched[1] ?? '', to: matched[2] ?? '' };
 }
 
+// 구독이 하나뿐인 테스트에서 "그 구독의 커서"를 읽는다. 커서가 구독마다 독립이 된 뒤로
+// 파일에 top-level updateTime이 없다 — apis[0].updateTime을 본다.
 function storedSubscriptions(): { updateTime?: number } {
 	const raw = vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`);
 	assert.ok(raw !== undefined, 'Subscriptions.json이 저장되지 않았다');
-	return JSON.parse(raw) as { updateTime?: number };
+	const data = JSON.parse(raw) as { apis?: { updateTime?: number }[] };
+	return { updateTime: data.apis?.[0]?.updateTime };
 }
 
 beforeEach(() => {
@@ -596,6 +650,94 @@ describe('CollectAndSave.run — 커서', () => {
 		);
 		assert.equal(new Date(updateTime).getUTCFullYear(), 2025);
 	});
+
+	it('구독마다 독립된 커서로 서로 다른 구간을 훑는다', async () => {
+		// 새 구독(cursor=0)과 이미 진행 중이던 구독(cursor=일주일 전)을 함께 등록한다.
+		// 예전(전역 커서 하나)이었다면 둘 다 같은 구간을 훑거나, 둘 중 하나가 서로의
+		// 진행 상황에 끌려다녔다.
+		const advancedCursor = Date.now() - 7 * 24 * 60 * 60 * 1000;
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'brand-new' }], updateTime: 0 },
+					{
+						apiName: 'arxiv',
+						querys: [{ searchType: 'keyword', query: 'already-running' }],
+						updateTime: advancedCursor,
+					},
+				],
+			}),
+		);
+		arxivOnly(feed([], 0));
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).run('recent');
+
+		const requests = recordedRequests().filter((r) => r.url.includes('arxiv.org'));
+		const windowFor = (query: string): { from: string; to: string } => {
+			const url = requests.find((r) => decodeURIComponent(r.url).includes(query))?.url ?? '';
+			const q = decodeURIComponent(url).replace(/\+/g, ' ');
+			const matched = /submittedDate:\[(\d{12}) TO (\d{12})\]/.exec(q);
+			assert.ok(matched, `${query} 요청에 날짜 구간이 없다: ${q}`);
+			return { from: matched[1] ?? '', to: matched[2] ?? '' };
+		};
+
+		// 새 구독은 "지금"에서 4일 물러난 지점부터, 진행 중이던 구독은 자기 커서(일주일 전)
+		// 에서 4일 물러난 지점부터 — 서로 다른 from이어야 한다.
+		const newSub = windowFor('brand-new');
+		const runningSub = windowFor('already-running');
+		assert.notEqual(newSub.from, runningSub.from, '두 구독이 같은 구간을 훑었다');
+
+		// 저장된 결과도 각자의 커서로 따로 갱신된다.
+		const stored = JSON.parse(
+			vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}',
+		) as { apis: { querys: { query: string }[]; updateTime: number }[] };
+		const cursorFor = (query: string): number | undefined =>
+			stored.apis.find((api) => api.querys[0]?.query === query)?.updateTime;
+
+		assert.ok((cursorFor('brand-new') ?? 0) > 0, '새 구독의 커서가 안 움직였다');
+		assert.ok(
+			(cursorFor('already-running') ?? 0) > advancedCursor,
+			'진행 중이던 구독의 커서가 안 움직였다',
+		);
+	});
+
+	it('한 구독이 실패해도 앞서 성공한 구독의 커서는 갱신되지 않는다 — 보수적 동작', async () => {
+		// collect()는 예외가 나면 그때까지 모은 cursorUpdates를 호출자에게 못 넘긴다.
+		// 부분 갱신을 허용하면 실패한 구독을 재시도할 때 성공했던 구독까지 다시 도는
+		// 낭비는 없지만, "이번 실행이 정말 끝까지 끝났다"는 보장이 흐려진다 — 기존
+		// advanceCursor의 전체-성공-후-일괄 방식을 그대로 유지한다.
+		let call = 0;
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			call += 1;
+			if (call === 1) {
+				return response(200, feed([], 0)); // 첫 구독은 성공
+			}
+			return response(500, 'boom'); // 두 번째 구독은 실패
+		});
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'succeeds' }], updateTime: 0 },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'fails' }], updateTime: 0 },
+				],
+			}),
+		);
+		const { embedding } = fakeEmbedding();
+
+		await assert.rejects(() => collectFlow(embedding).run('recent'));
+
+		const stored = JSON.parse(
+			vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}',
+		) as { apis: { querys: { query: string }[]; updateTime: number }[] };
+		const succeeded = stored.apis.find((api) => api.querys[0]?.query === 'succeeds');
+		assert.equal(succeeded?.updateTime, 0, '실패한 실행인데 일부 구독의 커서가 갱신됐다');
+	});
 });
 
 // ── 재스캔 시 이미 아는 인용수는 S2에 다시 묻지 않는다 (knownCitations) ─────
@@ -631,6 +773,42 @@ describe('CollectAndSave.run — 저장된 인용수는 S2에 다시 묻지 않�
 
 		assert.equal(s2Called, false, '이미 아는 인용수인데 S2를 다시 불렀다');
 		assert.equal(vault.storedPapers()[0]?.paper.citationCount, 7, '기존 인용수가 유지돼야 한다');
+	});
+
+	it('재스캔에서 보강을 건너뛴 논문의 references가 빈 배열로 덮이지 않는다', async () => {
+		// references는 인용수와 같은 S2 응답으로 채워지므로 citationsKnown 하나가 둘 다의
+		// "보강 완료" 플래그다. 재스캔은 그 플래그를 보고 S2를 건너뛰는데, prefill이
+		// 인용수만 복원하고 references를 빼먹으면 arXiv 파싱 기본값인 빈 배열이 그대로
+		// 저장돼 인용 그래프의 엣지가 조용히 사라진다.
+		writeSubscriptionsFile(['graph']);
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(
+					200,
+					JSON.stringify([
+						{
+							citationCount: 7,
+							externalIds: { ArXiv: '2501.00001' },
+							references: [{ externalIds: { ArXiv: '1706.03762' } }],
+						},
+					]),
+				);
+			}
+			return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00001v1' })], 1));
+		});
+		const { embedding } = fakeEmbedding();
+		await collectFlow(embedding).run('recent', { hours: 24 });
+		assert.deepEqual(vault.storedPapers()[0]?.paper.references, ['arxiv:1706.03762']);
+
+		// 2차 재스캔 — S2는 호출되지 않고, 저장본의 references가 그대로 남아야 한다.
+		const { embedding: embedding2 } = fakeEmbedding();
+		await collectFlow(embedding2).run('recent', { hours: 24 });
+
+		assert.deepEqual(
+			vault.storedPapers()[0]?.paper.references,
+			['arxiv:1706.03762'],
+			'재스캔이 저장된 references를 빈 배열로 덮었다',
+		);
 	});
 
 	it('citationsKnown=false인 논문은 재스캔에서도 정상적으로 S2에 묻는다', async () => {
@@ -906,6 +1084,45 @@ describe('CollectAndSave.repair — 보정 패스', () => {
 		assert.equal(enriched?.paper.citationCount, 42);
 	});
 
+	it('보정이 references도 함께 채운다 — references가 빈 옛 논문의 복구 경로', async () => {
+		// references를 채우기 전에 수집된 논문은 citationsKnown=true인데 references는
+		// 빈 배열이다. 그 논문들은 이 조건으로는 보정 대상이 아니지만(citationsKnown이
+		// 이미 true), citationsKnown=false로 남아 있던 논문은 보정이 인용수와 references를
+		// 한 번에 채워준다 — 같은 S2 응답에서 오기 때문이다.
+		await File.writePaper(
+			buildStoredPaper({
+				sourceId: 'arxiv:2501.00003',
+				title: '보강 안 된 논문',
+				citationsKnown: false,
+				citationCount: 0,
+				references: [],
+			}),
+		);
+		mockRequests((param) => {
+			if (!param.url.includes('semanticscholar')) {
+				throw new Error(`repair가 예상 밖 요청을 보냈다: ${param.url}`);
+			}
+			const ids = (JSON.parse(param.body ?? '{}') as { ids: string[] }).ids;
+			return response(
+				200,
+				JSON.stringify(
+					ids.map((id) => ({
+						citationCount: 11,
+						externalIds: { ArXiv: id.replace(/^ARXIV:/, '') },
+						references: [{ externalIds: { ArXiv: '1706.03762' } }],
+					})),
+				),
+			);
+		});
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).repair();
+
+		const enriched = vault.storedPapers().find((s) => s.paper.title === '보강 안 된 논문');
+		assert.equal(enriched?.paper.citationCount, 11);
+		assert.deepEqual(enriched?.paper.references, ['arxiv:1706.03762']);
+	});
+
 	it('둘 다 멀쩡한 논문은 재시도도 재저장도 하지 않는다', async () => {
 		await File.writePaper(buildStoredPaper({ title: '완전한 논문' }));
 		s2Only(1);
@@ -917,6 +1134,93 @@ describe('CollectAndSave.repair — 보정 패스', () => {
 		assert.equal(spy.calls.length, 0);
 		assert.equal(recordedRequests().length, 0, 'S2에 물어볼 것이 없어야 한다');
 		assert.deepEqual(vault.files, before);
+	});
+
+	// 보정은 실패한 논문만 모아 도는 경로라 서킷브레이커가 열릴 확률이 가장 높다.
+	// run() 경로와 같은 대응(쿨다운 기다렸다 재개, 계속 안 풀리면 포기)을 공유하는지 확인한다.
+	it('브레이커가 열려도 쿨다운을 기다렸다 재개한다 — 남은 논문을 즉시 실패로 흘리지 않는다', async () => {
+		for (let i = 0; i < 6; i += 1) {
+			await File.writePaper(
+				buildStoredPaper({
+					sourceId: `arxiv:2501.0000${i}`,
+					title: `Paper ${i}`,
+					embeddingSucceeded: false,
+					embedding: [],
+				}),
+			);
+		}
+		s2Only(1);
+		const failing = new Set(['Paper 0', 'Paper 1', 'Paper 2']);
+		const { embedding, spy } = fakeEmbedding({
+			failOn: (title) => failing.has(title),
+			tripCooldownMs: 60_000,
+			cooldownPersists: false,
+		});
+
+		await withFastTimers(() => collectFlow(embedding).repair());
+
+		assert.equal(spy.calls.length, 6, '쿨다운 후 나머지 논문을 시도하지 않았다');
+		const succeeded = vault.storedPapers().filter((s) => s.paper.embeddingSucceeded);
+		assert.equal(succeeded.length, 3, '쿨다운 후 재임베딩이 재개되지 않았다');
+	});
+
+	it('브레이커가 계속 열려 있으면 포기하되, 이미 고친 것은 저장돼 있다 — 점진 저장', async () => {
+		for (let i = 0; i < 5; i += 1) {
+			await File.writePaper(
+				buildStoredPaper({
+					sourceId: `arxiv:2501.0000${i}`,
+					title: `Paper ${i}`,
+					embeddingSucceeded: false,
+					embedding: [],
+				}),
+			);
+		}
+		s2Only(1);
+		const { embedding, spy } = fakeEmbedding({
+			failOn: () => true,
+			tripCooldownMs: 60_000,
+			cooldownPersists: true, // 기다려도 안 풀린다
+		});
+
+		await withFastTimers(() => collectFlow(embedding).repair());
+
+		assert.equal(
+			spy.calls.length,
+			FAKE_FAILURE_LIMIT,
+			`브레이커가 열린 뒤에도 계속 시도했다: ${spy.calls.length}회`,
+		);
+		assert.ok(
+			vault.storedPapers().every((s) => !s.paper.embeddingSucceeded),
+			'전부 실패했어야 한다',
+		);
+	});
+
+	it('완료 집계(lastRepairStats)를 남긴다', async () => {
+		await File.writePaper(
+			buildStoredPaper({
+				sourceId: 'arxiv:2501.00001',
+				title: '재임베딩 대상',
+				embeddingSucceeded: false,
+				embedding: [],
+			}),
+		);
+		await File.writePaper(
+			buildStoredPaper({
+				sourceId: 'arxiv:2501.00002',
+				title: '인용수 보강 대상',
+				citationsKnown: false,
+				citationCount: 0,
+			}),
+		);
+		s2Only(9);
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		await flow.repair();
+
+		assert.equal(flow.lastRepairStats?.reembedded, 1);
+		assert.equal(flow.lastRepairStats?.citationsFixed, 1);
+		assert.equal(flow.lastRepairStats?.reembedFailed, 0);
 	});
 });
 
@@ -930,11 +1234,6 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 		assert.deepEqual(subscriptions.apis, []);
 	});
 
-	it('updateTime도 undefined로 두지 않는다 — 파일이 있을 때와 같은 모양이어야 한다', async () => {
-		const subscriptions = await File.readSubscriptions();
-		assert.equal(subscriptions.updateTime, 0);
-	});
-
 	it('모르는 apiName이 저장돼 있으면 조용히 넘기지 않고 throw한다', async () => {
 		// 이 버전이 모르는 API로 저장된 파일(팀원이 새 API를 추가한 브랜치에서 저장 등).
 		// 조용히 빈 목록을 돌려주면 그 위에 저장이 일어나 기존 구독이 사라지므로,
@@ -944,6 +1243,154 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 			JSON.stringify({ updateTime: 123, apis: [{ apiName: 'pubmed', querys: [] }] }),
 		);
 		await assert.rejects(() => File.readSubscriptions(), /Unknown apiName: pubmed/);
+	});
+});
+
+// ── 구독별 커서 ─────────────────────────────────────────────────────
+// 커서(updateTime)는 Subscriptions 전체가 아니라 구독(API 인스턴스)마다 따로 갖는다.
+// 새 구독을 추가해도 다른 구독의 진행 상황을 건드리지 않고, 구독이 배열에서 옮겨져도
+// (추가/삭제) 커서가 그 구독을 계속 따라가야 한다.
+describe('File.readSubscriptions/writeSubscriptions — 구독별 커서', () => {
+	it('구독마다 커서를 따로 저장하고 따로 복원한다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 111 },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }], updateTime: 222 },
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis[0]?.updateTime, 111);
+		assert.equal(subscriptions.apis[1]?.updateTime, 222);
+	});
+
+	it('구버전 파일(전역 updateTime 하나)을 읽으면 모든 구독이 그 값을 커서로 물려받는다', async () => {
+		// 커서 형식이 바뀌었다고 갑자기 전체를 다시 backfill하면 안 된다 — 마이그레이션은
+		// "예전과 같은 지점부터 이어서 훑는다"가 목표다.
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				updateTime: 999,
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }] },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }] },
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis[0]?.updateTime, 999);
+		assert.equal(subscriptions.apis[1]?.updateTime, 999);
+	});
+
+	it('구독을 추가해도 기존 구독의 커서는 그대로 저장된다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'old' }], updateTime: 555 },
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'new' }]));
+		await File.writeSubscriptions(subscriptions);
+
+		const reread = await File.readSubscriptions();
+		assert.equal(reread.apis[0]?.updateTime, 555, '기존 구독의 커서가 바뀌었다');
+		assert.equal(reread.apis[1]?.updateTime, 0, '새 구독은 아직 수집한 적 없는 상태여야 한다');
+	});
+
+	describe('File.updateApiCursors', () => {
+		it('apiName+querys가 일치하는 구독만 커서를 갱신한다', async () => {
+			vault.files.set(
+				`${PLUGIN_DIR}/Subscriptions.json`,
+				JSON.stringify({
+					apis: [
+						{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 1 },
+						{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }], updateTime: 2 },
+					],
+				}),
+			);
+
+			await File.updateApiCursors([
+				{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], cursor: 100 },
+			]);
+
+			const subscriptions = await File.readSubscriptions();
+			assert.equal(subscriptions.apis[0]?.updateTime, 100, '대상 구독의 커서가 안 바뀌었다');
+			assert.equal(subscriptions.apis[1]?.updateTime, 2, '대상 아닌 구독의 커서가 바뀌었다');
+		});
+
+		it('수집 도중 추가된 구독을 덮어쓰지 않는다 — lost-update 회귀', async () => {
+			vault.files.set(
+				`${PLUGIN_DIR}/Subscriptions.json`,
+				JSON.stringify({
+					apis: [
+						{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 0 },
+					],
+				}),
+			);
+
+			// 수집이 도는 동안(File.updateApiCursors를 부르기 전에) 사용자가 구독을 추가했다고
+			// 가정한다.
+			const midFlight = await File.readSubscriptions();
+			midFlight.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'added-mid-run' }]));
+			await File.writeSubscriptions(midFlight);
+
+			await File.updateApiCursors([
+				{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], cursor: 42 },
+			]);
+
+			const after = await File.readSubscriptions();
+			const queries = after.apis.flatMap((api) => api.querys.map((q) => q.query));
+			assert.ok(queries.includes('added-mid-run'), '수집 중 추가된 구독이 사라졌다');
+			assert.equal(after.apis[0]?.updateTime, 42);
+		});
+	});
+
+	// updateApiCursors(수집 종료)와 persistSubscriptions(UI 저장)는 둘 다 mutateSubscriptions를
+	// 거친다. 각자 lost-update 방지 패턴(다시 읽고, 자기 필드만 고치고, 다시 쓴다)을 쓰지만
+	// 그것만으로는 두 호출이 정확히 겹치는 경우까지 못 막는다 — 큐가 그 마지막 구멍을 막는다.
+	describe('File.mutateSubscriptions — 직렬화', () => {
+		it('동시에 여러 번 호출해도 서로의 변경을 지우지 않는다', async () => {
+			vault.files.set(`${PLUGIN_DIR}/Subscriptions.json`, JSON.stringify({ apis: [] }));
+
+			// 큐가 없다면: 둘 다 apis:[]를 읽고, 둘 다 자기 구독 하나만 담아 쓴다 —
+			// 나중에 쓴 쪽이 이겨서 하나만 남는다.
+			await Promise.all([
+				File.mutateSubscriptions((subscriptions) => {
+					subscriptions.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'a' }]));
+				}),
+				File.mutateSubscriptions((subscriptions) => {
+					subscriptions.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'b' }]));
+				}),
+			]);
+
+			const stored = await File.readSubscriptions();
+			const queries = stored.apis.flatMap((api) => api.querys.map((q) => q.query)).sort();
+			assert.deepEqual(queries, ['a', 'b'], '동시 호출 중 한쪽의 변경이 사라졌다');
+		});
+
+		it('한쪽이 실패해도 큐는 막히지 않고 다음 변경이 반영된다', async () => {
+			vault.files.set(`${PLUGIN_DIR}/Subscriptions.json`, JSON.stringify({ apis: [] }));
+
+			await assert.rejects(() =>
+				File.mutateSubscriptions(() => {
+					throw new Error('mutator가 실패');
+				}),
+			);
+			await File.mutateSubscriptions((subscriptions) => {
+				subscriptions.apis.push(File.createApi('arxiv', [{ searchType: 'keyword', query: 'after-failure' }]));
+			});
+
+			const stored = await File.readSubscriptions();
+			assert.equal(stored.apis[0]?.querys[0]?.query, 'after-failure');
+		});
 	});
 });
 
@@ -963,5 +1410,341 @@ describe('File.readSecret/writeSecret — provider별 키 보존', () => {
 		const final = await File.readSecret();
 		assert.equal(final.getKey('otherProvider'), 'other-key', '다른 provider의 키가 사라졌다');
 		assert.equal(final.getKey(S2_SECRET_PROVIDER), 's2-key');
+	});
+});
+
+// ── 직렬 작업 큐 ──────────────────────────────────────────────────────
+// 수집 작업은 절대 겹치면 안 되지만(Embedding이 세션/서킷브레이커를 락 없이 공유), 자동
+// 수집이 도는 중에도 사용자가 구독을 추가하거나 Backfill을 실행할 수 있어야 한다. 그래서
+// 두 번째 요청은 거절이 아니라 큐에 들어가 순서대로 실행된다.
+describe('CollectAndSave — 직렬 작업 큐', () => {
+	it('실행 중에 다른 작업을 요청하면 거절하지 않고 줄을 세운다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['queued']);
+
+		const timeline: string[] = [];
+		const { embedding, spy } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		const first = flow.run('recent', { hours: 24 }, () => timeline.push('start:A'));
+		const second = flow.run('backfill', { from: Date.now() - 86_400_000, to: Date.now() }, () =>
+			timeline.push('start:B'),
+		);
+
+		// 입큐는 동기다: 요청하자마자 둘 다 줄에 서 있고, 아직 아무것도 시작하지 않았다.
+		// (거절됐다면 두 번째가 아예 줄에 없을 것이다.)
+		assert.deepEqual(
+			flow.queueState.waiting.map((job) => job.kind),
+			['recent', 'backfill'],
+		);
+		assert.equal(timeline.length, 0, `아직 아무것도 시작하면 안 된다: ${timeline.join(',')}`);
+
+		await Promise.all([first, second]);
+
+		assert.deepEqual(timeline, ['start:A', 'start:B'], '요청한 순서대로 실행되지 않았다');
+		// 겹쳤다면 두 작업의 임베딩이 동시에 in-flight가 된다 — Embedding이 락 없이 세션을
+		// 공유하므로 이게 큐가 막아야 할 실제 위험이다.
+		assert.equal(spy.maxConcurrent, 1, '두 작업의 임베딩이 겹쳤다');
+		assert.equal(flow.isBusy, false);
+		assert.equal(flow.queueState.waiting.length, 0);
+	});
+
+	it('한 작업이 실패해도 큐의 다음 작업은 실행된다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['after-failure']);
+		const { embedding, spy } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		// 범위 없는 Backfill은 resolveWindow에서 확실히 실패한다.
+		const failing = flow.run('backfill');
+		const following = flow.run('recent', { hours: 24 });
+
+		await assert.rejects(() => failing, /수집할 구간\(from\/to\)이 필요합니다/);
+		await following;
+		assert.ok(spy.calls.length > 0, '앞 작업의 실패로 뒤 작업까지 취소됐다');
+	});
+
+	it('아직 시작하지 않은 requestRecent는 하나로 합친다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['coalesce']);
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		// 첫 작업이 큐를 점유한 동안, 구독을 연달아 세 번 바꿨다고 가정한다.
+		const blocking = flow.run('backfill', { from: Date.now() - 86_400_000, to: Date.now() });
+		const a = flow.requestRecent();
+		const b = flow.requestRecent();
+		const c = flow.requestRecent();
+
+		assert.equal(a, b, 'recent 요청이 합쳐지지 않았다');
+		assert.equal(b, c);
+		assert.equal(flow.queueState.waiting.filter((job) => job.kind === 'recent').length, 1);
+
+		await Promise.all([blocking, a, b, c]);
+	});
+
+	it('이미 실행 중인 recent에는 합치지 않는다 — 그 작업은 새 구독을 못 본다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['running']);
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		// 실행이 시작된 시점에 새 recent를 요청한다.
+		let queuedDuringRun: Promise<void> | undefined;
+		const running = flow.requestRecent('첫 번째', () => {
+			queuedDuringRun = flow.requestRecent('구독 변경 반영');
+		});
+
+		await running;
+		assert.ok(queuedDuringRun !== undefined, '실행 중 요청이 만들어지지 않았다');
+		assert.notEqual(queuedDuringRun, running, '실행 중인 작업에 합쳐져 새 구독이 무시된다');
+		await queuedDuringRun;
+	});
+});
+
+// ── 플러그인 언로드 ──────────────────────────────────────────────────
+// requestUrl은 취소할 수 없으므로(ApiSupport.requestWithTimeout 주석 참고) 이미 나간
+// 요청은 dispose() 후에도 자연스럽게 끝난다. dispose()가 실제로 막는 건 "새로 시작하는 것"
+// — 대기 중인 큐 작업과, 아직 손대지 않은 다음 구독.
+describe('CollectAndSave — dispose()', () => {
+	it('dispose() 이후에는 큐에 있던 작업이 시작되지 않는다', async () => {
+		writeSubscriptionsFile(['graph']);
+		arxivOnly(feed([], 0));
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		flow.dispose();
+		await flow.run('recent');
+
+		assert.equal(recordedRequests().length, 0, '언로드 후에도 요청이 나갔다');
+	});
+
+	it('실행 중 dispose()가 호출되면 아직 시작 안 한 구독은 건너뛴다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'first' }], updateTime: 0 },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'second' }], updateTime: 0 },
+				],
+			}),
+		);
+		const { embedding } = fakeEmbedding();
+		const flow = collectFlow(embedding);
+
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			if (decodeURIComponent(param.url).includes('first')) {
+				// 첫 번째 구독의 요청이 나가는 시점에 플러그인이 언로드됐다고 가정한다.
+				flow.dispose();
+			}
+			return response(200, feed([], 0));
+		});
+
+		await flow.run('recent');
+
+		const requests = recordedRequests().filter((r) => r.url.includes('arxiv.org'));
+		assert.ok(requests.length > 0, '첫 번째 구독조차 요청을 안 보냈다');
+		assert.ok(
+			requests.every((r) => decodeURIComponent(r.url).includes('first')),
+			'언로드 이후에 시작하면 안 되는 두 번째 구독까지 요청이 나갔다',
+		);
+	});
+});
+
+// ── 구독 사이 요청 간격 ────────────────────────────────────────────────
+describe('CollectAndSave — 구독 사이에도 요청 간격을 둔다', () => {
+	it('한 구독의 수집이 끝나고 다음 구독을 시작하기 전에 API가 요구하는 간격만큼 쉰다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'a' }], updateTime: 0 },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'b' }], updateTime: 0 },
+				],
+			}),
+		);
+		arxivOnly(feed([], 0));
+		const { embedding } = fakeEmbedding();
+
+		// withFastTimers처럼 지연을 0으로 만들되, 요청받은 지연 시간은 기록해 둔다 —
+		// "정말 쉬었는가"가 아니라 "얼마를 쉬라고 요청했는가"를 검사하려는 것이다.
+		const requestedDelays: number[] = [];
+		const original = globalThis.setTimeout;
+		globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+			requestedDelays.push(timeout ?? 0);
+			return original(handler, 0, ...args);
+		}) as typeof globalThis.setTimeout;
+		try {
+			await collectFlow(embedding).run('recent');
+		} finally {
+			globalThis.setTimeout = original;
+		}
+
+		// ArxivAPI.requestDelayMs(=3000)가 구독 경계에서 요청됐어야 한다.
+		assert.ok(
+			requestedDelays.includes(3_000),
+			`구독 사이 3000ms 딜레이 요청이 없었다: ${requestedDelays.join(',')}`,
+		);
+	});
+});
+
+// ── 커서 저장이 구독을 덮어쓰지 않는다 ────────────────────────────────
+describe('CollectAndSave — 수집 중 추가된 구독 보존', () => {
+	it('수집이 끝나도 그 사이에 추가된 구독이 사라지지 않는다', async () => {
+		arxivOnly(feed([entry()], 1));
+		writeSubscriptionsFile(['original']);
+		const { embedding } = fakeEmbedding();
+
+		// 'all' 미들웨어는 수집이 끝나고 커서 저장 전에 불린다 — 사용자가 수집 도중에
+		// 구독을 추가하는 상황을 이 시점에 재현한다.
+		const addSubscriptionMidRun: Middleware = {
+			type: 'all',
+			run: async () => {
+				const subscriptions = await File.readSubscriptions();
+				subscriptions.apis = [
+					...subscriptions.apis,
+					File.createApi('arxiv', [{ searchType: 'keyword', query: 'added-during-run' }]),
+				];
+				await File.writeSubscriptions(subscriptions);
+			},
+		};
+
+		await collectFlow(embedding, [addSubscriptionMidRun]).run('recent');
+
+		const stored = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys?: { query: string }[] }[];
+		};
+		const queries = (stored.apis ?? []).flatMap((api) =>
+			(api.querys ?? []).map((q) => q.query),
+		);
+		assert.ok(
+			queries.includes('added-during-run'),
+			`수집 중 추가된 구독이 커서 저장에 덮여 사라졌다: ${JSON.stringify(queries)}`,
+		);
+		assert.ok(queries.includes('original'), '기존 구독까지 사라졌다');
+	});
+});
+
+// ── 청크 단위 점진 저장 ────────────────────────────────────────────────
+// Backfill 상한이 사라지면서 "전량을 다 받은 뒤에 저장"은 못 쓰게 됐다. 수만 편을
+// 메모리에 들고 있어야 하고, 마지막에 실패하면 그때까지 받은 게 전부 사라진다.
+describe('CollectAndSave — 청크 단위로 저장한다', () => {
+	it('수집 도중 네트워크가 끊겨도 그 전까지 받은 청크는 이미 저장돼 있다', async () => {
+		writeSubscriptionsFile(['partial']);
+		const { embedding } = fakeEmbedding();
+
+		// 1·2페이지는 정상(각 100건), 3페이지에서 500. 500은 재시도 대상이 아니라 즉시 throw다.
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			const start = Number(queryParams(param.url).get('start'));
+			if (start >= 200) {
+				return response(500, 'boom');
+			}
+			return response(200, feed(entries(100, start), 500));
+		});
+
+		await assert.rejects(() =>
+			withFastTimers(() =>
+				collectFlow(embedding).run('backfill', { from: FROM_MS, to: TO_MS }),
+			),
+		);
+
+		// 예전 구조라면 여기서 0편이었다 — 전량을 모은 뒤에야 저장했기 때문이다.
+		assert.equal(
+			vault.storedPapers().length,
+			200,
+			'실패 전에 받은 청크가 저장되지 않았다 — 점진 저장이 동작하지 않는다',
+		);
+	});
+
+	it('페이지가 나뉘어도 all 미들웨어가 청크마다 불리고 총합은 전체 편수와 같다', async () => {
+		writeSubscriptionsFile(['chunked']);
+		const { embedding } = fakeEmbedding();
+
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			const start = Number(queryParams(param.url).get('start'));
+			// 총 250건: 100 + 100 + 50
+			const remaining = Math.max(0, 250 - start);
+			return response(200, feed(entries(Math.min(100, remaining), start), 250));
+		});
+
+		const chunkSizes: number[] = [];
+		const observer: Middleware = {
+			type: 'all',
+			run: (context) => {
+				chunkSizes.push((context as Paper[]).length);
+			},
+		};
+
+		await withFastTimers(() =>
+			collectFlow(embedding, [observer]).run('backfill', { from: FROM_MS, to: TO_MS }),
+		);
+
+		assert.ok(chunkSizes.length > 1, `청크가 하나뿐이다: ${chunkSizes.join(',')}`);
+		assert.equal(
+			chunkSizes.reduce((sum, n) => sum + n, 0),
+			250,
+			'청크 합계가 전체 편수와 다르다',
+		);
+		assert.equal(vault.storedPapers().length, 250);
+	});
+});
+
+// ── 임베딩 서킷브레이커 ────────────────────────────────────────────────
+// 브레이커가 열리면 embed()는 시도조차 안 하고 즉시 throw한다. 그대로 두면 남은 논문이
+// 몇 초 만에 전부 빈 벡터로 저장된다.
+describe('CollectAndSave — 임베딩 서킷브레이커', () => {
+	it('브레이커가 열리면 쿨다운을 기다렸다 재개한다 — 남은 논문을 즉시 실패로 흘리지 않는다', async () => {
+		arxivOnly(feed(entries(6), 6));
+		writeSubscriptionsFile(['breaker']);
+
+		// 앞 3편이 연달아 실패해 브레이커가 열리고, 기다리면 풀린다.
+		const failing = new Set(['Paper 0', 'Paper 1', 'Paper 2']);
+		const { embedding, spy } = fakeEmbedding({
+			failOn: (title) => failing.has(title),
+			tripCooldownMs: 60_000,
+			cooldownPersists: false,
+		});
+
+		await withFastTimers(() => collectFlow(embedding).run('recent', { hours: 24 }));
+
+		// 기다린 뒤 나머지가 정상적으로 임베딩됐어야 한다 — 브레이커가 열렸다고 남은
+		// 논문을 전부 빈 벡터로 흘려보내면 안 된다.
+		assert.deepEqual(spy.calls, ['Paper 0', 'Paper 1', 'Paper 2', 'Paper 3', 'Paper 4', 'Paper 5']);
+		const succeeded = vault.storedPapers().filter((s) => s.paper.embeddingSucceeded);
+		assert.equal(succeeded.length, 3, '쿨다운 후 임베딩이 재개되지 않았다');
+	});
+
+	it('계속 열려 있으면 무한정 기다리지 않고 포기하되, 메타데이터는 저장한다', async () => {
+		arxivOnly(feed(entries(8), 8));
+		writeSubscriptionsFile(['breaker-stuck']);
+
+		// 전부 실패하고 기다려도 안 풀린다 = 모델이 회복 불가능한 상태.
+		const { embedding, spy } = fakeEmbedding({
+			failOn: () => true,
+			tripCooldownMs: 60_000,
+			cooldownPersists: true,
+		});
+
+		await withFastTimers(() => collectFlow(embedding).run('recent', { hours: 24 }));
+
+		// 브레이커가 열린 뒤로는 embed를 더 부르지 않는다. 논문마다 1분씩 서면 수집이
+		// 사실상 멈추므로, 몇 번 기다려보고 포기해야 한다.
+		assert.equal(
+			spy.calls.length,
+			FAKE_FAILURE_LIMIT,
+			`브레이커가 열린 뒤에도 계속 시도했다: ${spy.calls.length}회`,
+		);
+		// 임베딩은 실패했어도 논문 자체는 저장된다(보정 패스가 벡터를 채운다).
+		assert.equal(vault.storedPapers().length, 8, '임베딩 실패로 논문까지 버려졌다');
+		assert.ok(vault.storedPapers().every((stored) => !stored.paper.embeddingSucceeded));
 	});
 });

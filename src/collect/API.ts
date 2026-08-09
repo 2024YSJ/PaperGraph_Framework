@@ -1,6 +1,7 @@
 import { SearchQuery, combineQueries } from './SearchQuery';
 import { Paper } from './Paper';
 import type { Secret } from './Secret';
+import { Log } from '../common/Log';
 import {
 	chunk,
 	delay,
@@ -35,13 +36,31 @@ export interface API {
 	readonly apiName: string;
 	querys: SearchQuery[];
 
+	// 이 구독(apiName+querys)의 수집 커서 — "recent 수집이 여기부터 이어서 훑으면 된다"는
+	// 지점(epoch ms). 0이면 아직 한 번도 수집한 적이 없다는 뜻.
+	//
+	// 구독마다 독립이다. 예전에는 Subscriptions 하나에 커서가 하나뿐이라(전역 updateTime),
+	// 새 구독을 추가해도 그 구독은 "최근"만 보고 과거를 영영 못 봤고, 여러 API를 묶을 때도
+	// 서로 다른 색인 지연을 무시하고 가장 보수적인 값(Math.max) 하나로 전부를 다시 훑어야
+	// 했다. 커서를 API 인스턴스에 실어 apis[] 배열 항목과 함께 저장하면(File.writeSubscriptions
+	// 참고) 이 문제가 없어진다 — 구독이 배열 어디로 옮겨져도(추가/삭제) 커서가 그 구독을
+	// 계속 따라간다. 값을 정하는 건 CollectAndSave의 책임이므로 여기서는 그냥 필드로 둔다
+	// (readonly가 아닌 이유는 그 갱신 때문).
+	updateTime: number;
+
 	// "최근" 수집이 색인 지연을 놓치지 않으려면 커서보다 얼마나 뒤로 물러나 다시 훑어야
 	// 하는지 — 이 API가 얼마나 늦게 논문을 색인하는지는 이 API만 아는 사정이라 여기 둔다
 	// (ArxivAPI.ARXIV_RETRY의 재시도 간격을 ApiSupport가 아니라 여기 둔 것과 같은 이유:
-	// "3초는 arXiv의 사정이지 HTTP의 사정이 아니다"). CollectAndSave.run()이 recent 수집
-	// 구간을 계산할 때, 구독된 API들 중 가장 큰 값을 취해 "어느 하나도 못 보고 지나치지
-	// 않도록" 보수적으로 정한다.
+	// "3초는 arXiv의 사정이지 HTTP의 사정이 아니다"). CollectAndSave의 resolveWindow가
+	// 구독(이 API 인스턴스)마다 자기 커서(updateTime)와 이 값으로 각자의 recent 구간을
+	// 계산한다 — 구독마다 독립이라 다른 구독의 색인 지연에 끌려다니지 않는다.
 	readonly recentRescanWindowMs: number;
+
+	// 이 API에 연달아 요청을 보낼 때 지켜야 하는 최소 간격. CollectAndSave가 구독을
+	// 순차로 도는 루프에서, 한 구독의 마지막 요청과 다음 구독의 첫 요청 사이에도 이만큼
+	// 쉰다 — 두 구독이 우연히 같은 서비스(예: arXiv 두 개)면 그 사이에 쉬지 않을 이유가
+	// 없고, 다른 서비스라도 손해가 크지 않다.
+	readonly requestDelayMs: number;
 
 	// 이 API와 통신해 데이터를 가져오는 가장 근본적인 핵심 진입점(엔진). 날짜 조건 없이
 	// 현재 querys만으로 이 API에 실제로 접근하는 최소 단위의 통신을 수행한다.
@@ -54,18 +73,8 @@ export interface API {
 	// 지정 구간을 빠짐없이 훑는 수집 경로. 내부적으로 SearchBase가 쓰는 것과 같은 통신
 	// 엔진을 날짜 필터/페이지를 바꿔가며 반복 호출한다. SearchBase와 달리 "구간을 어디까지
 	// 실제로 훑었는가"에 책임을 지며, 그 결과를 lastCoverage로 보고한다.
-	//
-	// knownCitations: 호출자(CollectAndSave)가 이미 알고 있는 sourceId -> citationCount.
-	// 재스캔 구간이 이전에 이미 보강까지 끝낸 논문을 다시 잡아올 수 있는데, 그 값을 여기로
-	// 넘기면 구현체가 해당 논문의 인용수를 그대로 채우고 보강([3] 정책)을 건너뛴다 — 이미
-	// 아는 값을 얻으려고 외부 API(S2 등)를 다시 두드리지 않는다. 안 넘기면(undefined) 전부
-	// 새로 보강한다.
-	SearchRecentPaper(hours: number, knownCitations?: ReadonlyMap<string, number>): Promise<Paper[]>;
-	Backfill(
-		from: number,
-		to: number,
-		knownCitations?: ReadonlyMap<string, number>,
-	): Promise<Paper[]>;
+	SearchRecentPaper(hours: number, options?: CollectOptions): Promise<Paper[]>;
+	Backfill(from: number, to: number, options?: CollectOptions): Promise<Paper[]>;
 
 	// [3] 정책의 재시도 경로. citationsKnown=false인 논문만 골라 보강을 다시 시도하고,
 	// 나머지는 건드리지 않는다. 수집 경로는 내부에서 자동으로 호출하므로 외부에서 부를
@@ -79,9 +88,39 @@ export interface API {
 	readonly lastCoverage: CollectionCoverage | undefined;
 }
 
+// 구간 수집(SearchRecentPaper/Backfill)의 선택 옵션.
+//
+// 둘 다 "수집한 논문을 전부 배열로 돌려준다"는 단순한 계약을 깨기 위해 있다. 구간이
+// 커지면(무제한 Backfill) 전량을 메모리에 들고 있을 수도, 끝날 때까지 한 편도 저장하지
+// 않을 수도 없기 때문이다.
+export interface CollectOptions {
+	// 한 청크가 파싱된 직후, 보강([3] 정책) 전에 불린다. 호출자가 저장본에 이미 있는 값
+	// (인용수·임베딩 등)을 얹을 기회다. 여기서 citationsKnown이 true가 된 논문은
+	// EnrichCitations가 자연히 건너뛰므로, 이미 아는 값을 얻으려고 S2를 다시 두드리지 않는다.
+	//
+	// 구현체는 이 콜백이 무엇을 채우는지 알 필요가 없다 — citationsKnown만 본다.
+	prefill?: (papers: Paper[]) => Promise<void>;
+
+	// 청크가 완성될 때마다(보강까지 끝난 뒤) 불린다. 주면 반환 배열에 논문을 쌓지 않는다 —
+	// 호출자가 청크를 받는 즉시 저장하고 버릴 것을 전제로 한 계약이다. 안 주면 예전처럼
+	// 전량을 모아서 반환한다(단발 조회나 테스트처럼 규모가 작을 때 쓴다).
+	onChunk?: (papers: Paper[]) => Promise<void>;
+
+	// 이 구간(from~to)에 실제로 몇 편이 있는지 arXiv가 알려주는 즉시(첫 페이지 응답) 한
+	// 번만 불린다. 진행률 UI가 "지금까지 받은 페이지 수"가 아니라 진짜 총계를 분모로
+	// 쓸 수 있게 하려는 용도다 — 이 값이 없으면 청크가 도착할 때마다 총계 자체가 같이
+	// 늘어나는 것처럼 보인다(청크 스트리밍으로 바뀌며 생긴 표시 버그).
+	//
+	// 상한(MAX_PAGES)에 걸려 여러 라운드로 나뉘어도 이 값은 **첫 라운드에서 한 번만**
+	// 보고된다 — 이후 라운드는 좁아진 남은 구간의 건수라 원래 요청한 전체 구간의
+	// 총계가 아니다(collectRounds 주석 참고). 구간에 결과가 없거나 arXiv가 총계를
+	// 못 읽어주면(-1) 호출되지 않는다.
+	onTotal?: (total: number) => void;
+}
+
 // 직전 날짜 구간 수집이 실제로 어디까지 훑었는지.
 //
-// CollectAndSave.run()이 수집 커서(Subscriptions.updateTime)를 저장할 때 요청한 구간의
+// CollectAndSave.run()이 수집 커서(API.updateTime)를 저장할 때 요청한 구간의
 // 끝(window.to)을 그냥 쓰면 안 된다 — 상한에 걸려 잘렸으면 거기까지 간 게 아니어서,
 // 못 본 구간을 봤다고 기록하게 된다. truncated면 coveredThrough를 저장하고 다음 패스가
 // 거기서부터 이어받아야 한다.
@@ -123,6 +162,17 @@ interface ArxivPage {
 interface S2BatchElement {
 	citationCount?: number;
 	externalIds?: { ArXiv?: string } | null;
+	// 이 논문이 인용하는 논문들. externalIds만 요청하므로(제목 등은 안 받음) 각 항목에서
+	// ArXiv id 유무만 본다 — arXiv에 없는 참고문헌은 이 코퍼스의 노드가 될 수 없어서
+	// 어차피 그래프에서 매칭되지 않는다.
+	references?: ({ externalIds?: { ArXiv?: string } | null } | null)[] | null;
+}
+
+// S2 배치 조회가 논문 하나에 대해 알려주는 것. fetchCitationBatch의 반환 값 단위.
+interface S2PaperInfo {
+	citationCount: number;
+	// 인용하는 논문들의 sourceId ("arxiv:2501.12345" 형태, 버전 제거·중복 제거 완료).
+	references: string[];
 }
 
 // 예시용 구현체 — arXiv API. apiName은 'arxiv' 고정(Subscriptions 복원 시 판별 키).
@@ -133,12 +183,19 @@ interface S2BatchElement {
 export class ArxivAPI implements API {
 	public readonly apiName = 'arxiv';
 	public querys: SearchQuery[];
+	// 기본 0(아직 수집한 적 없음). File.readSubscriptions가 저장된 값(또는 구버전 전역
+	// 커서에서 마이그레이션한 값)으로 갈아끼운다.
+	public updateTime = 0;
 
 	// arXiv는 논문을 실시간이 아니라 배치로 공지한다. 특히 금요일 마감 이후 제출분은
 	// 월요일에야 뜨는 주말 갭이 있어, 최소 그 갭(~3일)을 덮어야 한다. 4일로 여유를 더 뒀다
 	// — 이 저장소에서 실측한 값은 아니고 이전 프로젝트의 관행을 이어받은 것이다
 	// (docs/devLog/004.md). 재현측이 나오면 이 상수만 조정하면 된다.
 	public readonly recentRescanWindowMs = 4 * 24 * 60 * 60 * 1000;
+
+	// PAGE_DELAY_MS(아래, 페이지 사이 간격)와 같은 값이다 — 이용약관이 요구하는 건 결국
+	// "arXiv에 대한 연속 요청 간격"이라, 페이지 사이든 구독 사이든 같은 규칙을 적용한다.
+	public readonly requestDelayMs = 3_000;
 
 	// ── arXiv 쿼리 문법 ──
 	// SearchQuery.searchType 허용값
@@ -162,7 +219,8 @@ export class ArxivAPI implements API {
 	// 논문을 빠짐없이" 가져오는 게 목적이라 단발 조회로는 안 되고 start를 올려가며 이어받는다.
 	// - PAGE_SIZE: arXiv는 요청당 최대 2000건까지 허용하지만 응답이 커질수록 타임아웃/스로틀
 	//   확률이 올라가므로 100건씩 나눠 받는다.
-	// - MAX_PAGES: 구간을 잘못 준 경우 무한정 긁는 사고를 막는 상한 (최대 2000건).
+	// - MAX_PAGES: 구간을 잘못 준 경우 무한정 긁는 사고를 막는 상한 (라운드당 최대 2000건).
+	//   여기 걸려도 수집이 끝나지는 않는다 — collectRounds가 남은 구간으로 다시 훑는다.
 	// - PAGE_DELAY_MS: arXiv 이용약관이 권장하는 연속 호출 간격.
 	private static readonly PAGE_SIZE = 100;
 	private static readonly MAX_PAGES = 20;
@@ -175,7 +233,11 @@ export class ArxivAPI implements API {
 
 	// arXiv는 과부하 시 503을 쓰고, 이용약관이 3초 간격을 권한다. 이 값이 공용
 	// ApiSupport가 아니라 여기 있는 이유다 — 3초는 arXiv의 사정이지 HTTP의 사정이 아니다.
-	private static readonly ARXIV_RETRY: RetryPolicy = { retryDelayMs: 3_000 };
+	//
+	// timeoutMs: arXiv 정상 응답은 한 페이지(100건)에 보통 1~3초다. 60초면 느린 응답을
+	// 오판할 여지가 사실상 없으면서, 스로틀 중인 서버가 연결만 잡고 응답을 안 주는 경우에
+	// 수집이 영원히 멈추지 않게 한다(requestUrl에는 타임아웃 옵션이 없다).
+	private static readonly ARXIV_RETRY: RetryPolicy = { retryDelayMs: 3_000, timeoutMs: 60_000 };
 
 	// ── S2 인용수 보강 ──
 	// API 객체는 "하나의 외부 서비스"가 아니라 "Paper를 완성하는 하나의 방법"이다.
@@ -184,11 +246,22 @@ export class ArxivAPI implements API {
 	// 빈 인용수를 메우는 부품이므로, 별도 API 구현체가 아니라 이 클래스의 private으로 둔다.
 	// (S2 자체를 수집원으로 쓸 일이 생기면 그때 별도의 implements API 클래스를 만든다.)
 	private static readonly S2_BATCH_ENDPOINT = 'https://api.semanticscholar.org/graph/v1/paper/batch';
-	private static readonly S2_BATCH_CHUNK_SIZE = 500; // S2 배치 엔드포인트의 요청당 최대 id 수
+	// S2 배치 엔드포인트 자체는 요청당 최대 500개 id를 받지만, references까지 실으면서
+	// 100으로 낮췄다 — 논문당 참고문헌이 보통 수십 개라 응답이 수십 배 커지는데, 응답이
+	// 클수록 타임아웃/스로틀 확률이 올라간다(arXiv PAGE_SIZE를 2000이 아니라 100으로
+	// 잡은 것과 같은 판단).
+	private static readonly S2_BATCH_CHUNK_SIZE = 100;
 	// externalIds를 함께 받는 이유는 fetchCitationBatch의 정렬 검증 때문이다.
 	// 이게 없으면 응답이 자기 arXiv id를 안 알려줘서 검증 자체가 불가능하다.
-	private static readonly S2_BATCH_FIELDS = 'externalIds,citationCount';
-	private static readonly S2_RETRY: RetryPolicy = { retryDelayMs: 3_000 };
+	// references.externalIds는 인용 그래프 엣지용 — 시각화(CitationEdgeMiddleware)가
+	// paper.references에서 엣지를 그리는데, arXiv 응답에는 참고문헌이 아예 없어서
+	// 이 요청이 references가 채워지는 유일한 경로다.
+	private static readonly S2_BATCH_FIELDS = 'externalIds,citationCount,references.externalIds';
+	private static readonly S2_RETRY: RetryPolicy = { retryDelayMs: 3_000, timeoutMs: 60_000 };
+	// 배치 청크 사이 간격. S2 익명 호출은 공용 rate limit(대략 초당 1회)을 다른 모든 익명
+	// 사용자와 나눠 쓴다. 키가 있으면 더 여유롭지만, 키 유무로 값을 나누면 "키를 넣었더니
+	// 429가 늘었다" 같은 상황을 만들기 쉬워 보수적인 쪽 하나로 통일한다.
+	private static readonly S2_CHUNK_DELAY_MS = 1_500;
 
 	// 직전 구간 수집의 커버리지. 값을 정하는 건 이 클래스의 책임이고 밖에서는 읽기만
 	// 하므로, 필드는 private으로 감추고 getter만 인터페이스에 노출한다.
@@ -222,25 +295,18 @@ export class ArxivAPI implements API {
 					`(entry ${page.entryCount}건 중 ${page.papers.length}건만 Paper로 변환됨)`,
 			);
 		}
-		await runQuietly(() => this.EnrichCitations(page.papers));
+		await runQuietly(() => this.EnrichCitations(page.papers), 'SearchBase.EnrichCitations');
 		return page.papers;
 	}
 
-	public SearchRecentPaper(
-		hours: number,
-		knownCitations?: ReadonlyMap<string, number>,
-	): Promise<Paper[]> {
+	public SearchRecentPaper(hours: number, options?: CollectOptions): Promise<Paper[]> {
 		const to = Date.now();
 		const from = to - hours * 60 * 60 * 1000;
-		return this.collectWindow(from, to, knownCitations);
+		return this.collectWindow(from, to, options);
 	}
 
-	public Backfill(
-		from: number,
-		to: number,
-		knownCitations?: ReadonlyMap<string, number>,
-	): Promise<Paper[]> {
-		return this.collectWindow(from, to, knownCitations);
+	public Backfill(from: number, to: number, options?: CollectOptions): Promise<Paper[]> {
+		return this.collectWindow(from, to, options);
 	}
 
 	// ── 수집 흐름 ──────────────────────────────────────────────────
@@ -250,12 +316,15 @@ export class ArxivAPI implements API {
 	// 날짜 필터와 페이지 번호만 계산해서 같은 엔진을 반복 호출한다(collectPaged 참고).
 
 	// SearchRecentPaper/Backfill의 공통 몸통. 구간을 검증하고, 페이지네이션으로 구간을
-	// 끝까지 훑은 뒤, 반환 전에 S2 인용수 보강까지 마친다 — "API = Paper를 완성하는 방법".
-	// 수집([1])은 실패 시 throw로 전파되지만, 보강([3])은 실패해도 수집 결과를 그대로 반환한다.
+	// 끝까지 훑으며, 청크마다 S2 인용수 보강까지 마쳐 내보낸다 — "API = Paper를 완성하는 방법".
+	// 수집([1])은 실패 시 throw로 전파되지만, 보강([3])은 실패해도 그 청크를 그대로 내보낸다.
+	//
+	// 보강을 마지막에 한 번이 아니라 청크마다 하는 이유: 구간이 무제한이라 전량을 모아두면
+	// 메모리도 문제지만, 무엇보다 마지막에 실패하면 그때까지 받은 게 전부 버려진다.
 	private async collectWindow(
 		from: number,
 		to: number,
-		knownCitations?: ReadonlyMap<string, number>,
+		options?: CollectOptions,
 	): Promise<Paper[]> {
 		this.coverage = undefined;
 
@@ -280,24 +349,148 @@ export class ArxivAPI implements API {
 			return [];
 		}
 
-		const papers = await this.collectPaged(ArxivAPI.buildDateFilter(from, to), from, to);
+		Log.info('arxiv.window', '구간 수집 시작', {
+			from: new Date(from).toISOString(),
+			to: new Date(to).toISOString(),
+			querys: this.querys.map((q) => `${q.searchType}:${q.query}`),
+		});
+		// onChunk를 준 호출자는 청크를 받는 즉시 저장하고 버린다 — 여기에 쌓지 않는다.
+		const collected: Paper[] = [];
+		let total = 0;
 
-		// 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아올 수 있다. 호출자가 이미
-		// 아는 값을 여기서 먼저 채워두면, 아래 EnrichCitations의 기존 필터
-		// (`if (citationsKnown) continue`)가 이 논문들을 자연히 건너뛴다 — S2를 다시
-		// 두드리지 않는다. 모르는 논문(이번에 새로 걸린 것)만 실제로 보강한다.
-		if (knownCitations) {
-			for (const paper of papers) {
-				const known = knownCitations.get(paper.sourceId);
-				if (known !== undefined) {
-					paper.citationCount = known;
-					paper.citationsKnown = true;
+		await this.collectRounds(
+			from,
+			to,
+			async (chunk) => {
+				// 재스캔 구간이 이전에 이미 보강을 끝낸 논문을 다시 잡아올 수 있다. 호출자가 이미
+				// 아는 값을 여기서 먼저 채워두면, 아래 EnrichCitations의 기존 필터
+				// (`if (citationsKnown) continue`)가 이 논문들을 자연히 건너뛴다 — S2를 다시
+				// 두드리지 않는다. 모르는 논문(이번에 새로 걸린 것)만 실제로 보강한다.
+				if (options?.prefill) {
+					await options.prefill(chunk);
 				}
+				await runQuietly(() => this.EnrichCitations(chunk), 'collectWindow.EnrichCitations');
+				total += chunk.length;
+				if (options?.onChunk) {
+					await options.onChunk(chunk);
+				} else {
+					collected.push(...chunk);
+				}
+			},
+			options?.onTotal,
+		);
+
+		Log.info('arxiv.window', '구간 수집 종료', { papers: total, coverage: this.coverage });
+		return collected;
+	}
+
+	// 요청한 구간을 **끝까지** 훑는다. collectPaged 한 번은 MAX_PAGES(=2000건)에서 멈추는데,
+	// 그건 "구간을 잘못 줬을 때 무한정 긁는 사고"를 막는 안전장치라 없앨 수 없다. 대신 잘렸을
+	// 때 그 지점(coveredThrough)부터 새 구간으로 다시 훑기를 반복해, 상한은 유지하면서도
+	// "요청한 범위는 다 가져온다"는 Backfill의 계약을 지킨다.
+	//
+	// 이어받기가 성립하는 근거는 collectPaged의 ascending 정렬이다(아래 주석 참고) —
+	// 훑은 구간이 항상 [from, coveredThrough]라는 연속 구간이라 그 끝에서 이어붙일 수 있다.
+	//
+	// 논문은 모아서 돌려주지 않고 페이지 단위로 emit한다. 구간이 무제한이라 전량을 들고
+	// 있으면 메모리가 구간 크기에 비례해 늘고, 무엇보다 마지막에 실패했을 때 그때까지 받은
+	// 게 전부 사라진다. sourceId Set만 끝까지 들고 있는데, 이건 문자열이라 부담이 작다.
+	private async collectRounds(
+		from: number,
+		to: number,
+		emit: (papers: Paper[]) => Promise<void>,
+		onTotal?: (total: number) => void,
+	): Promise<void> {
+		// 이어받기는 반드시 중복을 만든다: formatDate가 분 단위로 자르고 buildDateFilter의
+		// 범위가 양끝 포함([A TO B])이라, 경계 분의 논문이 다음 라운드에 또 걸린다.
+		const seen = new Set<string>();
+		let cursor = from;
+		let pages = 0;
+		let skippedEntries = 0;
+		let duplicates = 0;
+		let unique = 0;
+		// 첫 라운드의 값만 의미가 있다 — 이후 라운드는 좁아진 구간의 전체 건수라서
+		// "이 수집이 총 몇 건짜리였나"를 나타내지 못한다.
+		let totalResults = -1;
+		let truncated = false;
+
+		for (let round = 0; ; round += 1) {
+			if (round > 0) {
+				await delay(ArxivAPI.PAGE_DELAY_MS);
 			}
+
+			const dateFilter = ArxivAPI.buildDateFilter(cursor, to);
+			let received = 0;
+			await this.collectPaged(
+				dateFilter,
+				cursor,
+				to,
+				async (page) => {
+					received += page.length;
+					// 중복은 여기서 걸러 내보낸다 — 호출자가 같은 논문을 두 번 저장하지 않도록.
+					const fresh = page.filter((paper) => {
+						if (seen.has(paper.sourceId)) {
+							duplicates += 1;
+							return false;
+						}
+						seen.add(paper.sourceId);
+						return true;
+					});
+					if (fresh.length > 0) {
+						unique += fresh.length;
+						await emit(fresh);
+					}
+				},
+				// 첫 라운드의 총계만 "요청한 전체 구간"을 뜻한다 — 이후 라운드는 전달하지
+				// 않아, 호출자가 좁아진 남은 구간의 건수를 전체 총계로 오해하지 않게 한다.
+				round === 0 ? onTotal : undefined,
+			);
+			// collectPaged는 항상 this.coverage를 채우고 돌아온다.
+			const roundCoverage = this.coverage as CollectionCoverage;
+
+			pages += roundCoverage.pages;
+			skippedEntries += roundCoverage.skippedEntries;
+			if (round === 0) {
+				totalResults = roundCoverage.totalResults;
+			}
+
+			Log.info('arxiv.round', `라운드 ${round + 1} 완료`, {
+				dateFilter,
+				received,
+				unique,
+				duplicates,
+				pages: roundCoverage.pages,
+				truncated: roundCoverage.truncated,
+				coveredThrough: new Date(roundCoverage.coveredThrough).toISOString(),
+			});
+
+			if (!roundCoverage.truncated) {
+				break;
+			}
+
+			// 커서가 안 움직이면 다음 라운드가 같은 요청을 그대로 반복한다 — 무한 루프다.
+			// 한 분 안에 2000건이 몰린 극단적인 경우인데, 여기서 멈추고 truncated로 보고해
+			// 호출자(커서 저장)가 못 본 구간을 봤다고 기록하지 않게 한다.
+			if (roundCoverage.coveredThrough <= cursor) {
+				truncated = true;
+				Log.warn('arxiv.round', '커서가 전진하지 않아 중단 — 구간을 좁혀 다시 시도해야 한다', {
+					dateFilter,
+					cursor: new Date(cursor).toISOString(),
+					coveredThrough: new Date(roundCoverage.coveredThrough).toISOString(),
+				});
+				break;
+			}
+			cursor = roundCoverage.coveredThrough;
 		}
 
-		await runQuietly(() => this.EnrichCitations(papers));
-		return papers;
+		this.coverage = {
+			truncated,
+			// 완주했으면 요청한 끝까지 인정한다. 커서 정체로 멈췄으면 실제로 훑은 지점까지만.
+			coveredThrough: truncated ? cursor : to,
+			pages,
+			totalResults,
+			skippedEntries,
+		};
 	}
 
 	// 날짜 구간 수집. 자체 통신 로직 없이, 같은 엔진(fetchPage)을 start를 올려가며 반복
@@ -307,12 +500,16 @@ export class ArxivAPI implements API {
 	// 오래된 쪽이 잘려나가는데, 그 구멍은 "어디까지 봤다"는 값 하나로 표현할 수 없어
 	// 이어받을 방법이 없다. ascending이면 훑은 구간이 항상 [from, coveredThrough]라는
 	// 연속 구간이라, 잘려도 다음 패스가 coveredThrough부터 이어받으면 아무것도 안 잃는다.
+	//
+	// 페이지가 곧 청크다 — 받는 즉시 emit하고 여기서는 들고 있지 않는다.
 	private async collectPaged(
 		dateFilter: string,
 		windowFrom: number,
 		windowTo: number,
-	): Promise<Paper[]> {
-		const papers: Paper[] = [];
+		emit: (papers: Paper[]) => Promise<void>,
+		onTotal?: (total: number) => void,
+	): Promise<void> {
+		let emitted = 0;
 		let latestPublishedMs: number | undefined;
 		let totalResults = -1;
 		// [2] 정책 — entry는 받았지만 필수 필드 누락 등으로 Paper가 못 된 항목의 누적 수.
@@ -326,7 +523,15 @@ export class ArxivAPI implements API {
 
 			const start = page * ArxivAPI.PAGE_SIZE;
 			const result = await this.fetchPage(dateFilter, start, ArxivAPI.PAGE_SIZE, 'ascending');
-			papers.push(...result.papers);
+			// 첫 페이지에서 총계를 알자마자 보고한다 — 나머지 페이지(최대 20개, ~1분)를
+			// 다 받을 때까지 기다리면 진행률 UI가 그동안 총계를 모르는 채로 있어야 한다.
+			if (page === 0 && result.totalResults >= 0) {
+				onTotal?.(result.totalResults);
+			}
+			if (result.papers.length > 0) {
+				emitted += result.papers.length;
+				await emit(result.papers);
+			}
 			totalResults = result.totalResults;
 			skippedEntries += result.entryCount - result.papers.length;
 			// 커서는 절대 뒤로 가지 않게 max로 누적한다. ascending이라 보통은 페이지마다
@@ -353,16 +558,25 @@ export class ArxivAPI implements API {
 					totalResults,
 					skippedEntries,
 				};
+				Log.info('arxiv.paged', '구간 완주', {
+					dateFilter,
+					reason: !filledPage ? 'lastPage' : 'reachedTotal',
+					pages: page + 1,
+					papers: emitted,
+					totalResults,
+					skippedEntries,
+				});
 				if (skippedEntries > 0) {
 					console.warn(`ArxivAPI: ${skippedEntries}건 스킵됨 (구간 ${dateFilter})`);
 				}
-				return papers;
+				return;
 			}
 		}
 
 		// 상한에 걸려 중단 — 구간에 논문이 예상보다 많다. 커서를 windowTo까지 올려버리면
 		// 못 본 구간을 봤다고 기록하는 셈이니, 실제로 훑은 지점까지만 인정한다.
 		// 읽어낼 제출 시각이 하나도 없었으면 전진 없음(windowFrom)으로 둔다.
+		// 여기서 수집이 끝나지는 않는다 — collectRounds가 이 지점부터 다시 훑는다.
 		this.coverage = {
 			truncated: true,
 			coveredThrough: latestPublishedMs ?? windowFrom,
@@ -370,14 +584,14 @@ export class ArxivAPI implements API {
 			totalResults,
 			skippedEntries,
 		};
-		console.warn(
-			`ArxivAPI: reached MAX_PAGES(${ArxivAPI.MAX_PAGES}) for ${dateFilter} — ` +
-				`collected ${papers.length} papers, covered through ` +
-				`${new Date(this.coverage.coveredThrough).toISOString()}. ` +
-				`Resume from there or narrow the date range.` +
-				(skippedEntries > 0 ? ` (${skippedEntries}건 스킵됨)` : ''),
-		);
-		return papers;
+		Log.info('arxiv.paged', '라운드 상한(MAX_PAGES) 도달 — 남은 구간은 다음 라운드로', {
+			dateFilter,
+			maxPages: ArxivAPI.MAX_PAGES,
+			papers: emitted,
+			totalResults,
+			skippedEntries,
+			coveredThrough: new Date(this.coverage.coveredThrough).toISOString(),
+		});
 	}
 
 	// ── 통신 엔진 (SearchBase의 실체) ──────────────────────────────
@@ -396,10 +610,12 @@ export class ArxivAPI implements API {
 		sortOrder: 'ascending' | 'descending',
 	): Promise<ArxivPage> {
 		const collectedQuery = combineQueries(this.querys);
-		const response = await requestWithRetry(
-			{ url: this.buildUrl(dateFilter, start, maxResults, sortOrder) },
-			ArxivAPI.ARXIV_RETRY,
-		);
+		const url = this.buildUrl(dateFilter, start, maxResults, sortOrder);
+		const startedAt = Date.now();
+		// 실패하면 여기서 throw로 끊긴다([1] 정책). 어느 요청에서 끊겼는지 남기려면
+		// 요청 직전에 한 줄 찍어둬야 한다 — 예외가 난 뒤에는 이 정보가 없다.
+		Log.debug('arxiv.page', '요청', { url, start, maxResults, sortOrder });
+		const response = await requestWithRetry({ url }, ArxivAPI.ARXIV_RETRY);
 		const xml = parseXmlOrThrow(response.text, 'arXiv');
 		const entries = Array.from(xml.querySelectorAll('entry'));
 		const papers: Paper[] = [];
@@ -424,10 +640,21 @@ export class ArxivAPI implements API {
 			}
 		}
 
+		const totalResults = ArxivAPI.readTotalResults(xml);
+		Log.debug('arxiv.page', '응답', {
+			start,
+			entryCount: entries.length,
+			papers: papers.length,
+			totalResults,
+			elapsedMs: Date.now() - startedAt,
+			latestPublished:
+				latestPublishedMs === undefined ? undefined : new Date(latestPublishedMs).toISOString(),
+		});
+
 		return {
 			papers,
 			entryCount: entries.length,
-			totalResults: ArxivAPI.readTotalResults(xml),
+			totalResults,
 			latestPublishedMs,
 		};
 	}
@@ -639,10 +866,14 @@ export class ArxivAPI implements API {
 			return;
 		}
 
-		const citations = await this.fetchCitationBatch(Array.from(idToPapers.keys()));
-		for (const [localId, count] of citations) {
+		const infos = await this.fetchCitationBatch(Array.from(idToPapers.keys()));
+		for (const [localId, info] of infos) {
 			for (const paper of idToPapers.get(localId) ?? []) {
-				paper.citationCount = count;
+				paper.citationCount = info.citationCount;
+				// 참고문헌도 같은 응답에 실려 오므로 citationsKnown이 두 값의 "보강 완료"
+				// 플래그를 겸한다 — 이 플래그가 서면 재스캔이 S2를 다시 두드리지 않고,
+				// prefillFromStore가 저장본의 references를 함께 복원한다.
+				paper.references = info.references;
 				paper.citationsKnown = true;
 			}
 		}
@@ -661,11 +892,18 @@ export class ArxivAPI implements API {
 	// secret에 S2 키가 등록돼 있으면 x-api-key 헤더로 실어 보낸다 — 익명 호출은 S2의 공용
 	// rate limit을 다른 모든 익명 사용자와 나눠 쓰므로 429가 잦다. 키가 없으면 지금까지처럼
 	// 익명으로 호출한다(throw하지 않음 — 키는 선택 사항).
-	private async fetchCitationBatch(arxivIds: string[]): Promise<Map<string, number>> {
-		const result = new Map<string, number>();
+	private async fetchCitationBatch(arxivIds: string[]): Promise<Map<string, S2PaperInfo>> {
+		const result = new Map<string, S2PaperInfo>();
 		const apiKey = this.secret?.getKey(S2_SECRET_PROVIDER);
+		const chunks = chunk(arxivIds, ArxivAPI.S2_BATCH_CHUNK_SIZE);
 
-		for (const ids of chunk(arxivIds, ArxivAPI.S2_BATCH_CHUNK_SIZE)) {
+		for (const [index, ids] of chunks.entries()) {
+			// 청크를 연달아 쏘면 S2 rate limit에 바로 걸린다. 대용량 Backfill이면 청크가
+			// 수백 개가 되는데, 그 실패는 전부 [3] 정책으로 조용히 삼켜져 인용수만 빈 채로
+			// 남는다 — 애초에 429를 만들지 않는 편이 낫다.
+			if (index > 0) {
+				await delay(ArxivAPI.S2_CHUNK_DELAY_MS);
+			}
 			await runQuietly(async () => {
 				const response = await requestWithRetry(
 					{
@@ -691,7 +929,10 @@ export class ArxivAPI implements API {
 					if (typeof echoed === 'string' && ArxivAPI.stripVersion(echoed) !== id) {
 						continue;
 					}
-					result.set(id, element.citationCount);
+					result.set(id, {
+						citationCount: element.citationCount,
+						references: ArxivAPI.extractArxivReferences(element),
+					});
 				}
 			});
 		}
@@ -703,5 +944,22 @@ export class ArxivAPI implements API {
 	private static toLocalId(sourceId: string): string | null {
 		const [provider, localId] = sourceId.split(':');
 		return provider === 'arxiv' && localId ? localId : null;
+	}
+
+	// S2 응답의 참고문헌 목록에서 arXiv에 있는 것만 sourceId 형태로 골라낸다.
+	//
+	// arXiv id가 없는 참고문헌(저널 논문, 단행본 등)은 버린다 — 이 코퍼스는 arXiv
+	// 논문만 수집하므로 그런 참고문헌은 그래프의 어떤 노드와도 매칭될 수 없고, 저장해봐야
+	// 파일 크기만 늘린다. 버전 접미사(v1 등)는 sourceId 규칙에 맞춰 떼고, 같은 논문을
+	// 두 번 인용한 것처럼 보이는 항목(버전만 다른 중복 등)은 하나로 합친다.
+	private static extractArxivReferences(element: S2BatchElement): string[] {
+		const ids = new Set<string>();
+		for (const reference of element.references ?? []) {
+			const arxivId = reference?.externalIds?.ArXiv;
+			if (typeof arxivId === 'string' && arxivId.length > 0) {
+				ids.add(`arxiv:${ArxivAPI.stripVersion(arxivId)}`);
+			}
+		}
+		return Array.from(ids);
 	}
 }
