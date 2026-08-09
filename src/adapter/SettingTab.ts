@@ -6,7 +6,9 @@ import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
+
 import { KEY_VALIDATORS, validateAllKeys } from '../collect/SecretValidation';
+
 import type { Middleware } from '../common/Middleware';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
@@ -495,11 +497,13 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('저장')
 					.setCta()
 					.onClick(() => {
+						button.setDisabled(true);
 						void this.persistApiKey()
 							.then(() => new Notice('API 키를 저장했습니다.'))
 							.catch((e: unknown) => {
 								new Notice(`API 키 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
-							});
+							})
+							.finally(() => button.setDisabled(false));
 					}),
 			)
 			// 등록된 키가 실제로 통하는지 가벼운 요청으로 확인한다 — 형식 검사로는 어떤
@@ -896,12 +900,11 @@ export class SettingTab extends PluginSettingTab {
 	// 갈아끼운다 — 그대로 새 Secret()을 써서 저장하면 다른 provider의 키까지 날아간다.
 	// 실패 시 호출부가 처리하도록 그대로 throw한다(성공 Notice를 잘못 띄우지 않기 위해
 	// 여기서 삼키지 않는다).
-	private async persistApiKey(): Promise<void> {
-		const secret = await File.readSecret();
-		secret.setKey(this.apiKeyProviderDraft, this.apiKeyDraft.trim());
-		await File.writeSecret(secret);
-	}
-
+private async persistApiKey(): Promise<void> {
+	const secret = await File.readSecret();
+	secret.setKey(this.apiKeyProviderDraft, this.apiKeyDraft.trim());
+	await File.writeSecret(secret);
+}
 	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다.
 	//
 	// File.mutateSubscriptions로 읽기-수정-쓰기를 큐에 태운다 — 수집이 막 끝나며
