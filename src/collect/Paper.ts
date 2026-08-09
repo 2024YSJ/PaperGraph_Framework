@@ -31,4 +31,16 @@ export class Paper {
 	embeddingSource!: string;
 	// 임베딩 성공/실패를 T/F로 표기 (기존 embeddingFailure 값/null 조합의 대체).
 	embeddingSucceeded!: boolean;
+
+	// 미들웨어가 덧붙이는 값들 (요약, 클러스터 라벨 등). 위 필드들과 달리 채워지지 않을
+	// 수 있어서, 미들웨어가 안 돌아도 항상 빈 객체는 있도록 여기서 바로 만들어 둔다
+	// (= 쓰는 쪽에서 undefined 검사를 안 해도 된다).
+	extra: ExtraData = new ExtraData();
 }
+
+// 미들웨어가 만들어내는 값을 담는 자리. 요약이나 클러스터 라벨처럼 수집·임베딩이
+// 보장하지 않는 값은 Paper의 필수 필드로 둘 수 없어서 여기에 모은다.
+// 미들웨어를 새로 만들 때 그 미들웨어가 채울 필드를 여기에 optional로 추가한다.
+// (예: summary?: string) — 필드가 늘어도 Paper의 필수 필드와 File의 저장/비교
+// 로직은 그대로다.
+export class ExtraData {}
