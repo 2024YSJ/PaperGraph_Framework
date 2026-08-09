@@ -6,3 +6,18 @@
 	white-space: pre-wrap;
 	word-break: break-word;
 }
+
+/* 시각화 뷰를 현재 화면(리프) 크기에 꽉 맞추고 스크롤바가 안 생기게 한다.
+   .view-content와 함께 써서 Obsidian 기본 스타일(패딩/overflow)보다 우선하도록 한다. */
+.view-content.papergraph3d-view {
+	padding: 0;
+	overflow: hidden;
+	position: relative;
+}
+
+/* 3D force graph 컨테이너 — 뷰를 정확히 가득 채운다(absolute inset). 실제 픽셀 크기는
+   Visualization.render가 이 요소의 clientWidth/Height로 3d-force-graph에 지정한다. */
+.papergraph3d-graph {
+	position: absolute;
+	inset: 0;
+}
