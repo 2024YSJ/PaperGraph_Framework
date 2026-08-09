@@ -7,6 +7,7 @@ import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
 import { S2_SECRET_PROVIDER } from '../collect/API';
+import { validateAllKeys } from '../collect/SecretValidation';
 import type { Middleware } from '../common/Middleware';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
@@ -482,6 +483,35 @@ export class SettingTab extends PluginSettingTab {
 								new Notice(`API 키 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
 							});
 					}),
+			)
+			// 등록된 키가 실제로 통하는지 가벼운 요청으로 확인한다 — 형식 검사로는 어떤
+			// provider의 키인지도, 유효한지도 판별할 수 없어 실제 호출만이 신뢰할 수 있는
+			// 방법이다(SecretValidation.ts 참고). 저장은 안 건드리고 조회만 한다.
+			.addButton((button) =>
+				button.setButtonText('키 확인').onClick(async () => {
+					button.setDisabled(true);
+					try {
+						const secret = await File.readSecret();
+						const results = await validateAllKeys(secret);
+						if (results.length === 0) {
+							new Notice('확인할 키가 등록돼 있지 않습니다.');
+							return;
+						}
+						for (const result of results) {
+							if (result.valid) {
+								new Notice(`${result.provider} 키가 정상 동작합니다.`);
+							} else if (result.reason === 'invalid-key') {
+								new Notice(`${result.provider} 키가 유효하지 않습니다 — 키를 다시 확인하세요.`);
+							} else {
+								new Notice(`${result.provider} 키 확인 중 오류: ${result.detail ?? '알 수 없음'}`);
+							}
+						}
+					} catch (e) {
+						new Notice(`키 확인 실패: ${e instanceof Error ? e.message : String(e)}`);
+					} finally {
+						button.setDisabled(false);
+					}
+				}),
 			);
 
 		new Setting(containerEl)
