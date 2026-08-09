@@ -58,17 +58,53 @@ export class VisualizationView extends ItemView {
 		});
 
 		contentEl.createEl('h4', { text: '전체 파이프라인' });
+		this.pipelineResultEl = contentEl.createEl('pre', {
+			text: '아직 실행하지 않았습니다.',
+			cls: 'papergraph3d-pca-result',
+		});
 		new ButtonComponent(contentEl).setButtonText('run() 전체 실행').onClick(async () => {
-			try {
-				await this.plugin.visualflow.run();
-			} catch {
-				new Notice('아직 구현되지 않음: 시각화 실행');
-			}
+			await this.runPipelineWithRepairRetry();
 		});
 	}
 
 	async onClose(): Promise<void> {
 		this.contentEl.empty();
+	}
+
+	private pipelineResultEl: HTMLElement | null = null;
+
+	// PCA가 needsReembedding(임베딩이 안 됐거나 깨진 논문)을 신호로 주면, 그 논문들만
+	// collectflow.repairEmbeddings()로 재임베딩한 뒤 파이프라인을 한 번 더 돌린다. 인용수는
+	// 건드리지 않는다 — PCA는 임베딩만 신경 쓰므로 「실행」을 누를 때마다 불필요한 S2 호출이
+	// 딸려가면 안 된다(인용수 재보강은 수집 직후 CollectAndSave.runNow가 따로 자동으로 돈다).
+	// retried를 둬서 재시도는 딱 한 번만 — repairEmbeddings 뒤에도 여전히 실패하는 논문이
+	// 있으면(원인 불명) 여기서 무한 왕복하지 않고 남은 실패를 그대로 보여준다.
+	private async runPipelineWithRepairRetry(retried = false): Promise<void> {
+		try {
+			await this.plugin.visualflow.run();
+			this.pipelineResultEl?.setText('시각화 실행 완료');
+		} catch (error) {
+			if (error instanceof PCAError && error.needsReembedding.length > 0 && !retried) {
+				this.pipelineResultEl?.setText(
+					`임베딩이 안 된 논문 ${error.needsReembedding.length}편을 재시도하는 중...`,
+				);
+				try {
+					await this.plugin.collectflow.repairEmbeddings(error.needsReembedding);
+				} catch (repairError) {
+					this.pipelineResultEl?.setText(
+						`보정 실패: ${repairError instanceof Error ? repairError.message : String(repairError)}`,
+					);
+					return;
+				}
+				await this.runPipelineWithRepairRetry(true);
+				return;
+			}
+			this.pipelineResultEl?.setText(
+				error instanceof PCAError
+					? `시각화 실패: ${error.message}`
+					: `아직 구현되지 않음: 시각화 실행 (${String(error)})`,
+			);
+		}
 	}
 
 	// ─────────────────────────────────────────────────────────────

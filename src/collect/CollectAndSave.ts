@@ -51,10 +51,21 @@ export interface CollectStats extends EmbedBreakerStats {
 	embedFailed: number;
 }
 
-// 한 번의 보정 실행이 무엇을 했는지.
+// 한 번의 보정 실행이 무엇을 했는지 (예전 combined 경로 — repair()가 남긴다).
 export interface RepairStats extends EmbedBreakerStats {
 	reembedded: number;
 	reembedFailed: number;
+	citationsFixed: number;
+}
+
+// 재임베딩만 돈 실행의 집계 (repairEmbeddings()가 남긴다).
+export interface EmbedRepairStats extends EmbedBreakerStats {
+	reembedded: number;
+	reembedFailed: number;
+}
+
+// 인용수 재보강만 돈 실행의 집계 (repairCitations()가 남긴다).
+export interface CitationRepairStats {
 	citationsFixed: number;
 }
 
@@ -105,6 +116,10 @@ export class CollectAndSave {
 	lastStats: CollectStats | undefined;
 	// 직전 보정 실행의 집계. lastStats와 같은 이유로 존재한다(repairNow()도 void 반환).
 	lastRepairStats: RepairStats | undefined;
+	// 직전 재임베딩 전용 실행(repairEmbeddings, PCA 트리거 경로)의 집계.
+	lastEmbedRepairStats: EmbedRepairStats | undefined;
+	// 직전 인용수 재보강 전용 실행(repairCitations, 수집 후 자동 실행)의 집계.
+	lastCitationRepairStats: CitationRepairStats | undefined;
 
 	// 한 실행에서 서킷브레이커 쿨다운을 몇 번까지 기다려줄지. 이 횟수를 넘으면 모델이
 	// 회복 불가능한 상태라고 보고 임베딩을 포기한다 — embedOrReuse 주석 참고.
@@ -243,8 +258,37 @@ export class CollectAndSave {
 		);
 	}
 
-	repair(onStart?: () => void): Promise<void> {
-		return this.enqueue({ kind: 'repair', label: '보정' }, () => this.repairNow(), onStart);
+	// targetSourceIds를 주면 그 논문들만 재시도한다. 생략하면 코퍼스 전체에서 실패 플래그가
+	// 선 논문을 찾는다(수동 「보정」 버튼의 경로).
+	repair(targetSourceIds?: string[], onStart?: () => void): Promise<void> {
+		return this.enqueue(
+			{ kind: 'repair', label: '보정' },
+			() => this.repairNow(targetSourceIds),
+			onStart,
+		);
+	}
+
+	// 재임베딩 전용 — PCA가 needsReembedding(임베딩이 안 됐거나 깨진 논문의 sourceId)을
+	// 신호로 줄 때 그 논문들만 재시도한다. 인용수는 건드리지 않는다: PCA는 임베딩만
+	// 신경 쓰므로(selectValidPapers가 citationCount를 안 읽는다), 시각화를 열 때마다
+	// 불필요한 S2 호출까지 딸려 가면 안 된다.
+	repairEmbeddings(targetSourceIds?: string[], onStart?: () => void): Promise<void> {
+		return this.enqueue(
+			{ kind: 'repair', label: '재임베딩 보정' },
+			() => this.repairEmbeddingsNow(targetSourceIds),
+			onStart,
+		);
+	}
+
+	// 인용수 재보강 전용 — 대상을 좁히지 않고 코퍼스 전체를 본다. runNow()가 수집 직후
+	// 자동으로 호출하므로, 사용자가 직접 부를 일은 거의 없다(그래도 수동 호출 경로는
+	// 열어 둔다).
+	repairCitations(onStart?: () => void): Promise<void> {
+		return this.enqueue(
+			{ kind: 'repair', label: '인용수 보정' },
+			() => this.repairCitationsNow(),
+			onStart,
+		);
 	}
 
 	// 실제 수집 몸통 — 큐가 한 번에 하나만 부른다.
@@ -321,6 +365,15 @@ export class CollectAndSave {
 			})),
 		});
 		await File.updateApiCursors(cursorUpdates);
+
+		// 인용수 재보강을 자동으로 뒤이어 돌린다 — await하지 않는다: repairCitations()도
+		// enqueue()를 타는데, 지금 이 함수(runNow) 자체가 아직 끝나지 않은 큐 작업의 task()
+		// 안에서 실행 중이라 여기서 기다리면 "이 작업이 끝나야 다음 작업(방금 큐에 넣은
+		// repairCitations)이 시작"→"그 다음 작업을 기다리는 이 작업은 안 끝남"이 서로를
+		// 기다리는 순환 대기가 된다. fire-and-forget으로 큐 뒤에 줄만 세운다.
+		void this.repairCitations().catch((error) => {
+			Log.error('collect', '자동 인용수 보정 실패', error);
+		});
 	}
 
 	// 청크 하나를 끝까지 처리한다: 미들웨어(all) -> loop { 임베딩 -> 미들웨어(forEach) -> 저장 }.
@@ -378,32 +431,28 @@ export class CollectAndSave {
 	// 논문을 찾는다"는 게 본질적으로 전수 조사라 페이지로 나눠 받을 날짜 구간이 없다.
 	// 코퍼스가 아주 커지면 이 로드 자체가 무거워질 수 있다는 건 알려진 한계로 남겨둔다
 	// (별도 인덱스 없이는 못 줄인다).
-	private async repairNow(): Promise<void> {
-		// 재임베딩이 섞여 있으므로 run()과 같은 사전 체크 — 모델이 없으면 대상 논문 수만큼
-		// 조용히 실패만 반복하게 된다(CollectAndSave.run의 같은 체크 주석 참고).
-		if (!(await this.embedding.isModelInstalled())) {
-			throw new Error(
-				'PaperGraph3D: 임베딩 모델이 설치되어 있지 않습니다. 설정 탭에서 모델을 먼저 설치하세요.',
-			);
+	// sourceId -> 경로 인덱스가 없어 "그 논문들만" 골라 읽을 수는 없다 — 전체를 읽은 뒤
+	// targetSourceIds가 있으면 메모리에서 좁힌다. 좁혀도 디스크 읽기 비용은 그대로지만,
+	// 재임베딩/재보강 루프가 도는 대상(=네트워크 호출)은 줄어든다.
+	private async loadRepairTargets(targetSourceIds?: string[]): Promise<Paper[]> {
+		const all = await File.readAllPapers();
+		if (!targetSourceIds) {
+			return all;
 		}
+		const targetSet = new Set(targetSourceIds);
+		return all.filter((p) => targetSet.has(p.sourceId));
+	}
 
-		const papers = await File.readAllPapers();
-		const stats: RepairStats = {
-			reembedded: 0,
-			reembedFailed: 0,
-			citationsFixed: 0,
-			embedWaits: 0,
-			embedGaveUp: false,
-		};
-
-		// 1) 재임베딩. embedOrReuse()가 run() 경로와 같은 서킷브레이커 대응을 해준다 —
-		// 브레이커가 열려 있으면 쿨다운을 기다렸다 재개하고, 계속 안 풀리면 몇 번 뒤에는
-		// 포기한다(embedOrReuse 주석 참고). 보정은 실패한 논문만 모아 도는 경로라 오히려
-		// 브레이커가 열릴 확률이 가장 높은 곳이다 — 예전 코드는 이 대응이 없어 브레이커가
-		// 열리면 남은 논문 전부가 빈 catch로 몇 초 만에 조용히 실패했다.
-		//
-		// 논문마다 즉시 저장한다 — 끝에 한꺼번에 쓰면, 도중에 저장이 실패하거나 언로드되면
-		// 그때까지 고친 것까지 전부 사라진다.
+	// 재임베딩만 하는 몸통. embedOrReuse()가 run() 경로와 같은 서킷브레이커 대응을 해준다 —
+	// 브레이커가 열려 있으면 쿨다운을 기다렸다 재개하고, 계속 안 풀리면 몇 번 뒤에는
+	// 포기한다(embedOrReuse 주석 참고). 보정은 실패한 논문만 모아 도는 경로라 오히려
+	// 브레이커가 열릴 확률이 가장 높은 곳이다 — 예전 코드는 이 대응이 없어 브레이커가
+	// 열리면 남은 논문 전부가 빈 catch로 몇 초 만에 조용히 실패했다.
+	//
+	// 논문마다 즉시 저장한다 — 끝에 한꺼번에 쓰면, 도중에 저장이 실패하거나 언로드되면
+	// 그때까지 고친 것까지 전부 사라진다.
+	private async repairEmbeddingsBody(papers: Paper[]): Promise<EmbedRepairStats> {
+		const stats: EmbedRepairStats = { reembedded: 0, reembedFailed: 0, embedWaits: 0, embedGaveUp: false };
 		this.embedding.resetCircuitBreaker();
 		for (const paper of papers) {
 			if (this.disposed) {
@@ -428,39 +477,84 @@ export class CollectAndSave {
 				stats.reembedFailed += 1;
 			}
 		}
+		return stats;
+	}
 
-		// 2) 재보강. 논문이 수집된 API별로 묶어 각 구현체의 EnrichCitations에 맡긴다
-		// (citationsKnown 필터는 그 안에 있다). 실패해도 throw하지 않는 [3] 정책 그대로.
-		if (!this.disposed) {
-			const secret = await File.readSecret();
-			for (const apiName of File.supportedApiNames()) {
-				if (this.disposed) {
-					// API(서비스) 경계 — collect()가 구독 경계에서 멈추는 것과 같은 원칙.
-					break;
-				}
-				const targets = papers.filter(
-					(paper) => !paper.citationsKnown && paper.collectedApis.includes(apiName),
-				);
-				if (targets.length === 0) {
-					continue;
-				}
-				await File.createApi(apiName, [], secret).EnrichCitations(targets);
-				for (const paper of targets) {
-					if (paper.citationsKnown) {
-						stats.citationsFixed += 1;
-						try {
-							await File.writePaper(paper);
-						} catch (error) {
-							Log.error('collect', '보정 중 논문 저장 실패', error, {
-								sourceId: paper.sourceId,
-							});
-							throw error;
-						}
+	// 재보강(인용수)만 하는 몸통. 논문이 수집된 API별로 묶어 각 구현체의 EnrichCitations에
+	// 맡긴다(citationsKnown 필터는 그 안에 있다). 실패해도 throw하지 않는 [3] 정책 그대로.
+	private async repairCitationsBody(papers: Paper[]): Promise<CitationRepairStats> {
+		const stats: CitationRepairStats = { citationsFixed: 0 };
+		if (this.disposed) {
+			return stats;
+		}
+		const secret = await File.readSecret();
+		for (const apiName of File.supportedApiNames()) {
+			if (this.disposed) {
+				// API(서비스) 경계 — collect()가 구독 경계에서 멈추는 것과 같은 원칙.
+				break;
+			}
+			const targets = papers.filter(
+				(paper) => !paper.citationsKnown && paper.collectedApis.includes(apiName),
+			);
+			if (targets.length === 0) {
+				continue;
+			}
+			await File.createApi(apiName, [], secret).EnrichCitations(targets);
+			for (const paper of targets) {
+				if (paper.citationsKnown) {
+					stats.citationsFixed += 1;
+					try {
+						await File.writePaper(paper);
+					} catch (error) {
+						Log.error('collect', '보정 중 논문 저장 실패', error, {
+							sourceId: paper.sourceId,
+						});
+						throw error;
 					}
 				}
 			}
 		}
+		return stats;
+	}
 
+	// 재임베딩 전용 진입점 — PCA가 needsReembedding으로 좁혀준 목록을 받아 그것만 돈다.
+	// 「진짜 UI」에서는 재임베딩을 이 경로(PCA 트리거)로만 실행한다: 인용수는 건드리지
+	// 않으므로 시각화를 열 때마다 불필요한 S2 호출이 함께 도는 일이 없다.
+	private async repairEmbeddingsNow(targetSourceIds?: string[]): Promise<void> {
+		// 모델이 없으면 대상 논문 수만큼 조용히 실패만 반복하게 된다(run()의 같은 체크 참고).
+		if (!(await this.embedding.isModelInstalled())) {
+			throw new Error(
+				'PaperGraph3D: 임베딩 모델이 설치되어 있지 않습니다. 설정 탭에서 모델을 먼저 설치하세요.',
+			);
+		}
+		const papers = await this.loadRepairTargets(targetSourceIds);
+		const stats = await this.repairEmbeddingsBody(papers);
+		Log.info('collect', '재임베딩 보정 완료', stats);
+		this.lastEmbedRepairStats = stats;
+	}
+
+	// 인용수 재보강 전용 진입점 — 대상을 좁히지 않는다(코퍼스 전체에서 citationsKnown=false를
+	// 찾는다). runNow()가 수집 직후 자동으로 호출한다 — 「진짜 UI」에서는 사용자가 누를
+	// 버튼 없이 수집이 끝날 때마다 조용히 따라 도는 것이 목표다.
+	private async repairCitationsNow(): Promise<void> {
+		const papers = await this.loadRepairTargets();
+		const stats = await this.repairCitationsBody(papers);
+		Log.info('collect', '인용수 보정 완료', stats);
+		this.lastCitationRepairStats = stats;
+	}
+
+	// 예전 combined 경로 — 재임베딩과 재보강을 같은 대상 집합에 대해 함께 돈다. 수동 「보정」
+	// 버튼/커맨드가 아직 이 경로를 쓴다.
+	private async repairNow(targetSourceIds?: string[]): Promise<void> {
+		if (!(await this.embedding.isModelInstalled())) {
+			throw new Error(
+				'PaperGraph3D: 임베딩 모델이 설치되어 있지 않습니다. 설정 탭에서 모델을 먼저 설치하세요.',
+			);
+		}
+		const papers = await this.loadRepairTargets(targetSourceIds);
+		const embedStats = await this.repairEmbeddingsBody(papers);
+		const citationStats = await this.repairCitationsBody(papers);
+		const stats: RepairStats = { ...embedStats, ...citationStats };
 		Log.info('collect', '보정 완료', stats);
 		this.lastRepairStats = stats;
 	}
