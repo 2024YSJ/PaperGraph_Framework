@@ -33,10 +33,9 @@ export default class PaperGraph3D extends Plugin {
 
 		this.addSettingTab(new SettingTab(this.app, this));
 
-		// ⚠️ 두 커맨드 모두 EventListener.checking()/TaskManager.runTask()가 아직 스텁이라
-		// (둘 다 항상 throw — 담당자 미배정, 8/1 회의록 역할분담에 없음) run()/repair()에
-		// 도달하지 못한다. 이벤트 배선이 구현되기 전까지는 설정 탭의 수집/보정 버튼이
-		// collectflow를 직접 호출하는 유일한 실동작 경로다.
+		// EventListener.checking()/TaskManager.runTask()가 구현됨(009 devLog) — 두 커맨드
+		// 모두 실제로 collectflow.run()/repair()까지 도달한다. catch는 더 이상 "미구현"을
+		// 뜻하지 않으므로 실제 에러 메시지를 보여준다(SettingTab.ts의 Notice 관례와 동일).
 
 		this.addCommand({
 			id: 'collect-recent',
@@ -44,8 +43,10 @@ export default class PaperGraph3D extends Plugin {
 			callback: async () => {
 				try {
 					await this.eventListener.checking('ui:collect-recent');
-				} catch {
-					new Notice('아직 구현되지 않음: 최근 논문 수집');
+					new Notice('최근 논문 수집을 마쳤습니다.');
+				} catch (e) {
+					const message = e instanceof Error ? e.message : String(e);
+					new Notice(`최근 논문 수집 실패: ${message}`);
 				}
 			},
 		});
@@ -60,8 +61,10 @@ export default class PaperGraph3D extends Plugin {
 			callback: async () => {
 				try {
 					await this.eventListener.checking('ui:collect-repair');
-				} catch {
-					new Notice('아직 구현되지 않음: 보정');
+					new Notice('보정을 마쳤습니다.');
+				} catch (e) {
+					const message = e instanceof Error ? e.message : String(e);
+					new Notice(`보정 실패: ${message}`);
 				}
 			},
 		});
@@ -95,15 +98,18 @@ export default class PaperGraph3D extends Plugin {
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
+		this.eventListener.setTaskManager(this.taskManager);
 
-		const collectRecentTask = new Task();
-		collectRecentTask.taskName = 'collect:recent';
-		collectRecentTask.func = () => this.collectflow.run('recent');
+		const collectRecentTask: Task = {
+			taskName: 'collect:recent',
+			func: () => this.collectflow.run('recent'),
+		};
 		this.taskManager.setTask(collectRecentTask);
 
-		const collectRepairTask = new Task();
-		collectRepairTask.taskName = 'collect:repair';
-		collectRepairTask.func = () => this.collectflow.repair();
+		const collectRepairTask: Task = {
+			taskName: 'collect:repair',
+			func: () => this.collectflow.repair(),
+		};
 		this.taskManager.setTask(collectRepairTask);
 
 		this.eventListener.setEventListener('ui:collect-recent', 'collect:recent');

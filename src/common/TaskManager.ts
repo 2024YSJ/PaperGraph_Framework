@@ -8,8 +8,15 @@ export class TaskManager {
 		this.tasks.push(task);
 	}
 
-	// 실행 계열: 아직 미구현. Task.func 호출/에러 처리 등은 담당자가 채운다.
+	// 실행 계열: taskName은 등록 시점에 유일한 식별자로 쓰인다(find). 같은 이벤트에
+	// 여러 task를 거는 팬아웃은 EventListener.events 쪽 책임이라 여기서는 다루지 않는다.
+	// 미등록 taskName은 throw(File.createApi의 미등록 apiName과 같은 규칙). 실행 에러도
+	// 삼키지 않고 그대로 전파한다 — 호출자(커맨드/UI)가 실제 실패를 봐야 한다.
 	async runTask(taskName: string, ...args: unknown[]): Promise<unknown> {
-		throw new Error(`Not implemented: TaskManager.runTask(${taskName})`);
+		const task = this.tasks.find((t) => t.taskName === taskName);
+		if (!task) {
+			throw new Error(`No task registered with name: ${taskName}`);
+		}
+		return task.func(...args);
 	}
 }
