@@ -7,7 +7,7 @@ import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
 import { S2_SECRET_PROVIDER } from '../collect/API';
-import { validateAllKeys } from '../collect/SecretValidation';
+import { identifyKeyProvider, validateAllKeys } from '../collect/SecretValidation';
 import type { Middleware } from '../common/Middleware';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
@@ -461,8 +461,9 @@ export class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('API 키')
 			.setDesc(
-				'Semantic Scholar 인용수 조회에 쓰는 키(선택 사항 — 없으면 익명으로 호출되지만 ' +
-					'요청 한도가 낮습니다). 입력 후 저장을 눌러야 반영됩니다.',
+				'Semantic Scholar 등 등록된 API의 키(선택 사항 — 없으면 익명으로 호출되지만 ' +
+					'요청 한도가 낮습니다). 어느 provider 키인지는 저장 시 실제 요청으로 자동 ' +
+					'판별합니다 — 여러 provider의 키를 하나씩 붙여넣고 저장하면 됩니다.',
 			)
 			.addText((text) =>
 				text
@@ -477,11 +478,13 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('저장')
 					.setCta()
 					.onClick(() => {
+						button.setDisabled(true);
 						void this.persistApiKey()
 							.then(() => new Notice('API 키를 저장했습니다.'))
 							.catch((e: unknown) => {
 								new Notice(`API 키 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
-							});
+							})
+							.finally(() => button.setDisabled(false));
 					}),
 			)
 			// 등록된 키가 실제로 통하는지 가벼운 요청으로 확인한다 — 형식 검사로는 어떤
@@ -861,13 +864,21 @@ export class SettingTab extends PluginSettingTab {
 		this.display();
 	}
 
-	// apiKeyDraft -> Secret.json. Secret은 provider->key 맵 전체를 한 파일에 저장하므로,
-	// 현재 저장본을 읽어 S2_SECRET_PROVIDER 항목만 갈아끼운다 — 그대로 새 Secret()을
-	// 써서 저장하면 다른 provider의 키까지 날아간다. 실패 시 호출부가 처리하도록 그대로
-	// throw한다(성공 Notice를 잘못 띄우지 않기 위해 여기서 삼키지 않는다).
+	// apiKeyDraft -> Secret.json. 입력란이 하나뿐이라도 provider별로 나눠 저장한다 —
+	// identifyKeyProvider()가 등록된 KeyValidator들에 실제로 물어봐 이 키가 어느 provider
+	// 것인지 판별한다(형식만으로는 구분 불가 — SecretValidation.ts 참고). 어느 provider에도
+	// 안 맞으면 잘못된 키로 보고 저장하지 않는다. 현재 저장본을 읽어 그 provider 항목만
+	// 갈아끼운다 — 그대로 새 Secret()을 써서 저장하면 다른 provider의 키까지 날아간다.
+	// 실패 시 호출부가 처리하도록 그대로 throw한다(성공 Notice를 잘못 띄우지 않기 위해
+	// 여기서 삼키지 않는다).
 	private async persistApiKey(): Promise<void> {
+		const key = this.apiKeyDraft.trim();
+		const provider = await identifyKeyProvider(key);
+		if (provider === undefined) {
+			throw new Error('등록된 provider(Semantic Scholar 등) 중 어디에도 맞지 않는 키입니다.');
+		}
 		const secret = await File.readSecret();
-		secret.setKey(S2_SECRET_PROVIDER, this.apiKeyDraft.trim());
+		secret.setKey(provider, key);
 		await File.writeSecret(secret);
 	}
 
