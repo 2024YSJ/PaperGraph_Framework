@@ -23,6 +23,9 @@ export class SettingTab extends PluginSettingTab {
 		}
 		this.queueSubscribed = true;
 		this.plugin.collectflow.onQueueChange(() => this.renderQueueStatus());
+		// 큐 멤버십(시작/대기/종료) 변화와 별개로, "지금 도는 API의 진행 상황"은 더 잦게
+		// 바뀐다(청크·논문 단위) — CollectController가 그 신호를 따로 준다.
+		this.plugin.collectController.onProgressChange(() => this.renderQueueStatus());
 	}
 
 	// 지금 무엇이 돌고 어떤 게 줄 서 있는지. display()가 다시 그린 직후에도 반드시 한 번
@@ -38,12 +41,21 @@ export class SettingTab extends PluginSettingTab {
 			el.createSpan({ text: '대기 중인 수집 작업 없음' });
 			return;
 		}
-		el.createSpan({
+		el.createDiv({
 			text:
 				waiting.length === 0
 					? `실행 중: ${active.label}`
 					: `실행 중: ${active.label} — 대기 ${waiting.length}건 (${waiting.map((job) => job.label).join(', ')})`,
 		});
+
+		// 지금 어떤 API·조건이 도는지는 보정처럼 진행률 개념이 없는 작업이거나, 첫 청크가
+		// 아직 안 온 시점에는 없다 — 그럴 땐 보조 줄 자체를 생략한다.
+		const progress = this.plugin.collectController.currentApiProgress;
+		if (progress) {
+			el.createDiv({
+				text: `→ ${progress.apiName} 수집 중 — 조건: ${progress.conditionsText} — 추려진 ${progress.found}편 · 수집 ${progress.done}편`,
+			});
+		}
 	}
 
 	display(): void {

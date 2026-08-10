@@ -57,6 +57,25 @@ interface ProgressFlow {
 	started: boolean; // 큐에서 빠져나와 실제로 실행이 시작됐는가
 	collected: number | undefined; // 'all' 미들웨어가 알려준 수집 편수
 	notice: Notice | undefined;
+	// 지금 청크를 보내고 있는 API(구독)의 정보. CollectAndSave.ts는 건드리지 않고, 'all'
+	// 미들웨어가 받는 Paper.collectedApis/collectedQueries에서 읽어낸다 — API들이 항상
+	// 순차 처리되므로(collect() 참고) 한 청크는 늘 같은 API·조건에서 나온다는 전제 위에
+	// 있다. apiName만으로는 "같은 API, 다른 조건의 구독 두 개가 연달아 돈다"를 구분 못
+	// 하므로, apiName+조건 문자열을 합친 키가 바뀔 때만 리셋한다(renderQueueStatus에서
+	// SettingTab이 이 값을 그대로 보여준다).
+	apiName: string | undefined;
+	apiConditionsText: string | undefined;
+	apiFound: number; // 이 API(조건)에서 지금까지 추려진(도착한) 논문 수
+	apiDone: number; // 이 API(조건)에서 지금까지 처리(임베딩+저장 직전)한 논문 수
+}
+
+// SettingTab 등 다른 UI가 읽는 읽기 전용 투영 — ProgressFlow의 Notice/started 같은 UI 전용
+// 필드는 밖으로 내보내지 않는다.
+export interface CollectApiProgress {
+	apiName: string;
+	conditionsText: string;
+	found: number;
+	done: number;
 }
 
 // 수집 실행(최근/Backfill/보정)과 진행률 표시를 한 곳에 모은 컨트롤러.
@@ -68,9 +87,42 @@ interface ProgressFlow {
 // 이 컨트롤러가 하나만 만들어진다는 전제로 생성자에서 한 번만 한다(main.ts.init 참고).
 export class CollectController {
 	private activeFlow: ProgressFlow | undefined;
+	private progressListeners: (() => void)[] = [];
 
 	constructor(private readonly plugin: PaperGraph3D) {
 		this.registerDiagnostics();
+	}
+
+	// 지금 도는 API(구독)의 진행 상태. 대기열 표시(SettingTab)가 이 값을 읽는다 — 없으면
+	// (유휴 상태, 보정 실행 중, 또는 첫 청크가 아직 안 온 시점) undefined.
+	get currentApiProgress(): CollectApiProgress | undefined {
+		const flow = this.activeFlow;
+		if (!flow || flow.apiName === undefined || flow.apiConditionsText === undefined) {
+			return undefined;
+		}
+		return {
+			apiName: flow.apiName,
+			conditionsText: flow.apiConditionsText,
+			found: flow.apiFound,
+			done: flow.apiDone,
+		};
+	}
+
+	// queueState의 onQueueChange와 같은 패턴 — 대기열 박스가 여기 구독해서 API별 진행이
+	// 바뀔 때마다 다시 그린다(onQueueChange는 큐 멤버십 변화만 알리므로 이 신호가 따로
+	// 필요하다).
+	onProgressChange(listener: () => void): void {
+		this.progressListeners.push(listener);
+	}
+
+	private notifyProgress(): void {
+		for (const listener of this.progressListeners) {
+			try {
+				listener();
+			} catch (error) {
+				Log.error('ui', '진행률 리스너 실패', error);
+			}
+		}
 	}
 
 	// 클릭 위치에 "최근 논문 수집"/"Backfill" 선택 메뉴를 띄운다. 설정 탭의 「수집」
@@ -169,6 +221,10 @@ export class CollectController {
 			started: false,
 			collected: undefined,
 			notice: undefined,
+			apiName: undefined,
+			apiConditionsText: undefined,
+			apiFound: 0,
+			apiDone: 0,
 		};
 		flow.notice = new Notice(this.renderProgress(flow), 0);
 		try {
@@ -179,12 +235,14 @@ export class CollectController {
 					// 갱신할 대상이다.
 					this.activeFlow = flow;
 					this.updateProgress(flow);
+					this.notifyProgress();
 				},
 				(subtotal) => {
 					// 구독마다 최대 한 번씩 불린다 — 값을 더해야 여러 구독을 합친 전체
 					// 총계가 된다(청크 도착 순서에 상관없이 각자 자기 몫만 보고한다).
 					flow.total = (flow.total < 0 ? 0 : flow.total) + subtotal;
 					this.updateProgress(flow);
+					this.notifyProgress();
 				},
 			);
 		} finally {
@@ -192,6 +250,9 @@ export class CollectController {
 			flow.notice = undefined;
 			if (this.activeFlow === flow) {
 				this.activeFlow = undefined;
+				// 대기열 보조 줄(currentApiProgress)이 남아있지 않도록 실행이 끝났다는
+				// 사실도 알린다.
+				this.notifyProgress();
 			}
 		}
 		if (flow.collected === undefined) {
@@ -247,7 +308,36 @@ export class CollectController {
 					return;
 				}
 				flow.collected = (flow.collected ?? 0) + papers.length;
+
+				// 이 청크가 어떤 API·조건에서 나왔는지는 CollectAndSave.ts를 안 건드리고
+				// Paper.collectedApis/collectedQueries에서 읽는다 — API는 항상 순차 처리되므로
+				// (CollectAndSave.collect() 참고) 한 청크의 논문은 전부 같은 API·조건에서
+				// 나온다. prefillFromStore(인용수/임베딩 보강)는 이 필드들을 안 건드리므로
+				// 'all' 시점엔 아직 다른 구독과 병합되기 전 원본 그대로다.
+				const first = papers[0];
+				if (first) {
+					const apiName = first.collectedApis[0];
+					const conditionsText = first.collectedQueries[0]?.query;
+					if (apiName !== undefined && conditionsText !== undefined) {
+						// apiName만으로는 "같은 API, 다른 조건의 구독 두 개가 연달아 돈다"를
+						// 구분 못 한다 — 조건까지 합친 키가 바뀔 때만 새 구독으로 보고 리셋.
+						const key = `${apiName}::${conditionsText}`;
+						const prevKey =
+							flow.apiName === undefined
+								? undefined
+								: `${flow.apiName}::${flow.apiConditionsText ?? ''}`;
+						if (key !== prevKey) {
+							flow.apiName = apiName;
+							flow.apiConditionsText = conditionsText;
+							flow.apiFound = 0;
+							flow.apiDone = 0;
+						}
+					}
+					flow.apiFound += papers.length;
+				}
+
 				this.updateProgress(flow);
+				this.notifyProgress();
 			},
 		});
 		this.plugin.collectflow.setMiddleware({
@@ -258,7 +348,9 @@ export class CollectController {
 					return;
 				}
 				flow.done += 1;
+				flow.apiDone += 1;
 				this.updateProgress(flow);
+				this.notifyProgress();
 			},
 		});
 	}
@@ -276,7 +368,8 @@ export class CollectController {
 			if (!flow.started) {
 				text = `${flow.label} — 대기 중... (진행 중인 작업이 끝나면 시작합니다)`;
 			} else if (!known) {
-				text = `${flow.label} — arXiv에서 수집 중... (총 편수는 아직 알 수 없습니다)`;
+				// API 이름을 하드코딩하지 않는다 — arXiv 외 다른 API가 추가돼도 그대로 맞다.
+				text = `${flow.label} — 수집 중... (총 편수는 아직 알 수 없습니다)`;
 			} else {
 				text = `${flow.label} — 수집한 논문 처리 중... (${flow.done}/${flow.total}편)`;
 			}
