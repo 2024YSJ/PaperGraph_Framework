@@ -52,8 +52,11 @@ export class SettingTab extends PluginSettingTab {
 		// 아직 안 온 시점에는 없다 — 그럴 땐 보조 줄 자체를 생략한다.
 		const progress = this.plugin.collectController.currentApiProgress;
 		if (progress) {
+			// "추려진"이라고 하면 전부 신규처럼 읽힌다 — 최근 수집은 색인 지연 때문에 매번
+			// 겹치는 구간을 다시 훑어서, 이 수치엔 이미 저장된 논문(재확인)도 섞여 있다.
+			// 그 사실을 숫자 계산 없이 문구로만 알린다.
 			el.createDiv({
-				text: `→ ${progress.apiName} 수집 중 — 조건: ${progress.conditionsText} — 추려진 ${progress.found}편 · 수집 ${progress.done}편`,
+				text: `→ ${progress.apiName} 수집 중 — 조건: ${progress.conditionsText} — 확인 ${progress.found}편(재스캔 구간 포함) · 처리 ${progress.done}편`,
 			});
 		}
 	}
