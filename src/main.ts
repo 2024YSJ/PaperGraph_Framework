@@ -15,6 +15,8 @@ import { Task } from './common/Task';
 import { File } from './common/File';
 import { Log } from './common/Log';
 import { SettingTab } from './adapter/SettingTab';
+import { ApiManagementModal } from './adapter/ApiManagementModal';
+import { CollectController } from './adapter/CollectController';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 
 export default class PaperGraph3D extends Plugin {
@@ -22,6 +24,7 @@ export default class PaperGraph3D extends Plugin {
 	visualflow!: VisualizationFlow;
 	eventListener!: EventListener;
 	taskManager!: TaskManager;
+	collectController!: CollectController;
 
 	async onload() {
 		this.init();
@@ -69,6 +72,22 @@ export default class PaperGraph3D extends Plugin {
 		this.addRibbonIcon('network', '시각화 열기', () => {
 			void this.activateVisualizationView();
 		});
+
+		this.addRibbonIcon('download', '수집', (evt) => {
+			this.collectController.openCollectMenu(evt, this.app);
+		});
+
+		this.addCommand({
+			id: 'open-subscription-manager',
+			name: '구독 관리 열기',
+			callback: () => {
+				new ApiManagementModal(this.app).open();
+			},
+		});
+
+		this.addRibbonIcon('rss', '구독 관리', () => {
+			new ApiManagementModal(this.app).open();
+		});
 	}
 
 	// 다이어그램의 PaperGraph3D.init() — collectflow/visualflow/eventListener/
@@ -93,6 +112,9 @@ export default class PaperGraph3D extends Plugin {
 		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
 		Log.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
+		// collectflow가 준비된 뒤에 만들어야 한다 — 생성자에서 바로 진단 미들웨어를
+		// collectflow에 등록한다(CollectController 참고).
+		this.collectController = new CollectController(this);
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
 
