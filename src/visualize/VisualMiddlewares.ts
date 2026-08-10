@@ -76,3 +76,34 @@ export class CitationEdgeMiddleware implements Middleware {
 		});
 	}
 }
+
+// 시각화 미들웨어: 그래프 위에 스위치를 얹어 엣지(링크)를 껐다 켤 수 있게 한다.
+// render 후크로 3d-force-graph 인스턴스를 받아 링크 표시 여부를 이 미들웨어의 상태(visible)로
+// 제어하고, 컨테이너에 토글 스위치 UI를 오버레이로 붙인다. 상태는 뷰를 다시 그려도 유지된다.
+export class EdgeToggleMiddleware implements Middleware {
+	type: MiddlewareType = 'visual';
+	private visible = true;
+
+	run(context: unknown): void {
+		const graph = context as GraphData;
+		const container = graph.container;
+		graph.renderHooks.push((forceGraph) => {
+			// 링크 표시 여부를 visible 상태로 제어(3d-force-graph 링크 가시성 접근자).
+			forceGraph.linkVisibility(() => this.visible);
+			if (!container) {
+				return;
+			}
+			// 스위치 UI(오버레이): "인용 엣지" 라벨 + 토글 스위치.
+			const wrap = container.createDiv({ cls: 'papergraph3d-edge-toggle' });
+			wrap.createSpan({ text: '인용 엣지' });
+			const label = wrap.createEl('label', { cls: 'papergraph3d-switch' });
+			const input = label.createEl('input', { attr: { type: 'checkbox' } });
+			input.checked = this.visible;
+			label.createSpan({ cls: 'slider' });
+			input.addEventListener('change', () => {
+				this.visible = input.checked;
+				forceGraph.linkVisibility(() => this.visible); // 표시 갱신
+			});
+		});
+	}
+}
