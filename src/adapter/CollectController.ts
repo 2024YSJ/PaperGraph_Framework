@@ -1,8 +1,13 @@
 import { App, Menu, Notice } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { Log } from '../common/Log';
-import { Paper } from '../collect/Paper';
 import { PipelineTestModal } from './PipelineTestModal';
+import {
+	CollectDoneMiddleware,
+	CollectFoundMiddleware,
+	type CollectProgressSink,
+	type CollectProgressState,
+} from './CollectMiddlewares';
 
 // 날짜 입력(YYYY-MM-DD)을 timestamp(ms)로 변환. 비어있거나 잘못된 값이면 undefined.
 function parseDateInput(value: string): number | undefined {
@@ -85,12 +90,25 @@ export interface CollectApiProgress {
 // 중인 흐름 하나"를 공유해야 하므로, 어느 진입점(설정 탭 버튼/리본 아이콘)에서 실행하든
 // 같은 컨트롤러를 거쳐야 상태가 어긋나지 않는다. 미들웨어 등록은 플러그인 인스턴스당
 // 이 컨트롤러가 하나만 만들어진다는 전제로 생성자에서 한 번만 한다(main.ts.init 참고).
-export class CollectController {
+export class CollectController implements CollectProgressSink {
 	private activeFlow: ProgressFlow | undefined;
 	private progressListeners: (() => void)[] = [];
 
 	constructor(private readonly plugin: PaperGraph3D) {
 		this.registerDiagnostics();
+	}
+
+	// CollectProgressSink 구현 — CollectFoundMiddleware/CollectDoneMiddleware가 ProgressFlow/
+	// Notice 등 이 클래스 내부 구조를 몰라도 진행 상태를 읽고 갱신을 알릴 수 있게 한다.
+	getActiveFlow(): CollectProgressState | undefined {
+		return this.activeFlow;
+	}
+
+	notifyUpdated(): void {
+		if (this.activeFlow) {
+			this.updateProgress(this.activeFlow);
+		}
+		this.notifyProgress();
 	}
 
 	// 지금 도는 API(구독)의 진행 상태. 대기열 표시(SettingTab)가 이 값을 읽는다 — 없으면
@@ -293,66 +311,16 @@ export class CollectController {
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는
 	// 다이어그램 계약상 void만 반환하고 Notice/DOM을 전혀 모르므로(CollectAndSave는
 	// Obsidian을 몰라야 한다 — 001 합의), 관측은 항상 미들웨어를 경유한다. UI(Notice
-	// 생성·표시 문자열)는 이 안이 아니라 renderProgress()에만 있다.
+	// 생성·표시 문자열)는 이 안이 아니라 renderProgress()에만 있다. 미들웨어 구현 자체는
+	// CollectMiddlewares.ts(src/visualize/VisualMiddlewares.ts와 같은 자리)에 있고, 여기서는
+	// 이 컨트롤러를 CollectProgressSink로 넘겨 등록만 한다.
 	//
 	// 이 컨트롤러가 플러그인 인스턴스당 하나만 생성된다는 전제로 생성자에서 한 번만
 	// 등록한다 — 여러 번 만들면 'all' 미들웨어가 쌓여 같은 run() 호출에 대해
 	// lastCollectedCount가 여러 번(마지막 값은 같아도) 덮어써진다.
 	private registerDiagnostics(): void {
-		this.plugin.collectflow.setMiddleware({
-			type: 'all',
-			run: (context) => {
-				const papers = context as Paper[];
-				const flow = this.activeFlow;
-				if (!flow) {
-					return;
-				}
-				flow.collected = (flow.collected ?? 0) + papers.length;
-
-				// 이 청크가 어떤 API·조건에서 나왔는지는 CollectAndSave.ts를 안 건드리고
-				// Paper.collectedApis/collectedQueries에서 읽는다 — API는 항상 순차 처리되므로
-				// (CollectAndSave.collect() 참고) 한 청크의 논문은 전부 같은 API·조건에서
-				// 나온다. prefillFromStore(인용수/임베딩 보강)는 이 필드들을 안 건드리므로
-				// 'all' 시점엔 아직 다른 구독과 병합되기 전 원본 그대로다.
-				const first = papers[0];
-				if (first) {
-					const apiName = first.collectedApis[0];
-					const conditionsText = first.collectedQueries[0]?.query;
-					if (apiName !== undefined && conditionsText !== undefined) {
-						// apiName만으로는 "같은 API, 다른 조건의 구독 두 개가 연달아 돈다"를
-						// 구분 못 한다 — 조건까지 합친 키가 바뀔 때만 새 구독으로 보고 리셋.
-						const key = `${apiName}::${conditionsText}`;
-						const prevKey =
-							flow.apiName === undefined
-								? undefined
-								: `${flow.apiName}::${flow.apiConditionsText ?? ''}`;
-						if (key !== prevKey) {
-							flow.apiName = apiName;
-							flow.apiConditionsText = conditionsText;
-							flow.apiFound = 0;
-							flow.apiDone = 0;
-						}
-					}
-					flow.apiFound += papers.length;
-				}
-
-				this.updateProgress(flow);
-				this.notifyProgress();
-			},
-		});
-		this.plugin.collectflow.setMiddleware({
-			type: 'forEach',
-			run: () => {
-				const flow = this.activeFlow;
-				if (!flow) {
-					return;
-				}
-				flow.done += 1;
-				flow.apiDone += 1;
-				this.updateProgress(flow);
-				this.notifyProgress();
-			},
-		});
+		this.plugin.collectflow.setMiddleware(new CollectFoundMiddleware(this));
+		this.plugin.collectflow.setMiddleware(new CollectDoneMiddleware(this));
 	}
 
 	private updateProgress(flow: ProgressFlow): void {
