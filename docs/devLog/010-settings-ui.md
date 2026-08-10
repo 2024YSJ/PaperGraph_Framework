@@ -85,8 +85,24 @@ Middleware/Task로만 확장"하는 게 원칙이기 때문이다.
 항상 순차 처리되므로 `'all'`/`'forEach'` 미들웨어가 받는 청크는 항상 단일 API·조건에서
 나온다는 걸 확인했다 — 즉 **`CollectAndSave.ts`를 전혀 안 건드리고**, 기존 진단 미들웨어
 (`CollectController.registerDiagnostics()`)를 확장하는 것만으로 같은 정보를 얻을 수 있다.
-이 방향으로 다시 설계해 별도로 구현할 예정이다(이 커밋에는 아직 포함되지 않음 — 다음
-커밋에서 진행).
+
+### 구현 (완료)
+
+`CollectController.ts`의 `ProgressFlow`에 `apiName`/`apiConditionsText`/`apiFound`/
+`apiDone`을 추가하고, 기존 `'all'` 핸들러가 청크의 첫 논문에서
+`collectedApis[0]`/`collectedQueries[0].query`를 읽어 API·조건을 식별한다.
+`apiName`만으로는 "같은 API, 다른 조건의 구독 두 개가 연달아 도는" 경우를 구분 못 해서
+`${apiName}::${conditionsText}` 합성 키가 바뀔 때만 리셋한다. `'forEach'`는 처리 개수를
+누적한다. 큐 멤버십 변화(`onQueueChange`)와 별개로 진행률 변화를 알리는
+`onProgressChange` 구독을 추가해, `SettingTab.renderQueueStatus()`가 청크/논문 단위로도
+다시 그려지게 했다. 읽기 전용 투영 타입(`CollectApiProgress`)만 밖으로 내보내
+`ProgressFlow`의 `Notice`/`started` 같은 UI 전용 필드는 안 새어나가게 했다.
+
+한계로 남긴 것: API의 검색 결과가 0편이면 그 API에 대한 청크가 아예 안 와서 대기열
+보조 줄에 전혀 안 보이고 다음 API(또는 종료)로 넘어간 것처럼 보인다 — 미들웨어 시점
+데이터만 쓰는 방식의 자연스러운 한계로 감수했다. "API가 보고하는 총 예상 편수"(arXiv의
+`totalResults`)도 `onTotal`은 미들웨어 경유가 아니라서 이번 범위에서 뺐다 — 필요하면
+별도 논의.
 
 ## 검증
 
