@@ -70,7 +70,8 @@ interface ProgressFlow {
 	// SettingTab이 이 값을 그대로 보여준다).
 	apiName: string | undefined;
 	apiConditionsText: string | undefined;
-	apiFound: number; // 이 API(조건)에서 지금까지 추려진(도착한) 논문 수
+	apiFound: number; // 이 API(조건)에서 지금까지 추려진(도착한) 논문 수 — 재스캔 겹침 포함
+	apiNewFound: number; // 그중 저장소에 없던(신규) 논문 수
 	apiDone: number; // 이 API(조건)에서 지금까지 처리(임베딩+저장 직전)한 논문 수
 }
 
@@ -80,6 +81,7 @@ export interface CollectApiProgress {
 	apiName: string;
 	conditionsText: string;
 	found: number;
+	newFound: number;
 	done: number;
 }
 
@@ -122,6 +124,7 @@ export class CollectController implements CollectProgressSink {
 			apiName: flow.apiName,
 			conditionsText: flow.apiConditionsText,
 			found: flow.apiFound,
+			newFound: flow.apiNewFound,
 			done: flow.apiDone,
 		};
 	}
@@ -242,6 +245,7 @@ export class CollectController implements CollectProgressSink {
 			apiName: undefined,
 			apiConditionsText: undefined,
 			apiFound: 0,
+			apiNewFound: 0,
 			apiDone: 0,
 		};
 		flow.notice = new Notice(this.renderProgress(flow), 0);

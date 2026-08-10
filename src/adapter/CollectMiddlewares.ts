@@ -3,6 +3,7 @@
 // 추가한다 — src/visualize/VisualMiddlewares.ts와 같은 자리.
 import { Middleware, MiddlewareType } from '../common/Middleware';
 import { Paper } from '../collect/Paper';
+import { File } from '../common/File';
 
 // 이 미들웨어들이 실제로 읽고 쓰는 진행 상태만 노출한 좁은 인터페이스. CollectController의
 // ProgressFlow(Notice/label 등 UI 전용 필드 포함)를 그대로 넘기지 않고 이 타입으로만 본다.
@@ -12,7 +13,8 @@ export interface CollectProgressState {
 	// 지금 청크를 보내고 있는 API(구독)의 정보 — CollectFoundMiddleware가 채운다.
 	apiName: string | undefined;
 	apiConditionsText: string | undefined;
-	apiFound: number;
+	apiFound: number; // 이 창(재스캔 포함)에 도착한 전체 논문 수
+	apiNewFound: number; // 그중 저장소에 없던(신규) 논문 수
 	apiDone: number;
 }
 
@@ -32,12 +34,19 @@ export interface CollectProgressSink {
 // 한 청크의 논문은 전부 같은 API·조건에서 나온다. prefillFromStore(인용수/임베딩 보강)는
 // 이 필드들을 안 건드리므로, 이 미들웨어가 받는 시점엔 아직 다른 구독과 병합되기 전
 // 원본 그대로다.
+//
+// "추려진 논문 수"가 곧 "신규 논문 수"는 아니다 — 최근 수집은 색인 지연에 대응하려고
+// recentRescanWindowMs(4일, API.ts)만큼 항상 겹치는 구간을 다시 훑으므로, 이미 저장된
+// 논문도 매번 이 청크에 다시 걸린다. File.readStoredPaper로 저장 여부를 확인해 신규만
+// 따로 센다 — CollectAndSave.ts는 안 건드리고 File(정적 유틸리티)을 직접 호출한다.
+// prefillFromStore가 같은 목적의 조회를 이미 하므로 완전히 새로운 비용은 아니지만, 페이지당
+// (최대 100편) 읽기가 한 번 더 늘어난다 — 코퍼스 전체를 훑는 비용은 아니라 감수할 만하다.
 export class CollectFoundMiddleware implements Middleware {
 	type: MiddlewareType = 'all';
 
 	constructor(private readonly sink: CollectProgressSink) {}
 
-	run(context: unknown): void {
+	async run(context: unknown): Promise<void> {
 		const papers = context as Paper[];
 		const flow = this.sink.getActiveFlow();
 		if (!flow) {
@@ -59,10 +68,17 @@ export class CollectFoundMiddleware implements Middleware {
 					flow.apiName = apiName;
 					flow.apiConditionsText = conditionsText;
 					flow.apiFound = 0;
+					flow.apiNewFound = 0;
 					flow.apiDone = 0;
 				}
 			}
 			flow.apiFound += papers.length;
+
+			// CollectAndSave는 청크(페이지)를 항상 순차로 await하며 처리하므로(collect()가
+			// 다음 페이지를 요청하기 전에 이 run()이 끝까지 끝난다), 이 await 도중 다른
+			// 청크·다른 실행이 flow를 바꿔치기할 일은 없다 — flow를 그대로 계속 써도 된다.
+			const stored = await Promise.all(papers.map((paper) => File.readStoredPaper(paper)));
+			flow.apiNewFound += stored.filter((existing) => existing === null).length;
 		}
 
 		this.sink.notifyUpdated();
