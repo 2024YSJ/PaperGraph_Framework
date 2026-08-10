@@ -52,13 +52,8 @@ export class SettingTab extends PluginSettingTab {
 		// 아직 안 온 시점에는 없다 — 그럴 땐 보조 줄 자체를 생략한다.
 		const progress = this.plugin.collectController.currentApiProgress;
 		if (progress) {
-			// "추려진" 전체를 곧 "신규"로 보여주지 않는다 — 최근 수집은 색인 지연 때문에
-			// 겹치는 구간을 매번 다시 훑어서, 이미 저장된 논문도 여기 다시 걸린다
-			// (CollectFoundMiddleware 참고). 신규/재확인을 나눠 보여줘야 실제로 뭐가 새로
-			// 들어왔는지 알 수 있다.
-			const rescanned = progress.found - progress.newFound;
 			el.createDiv({
-				text: `→ ${progress.apiName} 수집 중 — 조건: ${progress.conditionsText} — 신규 ${progress.newFound}편 · 재확인 ${rescanned}편 · 처리 ${progress.done}편`,
+				text: `→ ${progress.apiName} 수집 중 — 조건: ${progress.conditionsText} — 추려진 ${progress.found}편 · 수집 ${progress.done}편`,
 			});
 		}
 	}
