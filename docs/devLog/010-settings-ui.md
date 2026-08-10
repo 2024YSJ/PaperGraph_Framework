@@ -104,6 +104,19 @@ Middleware/Task로만 확장"하는 게 원칙이기 때문이다.
 `totalResults`)도 `onTotal`은 미들웨어 경유가 아니라서 이번 범위에서 뺐다 — 필요하면
 별도 논의.
 
+### 후속 — "추려진" 문구가 오해를 부른 문제 (계산 로직이 아니라 문구로 해결)
+
+사용자 리포트: 대기열의 "추려진" 개수가 실제와 안 맞아 보이고 페이지 크기(100편)씩
+뛴다. 원인은 "최근 논문 수집"이 색인 지연에 대응하려고 `recentRescanWindowMs`(4일,
+`API.ts`)만큼 항상 겹치는 구간을 다시 훑는다는 데 있다 — 이미 저장된 논문도 매번 이
+청크에 다시 걸리는데 "추려진"이라는 말은 신규처럼 읽힌다.
+
+처음엔 `CollectFoundMiddleware`가 `File.readStoredPaper()`로 신규/재확인을 실제로
+구분해서 세는 방식으로 고쳤으나(`CollectController.ts`/`CollectMiddlewares.ts` 모두
+수정), **되돌렸다** — `CollectController.ts`는 손대지 않는 쪽으로 방향을 바꿨다.
+최종적으로는 계산 로직은 그대로 두고 `SettingTab.ts`의 표시 문구만 "확인 N편(재스캔
+구간 포함) · 처리 M편"으로 바꿔, 실제 신규 여부를 구분하지 않고도 오해를 줄였다.
+
 ## 검증
 
 `npm run build` / `npm run lint`(0 errors, 기존과 동일한 경고만) / `npm test`(무관한 기존
