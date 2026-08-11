@@ -102,7 +102,15 @@ const COLOR_UNCLUSTERED = '#8a8a8a'; // 회색 — 어느 덩어리에도 안 �
 // 켜고 끄는 것은 버튼 쪽에서 toggle()로 한다 — 이 미들웨어는 버튼을 만들지 않는다.
 //
 // 덩어리 번호는 paper.extra.clusterId에 들어간다(Clustering). 이 미들웨어는 그 값을 색으로
-// 옮기기만 하므로, 다른 미들웨어도 같은 값을 읽어 쓸 수 있다.
+// 옮기기만 하므로, 다른 미들웨어도 같은 값을 읽어 쓸 수 있다. 값은 메모리에만 남는다 —
+// 시각화 흐름에는 저장 단계가 없고, 계산이 결정적이라 다시 열면 같은 색이 나온다.
+//
+// 노드 색을 칠하는 다른 미들웨어(CitationColorMiddleware)보다 뒤에 등록해야 한다. 앞에 두면
+// 켜놓아도 뒤에 오는 미들웨어가 색을 도로 덮어쓴다.
+//
+// ⚠️ 껐다 켜려면 그래프와 3d-force-graph 인스턴스를 계속 들고 있어야 한다(Middleware에는
+// 뷰가 닫힐 때 알려주는 자리가 없다). 그래서 뷰를 닫아도 직전 그래프 하나가 메모리에 남는다.
+// 다음에 뷰를 열면 새 것으로 교체되므로 쌓이지는 않는다.
 export class ClusterColorMiddleware implements Middleware {
 	type: MiddlewareType = 'visual';
 
@@ -174,10 +182,14 @@ export class ClusterColorMiddleware implements Middleware {
 		this.refresh();
 	}
 
-	// 이미 그려진 그래프에 색 변경을 반영한다. 같은 접근자를 다시 넣으면 3d-force-graph가
-	// 노드 색을 다시 읽는다. 아직 그리기 전이면(render 전에 toggle) 할 일이 없다 — render가
-	// node.color를 그대로 쓰기 때문이다.
+	// 이미 그려진 그래프에 색 변경을 반영한다. 3d-force-graph는 접근자를 다시 넣어야 노드 색을
+	// 다시 읽으므로, 지금 쓰고 있는 접근자를 꺼내 그대로 돌려준다(인자 없이 부르면 게터다).
+	// 접근자를 새로 지어내면 render가 정한 기본색을 여기서 한 번 더 적어야 해서, 나중에 한쪽만
+	// 바뀌면 조용히 어긋난다.
+	//
+	// 아직 그리기 전이면(render 전에 toggle) 할 일이 없다 — render가 node.color를 그대로 읽는다.
 	private refresh(): void {
-		this.forceGraph?.nodeColor((node) => (node as GraphNode).color ?? COLOR_CITED);
+		const forceGraph = this.forceGraph;
+		forceGraph?.nodeColor(forceGraph.nodeColor());
 	}
 }
