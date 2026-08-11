@@ -43,4 +43,9 @@ export class Paper {
 // 미들웨어를 새로 만들 때 그 미들웨어가 채울 필드를 여기에 optional로 추가한다.
 // (예: summary?: string) — 필드가 늘어도 Paper의 필수 필드와 File의 저장/비교
 // 로직은 그대로다.
-export class ExtraData {}
+export class ExtraData {
+	// 클러스터 번호 (0부터, 큰 덩어리가 0). 밀도가 낮아 어느 덩어리에도 안 들어간 논문은
+	// 값이 없다 — "아직 안 나눴다"와 "나눠봤지만 어디에도 안 속한다"가 둘 다 없음으로
+	// 표현되지만, 시각화는 둘 다 기본색으로 그리므로 구분할 필요가 없다.
+	clusterId?: number;
+}
