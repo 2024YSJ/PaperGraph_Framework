@@ -1,23 +1,35 @@
 import { App, Menu, Notice } from 'obsidian';
 import type PaperGraph3D from '../main';
+import type { API } from '../collect/API';
 import { Log } from '../common/Log';
-import { PipelineTestModal } from './PipelineTestModal';
+import { SubscriptionTargetModal, type SubscriptionTarget } from './SubscriptionTargetModal';
 import {
 	CollectDoneMiddleware,
 	CollectFoundMiddleware,
 	type CollectProgressSink,
 	type CollectProgressState,
+	type SubscriptionProgressEntry,
 } from './CollectMiddlewares';
-
-// 날짜 입력(YYYY-MM-DD)을 timestamp(ms)로 변환. 비어있거나 잘못된 값이면 undefined.
-function parseDateInput(value: string): number | undefined {
-	const parsed = Date.parse(value);
-	return Number.isNaN(parsed) ? undefined : parsed;
-}
 
 // timestamp -> <input type="date">가 받는 "YYYY-MM-DD". Backfill 범위 입력의 기본값 계산용.
 function isoDateInput(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
+}
+
+// 사람이 읽을 실행 라벨을 고른 구독으로부터 만든다 — 큐/Notice에 "최근 논문 수집" 같은
+// 뭉뚱그린 이름 대신 "arXiv 딥러닝 논문 수집"처럼 무엇을 수집하는지 바로 드러나는 이름을
+// 쓰기 위함(5번: 대기열 항목을 자연어로). 구독을 여럿 골랐으면 첫 번째 것 + "외 N건"으로
+// 줄인다 — 전부 나열하면 오히려 길어서 읽기 어렵다.
+function describeTargets(mode: string, targets: SubscriptionTarget[]): string {
+	const first = targets[0];
+	if (!first) {
+		return mode;
+	}
+	const describe = (t: SubscriptionTarget): string =>
+		`${t.apiName} ${t.querys.map((q) => q.query).join('/')}`;
+	const summary =
+		targets.length === 1 ? describe(first) : `${describe(first)} 외 ${targets.length - 1}건`;
+	return `${summary} ${mode}`;
 }
 
 // 수집/보정 버튼 공용 실행기. run()/repair()는 실패 시 사용자가 무엇을 해야 하는지 담아
@@ -39,16 +51,16 @@ async function runCollectFlow(
 	action: () => Promise<string | void>,
 ): Promise<void> {
 	if (busy) {
-		new Notice(`${label}을(를) 대기열에 넣었습니다. 진행 중인 작업이 끝나면 실행됩니다.`);
+		new Notice(`${label} — 대기열에 넣었습니다. 진행 중인 작업이 끝나면 실행됩니다.`);
 	}
 	Log.info('ui', `${label} 요청`, { queued: busy });
 	try {
 		const detail = await action();
-		new Notice(`${label}을(를) 마쳤습니다.${detail ? ` (${detail})` : ''}`);
+		new Notice(`${label} — 완료했습니다.${detail ? ` (${detail})` : ''}`);
 		Log.info('ui', `${label} 완료`, { detail });
 	} catch (e) {
 		const message = e instanceof Error ? e.message : String(e);
-		new Notice(`${label} 실패: ${message}`);
+		new Notice(`${label} — 실패했습니다: ${message}`);
 		Log.error('ui', `${label} 실패`, e);
 	}
 }
@@ -57,31 +69,23 @@ async function runCollectFlow(
 // 있을 수 있어서, 인스턴스 필드가 아니라 요청마다 하나씩 만든다(runWithProgress 주석 참고).
 interface ProgressFlow {
 	label: string;
-	total: number; // -1이면 아직 모름
-	done: number;
 	started: boolean; // 큐에서 빠져나와 실제로 실행이 시작됐는가
+	// 전체 처리 편수 — CollectDoneMiddleware가 채운다. CollectProgressState 계약상
+	// 필요하지만, 화면에는 더 이상 안 쓴다(구독별 독립 표기로 바뀌면서 전체 합계
+	// 표시 자체가 필요 없어졌다 — subscriptions[i].done이 그 자리를 대신한다).
+	done: number;
 	collected: number | undefined; // 'all' 미들웨어가 알려준 수집 편수
 	notice: Notice | undefined;
-	// 지금 청크를 보내고 있는 API(구독)의 정보. CollectAndSave.ts는 건드리지 않고, 'all'
-	// 미들웨어가 받는 Paper.collectedApis/collectedQueries에서 읽어낸다 — API들이 항상
-	// 순차 처리되므로(collect() 참고) 한 청크는 늘 같은 API·조건에서 나온다는 전제 위에
-	// 있다. apiName만으로는 "같은 API, 다른 조건의 구독 두 개가 연달아 돈다"를 구분 못
-	// 하므로, apiName+조건 문자열을 합친 키가 바뀔 때만 리셋한다(renderQueueStatus에서
-	// SettingTab이 이 값을 그대로 보여준다).
-	apiName: string | undefined;
-	apiConditionsText: string | undefined;
-	apiFound: number; // 이 API(조건)에서 지금까지 추려진(도착한) 논문 수
-	apiDone: number; // 이 API(조건)에서 지금까지 처리(임베딩+저장 직전)한 논문 수
+	// 이번 실행에서 시작된 구독들의 진행 상태 — CollectAndSave.run의 onApiStart/onApiDone이
+	// 채운다. 구독별 독립 표기(2번)의 핵심: 예전처럼 전체를 하나의 N/M 합계로 뭉뚱그리지
+	// 않고, 구독마다 자기 몫만 보여준다.
+	subscriptions: SubscriptionProgressEntry[];
+	currentIndex: number | undefined;
 }
 
 // SettingTab 등 다른 UI가 읽는 읽기 전용 투영 — ProgressFlow의 Notice/started 같은 UI 전용
 // 필드는 밖으로 내보내지 않는다.
-export interface CollectApiProgress {
-	apiName: string;
-	conditionsText: string;
-	found: number;
-	done: number;
-}
+export type CollectSubscriptionProgress = SubscriptionProgressEntry;
 
 // 수집 실행(최근/Backfill/보정)과 진행률 표시를 한 곳에 모은 컨트롤러.
 //
@@ -111,19 +115,10 @@ export class CollectController implements CollectProgressSink {
 		this.notifyProgress();
 	}
 
-	// 지금 도는 API(구독)의 진행 상태. 대기열 표시(SettingTab)가 이 값을 읽는다 — 없으면
-	// (유휴 상태, 보정 실행 중, 또는 첫 청크가 아직 안 온 시점) undefined.
-	get currentApiProgress(): CollectApiProgress | undefined {
-		const flow = this.activeFlow;
-		if (!flow || flow.apiName === undefined || flow.apiConditionsText === undefined) {
-			return undefined;
-		}
-		return {
-			apiName: flow.apiName,
-			conditionsText: flow.apiConditionsText,
-			found: flow.apiFound,
-			done: flow.apiDone,
-		};
+	// 이번 실행에서 지금까지 시작된 구독들의 진행 상태. 대기열 표시(SettingTab)가 이 값을
+	// 읽는다 — 없으면(유휴 상태, 보정 실행 중, 또는 아직 첫 구독도 시작 안 한 시점) 빈 배열.
+	get activeSubscriptions(): CollectSubscriptionProgress[] {
+		return this.activeFlow?.subscriptions ?? [];
 	}
 
 	// queueState의 onQueueChange와 같은 패턴 — 대기열 박스가 여기 구독해서 API별 진행이
@@ -151,7 +146,7 @@ export class CollectController implements CollectProgressSink {
 			item
 				.setTitle('최근 논문 수집')
 				.setIcon('download')
-				.onClick(() => this.runRecent()),
+				.onClick(() => this.runRecent(app)),
 		);
 		menu.addItem((item) =>
 			item
@@ -162,87 +157,85 @@ export class CollectController implements CollectProgressSink {
 		menu.showAtMouseEvent(evt);
 	}
 
-	runRecent(): void {
-		void runCollectFlow('최근 논문 수집', this.plugin.collectflow.isBusy, () =>
-			this.runWithProgress('최근 논문 수집', (onStart, onTotal) =>
-				this.plugin.collectflow.run('recent', undefined, onStart, onTotal),
-			),
-		);
+	// 실행 전 SubscriptionTargetModal로 "이번엔 어느 구독만 돌릴지" 먼저 고른다(4번
+	// 타겟팅) — 기본은 전체 선택이라 아무것도 안 바꾸면 예전과 동일하게 전체를 돈다.
+	// isBusy 체크는 모달을 여는 시점이 아니라 사용자가 실제로 「실행」을 누른 시점에
+	// 해야 한다 — 그 사이 다른 수집이 시작/종료될 수 있다.
+	runRecent(app: App): void {
+		new SubscriptionTargetModal(app, '최근 논문 수집 — 구독 선택', false, (targets) => {
+			const label = describeTargets('최근 논문 수집', targets);
+			void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
+				this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
+					this.plugin.collectflow.run(
+						'recent',
+						{ targetSubscriptions: targets },
+						onStart,
+						onTotal,
+						onApiStart,
+						onApiDone,
+					),
+				),
+			);
+		}).open();
 	}
 
 	openBackfillModal(app: App): void {
-		new PipelineTestModal(
+		new SubscriptionTargetModal(
 			app,
-			'Backfill — 과거 구간 수집',
-			[
-				{
-					key: 'from',
-					label: '시작일',
-					type: 'date',
-					// 기본 2주 — 좁은 구간을 고르면 100건 미만이라 페이지네이션이
-					// 한 번도 안 돌아 검증이 안 된다.
-					defaultValue: isoDateInput(Date.now() - 14 * 24 * 60 * 60 * 1000),
-				},
-				{
-					key: 'to',
-					label: '종료일 (당일 포함)',
-					type: 'date',
-					defaultValue: isoDateInput(Date.now()),
-				},
-			],
-			async (values) => {
-				const from = parseDateInput(values.from ?? '');
-				const toMidnight = parseDateInput(values.to ?? '');
-				if (from === undefined || toMidnight === undefined) {
-					new Notice('시작일/종료일을 올바르게 입력하세요');
+			'Backfill — 과거 구간 수집 · 구독 선택',
+			true,
+			(targets, range) => {
+				// needsDateRange=true일 때만 열리는 창이라 range는 항상 온다 — 타입 좁히기용 가드.
+				if (!range) {
 					return;
 				}
-				// 날짜 입력은 자정(00:00)으로 파싱되므로 그대로 넘기면 종료일 당일이
-				// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
-				// "종료일 당일 포함"으로 맞춘다.
-				const to = toMidnight + 24 * 60 * 60 * 1000;
-				await runCollectFlow('Backfill', this.plugin.collectflow.isBusy, () =>
-					this.runWithProgress('Backfill', (onStart, onTotal) =>
-						this.plugin.collectflow.run('backfill', { from, to }, onStart, onTotal),
+				const label = describeTargets('Backfill', targets);
+				void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
+					this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
+						this.plugin.collectflow.run(
+							'backfill',
+							{ from: range.from, to: range.to, targetSubscriptions: targets },
+							onStart,
+							onTotal,
+							onApiStart,
+							onApiDone,
+						),
 					),
 				);
 			},
+			// 기본 2주 — 좁은 구간을 고르면 100건 미만이라 페이지네이션이 한 번도 안 돌아
+			// 검증이 안 된다.
+			isoDateInput(Date.now() - 14 * 24 * 60 * 60 * 1000),
+			isoDateInput(Date.now()),
 		).open();
-	}
-
-	runRepair(): void {
-		void runCollectFlow('보정', this.plugin.collectflow.isBusy, async () => {
-			await this.plugin.collectflow.repair();
-			return this.formatRepairDetail();
-		});
 	}
 
 	// 수집 요청 하나를 진행률 Notice와 함께 실행한다.
 	//
 	// 큐 때문에 "요청했지만 아직 시작 안 한" 상태가 생기므로, 진행 상태는 인스턴스 필드가
 	// 아니라 요청마다 만드는 ProgressFlow에 담는다. 필드 하나를 공유하면 두 번째 요청이
-	// 첫 번째의 총계를 0으로 리셋해 "29/0편" 같은 표시가 나온다.
+	// 첫 번째의 진행 상태를 서로 덮어쓴다.
 	//
 	// CollectAndSave에는 이 존재가 전달되지 않는다 — 도메인은 Obsidian을 몰라야 한다
-	// (001 합의). 작업이 실제로 시작됐다는 사실만 onStart 콜백으로, 총계는 onTotal
-	// 콜백으로 되돌려받는다.
+	// (001 합의). 작업이 실제로 시작됐다는 사실만 onStart 콜백으로, 구독 시작/종료는
+	// onApiStart/onApiDone 콜백으로 되돌려받는다.
 	private async runWithProgress(
 		label: string,
-		action: (onStart: () => void, onTotal: (subtotal: number) => void) => Promise<void>,
+		action: (
+			onStart: () => void,
+			onTotal: (subtotal: number) => void,
+			onApiStart: (api: API, index: number, total: number) => void,
+			onApiDone: (api: API, index: number, total: number) => void,
+		) => Promise<void>,
 	): Promise<string | void> {
 		const flow: ProgressFlow = {
 			label,
-			// -1 = "총계 미정". run()이 onTotal로 알려주기 전까지는 분모를 아는 척하지
-			// 않는다 — 0으로 두면 아직 안 온 총계를 실제 값처럼 "N/0편"으로 찍게 된다.
-			total: -1,
-			done: 0,
 			started: false,
+			done: 0,
 			collected: undefined,
 			notice: undefined,
-			apiName: undefined,
-			apiConditionsText: undefined,
-			apiFound: 0,
-			apiDone: 0,
+			subscriptions: [],
+			currentIndex: undefined,
 		};
 		flow.notice = new Notice(this.renderProgress(flow), 0);
 		try {
@@ -255,10 +248,39 @@ export class CollectController implements CollectProgressSink {
 					this.updateProgress(flow);
 					this.notifyProgress();
 				},
+				// API.CollectOptions.onTotal — "지금 활성 구독이 이번 구간에 실제로 몇 편을
+				// 갖고 있는지"를 구독마다 최대 한 번씩 알려준다(CollectAndSave.run 주석
+				// 참고). found를 분모로 쓰면 페이지(청크)가 도착할 때마다 분모 자체가 같이
+				// 늘어나 "0/100 -> 101/200"처럼 실제 진행률처럼 안 보였다 — 진짜 총량인
+				// 이 값을 받아 그 구독의 total에 채운다.
 				(subtotal) => {
-					// 구독마다 최대 한 번씩 불린다 — 값을 더해야 여러 구독을 합친 전체
-					// 총계가 된다(청크 도착 순서에 상관없이 각자 자기 몫만 보고한다).
-					flow.total = (flow.total < 0 ? 0 : flow.total) + subtotal;
+					if (flow.currentIndex !== undefined) {
+						const entry = flow.subscriptions[flow.currentIndex];
+						if (entry) {
+							entry.total = subtotal;
+						}
+					}
+					this.updateProgress(flow);
+					this.notifyProgress();
+				},
+				(api, index) => {
+					flow.subscriptions[index] = {
+						apiName: api.apiName,
+						conditionsText: api.querys.map((q) => q.query).join(' AND '),
+						status: 'running',
+						found: 0,
+						done: 0,
+						total: -1,
+					};
+					flow.currentIndex = index;
+					this.updateProgress(flow);
+					this.notifyProgress();
+				},
+				(_api, index) => {
+					const entry = flow.subscriptions[index];
+					if (entry) {
+						entry.status = 'done';
+					}
 					this.updateProgress(flow);
 					this.notifyProgress();
 				},
@@ -268,7 +290,7 @@ export class CollectController implements CollectProgressSink {
 			flow.notice = undefined;
 			if (this.activeFlow === flow) {
 				this.activeFlow = undefined;
-				// 대기열 보조 줄(currentApiProgress)이 남아있지 않도록 실행이 끝났다는
+				// 대기열 보조 줄(activeSubscriptions)이 남아있지 않도록 실행이 끝났다는
 				// 사실도 알린다.
 				this.notifyProgress();
 			}
@@ -277,35 +299,15 @@ export class CollectController implements CollectProgressSink {
 			return undefined;
 		}
 		// 임베딩 실패는 수집을 멈추지 않으므로, 알리지 않으면 사용자는 벡터가 빈 논문이
-		// 쌓인 걸 모른다. 복구 방법(보정)까지 같이 말한다.
+		// 쌓인 걸 모른다. 3번(보정 자동화) 이후로는 수동 버튼이 없고, 임베딩 재시도는 이번
+		// 실행 안에서 하지 않는다 — 서킷브레이커를 막 리셋하고 바로 다시 두드리는 헛수고를
+		// 피하려고 다음 플러그인 로드 때의 전수 보정으로 미뤘다(CollectAndSave.runNow 끝
+		// 주석 참고). 그러니 여기서는 "지금 몇 편 실패했다"만 사실대로 알리고, 언제
+		// 복구되는지도 같이 말한다.
 		const failed = this.plugin.collectflow.lastStats?.embedFailed ?? 0;
 		return failed > 0
-			? `${flow.collected}편 수집, 그중 ${failed}편 임베딩 실패 — 「보정」으로 재시도하세요`
+			? `${flow.collected}편 수집, 그중 ${failed}편 임베딩 실패 — 다음 플러그인 로드 때 자동으로 재시도됩니다`
 			: `${flow.collected}편 수집`;
-	}
-
-	// 보정은 진행률 Notice가 없어 runWithProgress를 안 거치므로, 완료 문구는 여기서 따로
-	// 만든다. lastRepairStats는 repair()가 void를 반환하는 대신 인스턴스에 남겨두는 값이다
-	// (run()의 lastStats와 같은 이유).
-	private formatRepairDetail(): string | undefined {
-		const stats = this.plugin.collectflow.lastRepairStats;
-		if (!stats) {
-			return undefined;
-		}
-		const parts: string[] = [];
-		if (stats.reembedded > 0) {
-			parts.push(`재임베딩 ${stats.reembedded}편`);
-		}
-		if (stats.citationsFixed > 0) {
-			parts.push(`인용수 보강 ${stats.citationsFixed}편`);
-		}
-		if (parts.length === 0) {
-			return '고칠 것 없음';
-		}
-		if (stats.reembedFailed > 0) {
-			parts.push(`${stats.reembedFailed}편은 여전히 실패`);
-		}
-		return parts.join(', ');
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는
@@ -327,26 +329,38 @@ export class CollectController implements CollectProgressSink {
 		flow.notice?.setMessage(this.renderProgress(flow));
 	}
 
-	// 세 단계로 다르게 말한다: 큐에서 대기 중 / 받아오는 중(총계 미정) / 처리 중(N/M).
-	// 총계를 모르는 동안 분모를 아는 척하지 않는 게 핵심이다.
+	// 구독별 독립 표기(2번) — 예전처럼 전체를 하나의 N/M 합계로 뭉뚱그리지 않고, 시작된
+	// 구독마다 한 줄씩 자기 몫만 보여준다. 결과가 0편인 구독도 onApiStart 시점에 이미
+	// 줄이 하나 생기므로(collect() 참고) 화면에서 사라지지 않는다.
 	private renderProgress(flow: ProgressFlow): DocumentFragment {
-		const known = flow.total >= 0;
 		return createFragment((el) => {
-			let text: string;
 			if (!flow.started) {
-				text = `${flow.label} — 대기 중... (진행 중인 작업이 끝나면 시작합니다)`;
-			} else if (!known) {
-				// API 이름을 하드코딩하지 않는다 — arXiv 외 다른 API가 추가돼도 그대로 맞다.
-				text = `${flow.label} — 수집 중... (총 편수는 아직 알 수 없습니다)`;
-			} else {
-				text = `${flow.label} — 수집한 논문 처리 중... (${flow.done}/${flow.total}편)`;
+				el.createDiv({ text: `${flow.label} — 대기 중... (진행 중인 작업이 끝나면 시작합니다)` });
+				return;
 			}
-			el.createDiv({ text });
-			// max가 0/음수면 <progress>는 부정형(indeterminate)이 된다 — 총계를 모르는
-			// 동안 정확히 그 표시를 원한다.
-			el.createEl('progress', {
-				attr: known ? { value: flow.done, max: Math.max(flow.total, 1) } : {},
-			});
+			if (flow.subscriptions.length === 0) {
+				el.createDiv({ text: `${flow.label} — 준비 중...` });
+				return;
+			}
+			for (const sub of flow.subscriptions) {
+				el.createDiv({ text: CollectController.describeSubscription(sub) });
+			}
 		});
+	}
+
+	// 짧은 한 줄로 요약한다 — "재스캔 구간 포함" 같은 개발자용 배경 설명은 뺀다(5번:
+	// 너무 길다는 피드백). 완료된 구독은 몇 편을 모았는지만, 진행 중인 구독은 처리
+	// 상황만 보여준다.
+	private static describeSubscription(sub: SubscriptionProgressEntry): string {
+		const name = `${sub.apiName} ${sub.conditionsText}`;
+		if (sub.status === 'done') {
+			return `✓ ${name} — ${sub.found}편 수집 완료`;
+		}
+		if (sub.total < 0) {
+			// 아직 API가 총 편수를 안 알려준 시점(요청 보낸 직후) — found를 분모로 쓰면
+			// 페이지가 넘어갈 때마다 분모가 같이 늘어 진행률처럼 안 보인다.
+			return `→ ${name} — 수집 중... (총 편수 확인 중)`;
+		}
+		return `→ ${name} — 처리 중 (${sub.done}/${sub.total}편)`;
 	}
 }
