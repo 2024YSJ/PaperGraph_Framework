@@ -6,8 +6,9 @@ import { PipelineTestModal } from './PipelineTestModal';
 import { FileTestModal } from './FileTestModal';
 import { Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
-import { S2_SECRET_PROVIDER } from '../collect/API';
-import { identifyKeyProvider, validateAllKeys } from '../collect/SecretValidation';
+
+import { KEY_VALIDATORS, validateAllKeys } from '../collect/SecretValidation';
+
 import type { Middleware } from '../common/Middleware';
 
 // 임베딩 스트레스 테스트용 모의 논문 생성. 실제 arXiv cs.CL/cs.LG/cs.AI 최신 100편 초록의
@@ -208,6 +209,10 @@ export class SettingTab extends PluginSettingTab {
 	plugin: PaperGraph3D;
 
 	private apiKeyDraft = '';
+	// 어느 provider(Semantic Scholar 등)에 저장할지 — 구독의 apiNameDraft 드롭다운과 같은
+	// 패턴. provider를 명시적으로 고르게 하면 저장 시 실제 요청으로 provider를 추측할
+	// 필요가 없다.
+	private apiKeyProviderDraft = '';
 	private apiNameDraft = '';
 	private apiDrafts: ApiDraft[] = [];
 	private subscriptionsLoaded = false;
@@ -461,10 +466,24 @@ export class SettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName('API 키')
 			.setDesc(
-				'Semantic Scholar 등 등록된 API의 키(선택 사항 — 없으면 익명으로 호출되지만 ' +
-					'요청 한도가 낮습니다). 어느 provider 키인지는 저장 시 실제 요청으로 자동 ' +
-					'판별합니다 — 여러 provider의 키를 하나씩 붙여넣고 저장하면 됩니다.',
+				'등록된 provider를 고르고 키를 입력하세요(선택 사항 — 없으면 익명으로 호출되지만 ' +
+					'요청 한도가 낮습니다). 구독의 API 선택과 같은 방식으로, provider마다 따로 저장합니다.',
 			)
+			// 구독의 API 선택 드롭다운(apiNameDraft)과 같은 패턴 — provider를 직접 고르게
+			// 하면 저장 시 어느 provider 것인지 실제 요청으로 추측할 필요가 없다(추측은
+			// 네트워크 왕복이 들고, 등록된 검증기가 없는 provider는 애초에 추측이 불가능하다).
+			.addDropdown((dropdown) => {
+				for (const validator of KEY_VALIDATORS) {
+					dropdown.addOption(validator.provider, validator.label);
+				}
+				if (this.apiKeyProviderDraft.length === 0) {
+					this.apiKeyProviderDraft = KEY_VALIDATORS[0]?.provider ?? '';
+				}
+				dropdown.setValue(this.apiKeyProviderDraft).onChange((value) => {
+					this.apiKeyProviderDraft = value;
+					void this.loadApiKeyDraft();
+				});
+			})
 			.addText((text) =>
 				text
 					.setPlaceholder('API 키 입력')
@@ -850,38 +869,42 @@ export class SettingTab extends PluginSettingTab {
 		}
 		this.apiNameDraft = File.supportedApiNames()[0] ?? '';
 
-		// 이미 등록된 S2 키가 있으면 빈칸 대신 그대로 보여준다 — 안 그러면 등록해놓고도
-		// 설정탭을 다시 열 때마다 "비어 있나?" 헷갈린다(FileTestModal의 "Secret 확인하기"도
-		// 평문으로 보여주는 것과 같은 판단 — 이 vault 밖으로 안 나가는 로컬 값이다).
-		try {
-			const secret = await File.readSecret();
-			this.apiKeyDraft = secret.getKey(S2_SECRET_PROVIDER) ?? '';
-		} catch (e) {
-			new Notice(`API 키를 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
+		// provider 드롭다운의 기본 선택값과, 이미 등록된 키가 있으면 빈칸 대신 그대로
+		// 보여준다 — 안 그러면 등록해놓고도 설정탭을 다시 열 때마다 "비어 있나?" 헷갈린다
+		// (FileTestModal의 "Secret 확인하기"도 평문으로 보여주는 것과 같은 판단 — 이 vault
+		// 밖으로 안 나가는 로컬 값이다).
+		if (this.apiKeyProviderDraft.length === 0) {
+			this.apiKeyProviderDraft = KEY_VALIDATORS[0]?.provider ?? '';
 		}
+		await this.loadApiKeyDraft();
 
 		this.subscriptionsLoaded = true;
 		this.display();
 	}
 
-	// apiKeyDraft -> Secret.json. 입력란이 하나뿐이라도 provider별로 나눠 저장한다 —
-	// identifyKeyProvider()가 등록된 KeyValidator들에 실제로 물어봐 이 키가 어느 provider
-	// 것인지 판별한다(형식만으로는 구분 불가 — SecretValidation.ts 참고). 어느 provider에도
-	// 안 맞으면 잘못된 키로 보고 저장하지 않는다. 현재 저장본을 읽어 그 provider 항목만
+	// 지금 선택된 provider(apiKeyProviderDraft)에 등록된 키를 읽어 apiKeyDraft에 채운다.
+	// 드롭다운을 바꿀 때마다 다시 불러 그 provider의 실제 저장값을 보여준다.
+	private async loadApiKeyDraft(): Promise<void> {
+		try {
+			const secret = await File.readSecret();
+			this.apiKeyDraft = secret.getKey(this.apiKeyProviderDraft) ?? '';
+		} catch (e) {
+			new Notice(`API 키를 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
+		}
+		this.display();
+	}
+
+	// apiKeyDraft -> Secret.json, apiKeyProviderDraft가 가리키는 provider 항목에 저장한다.
+	// 구독의 API 선택 드롭다운과 같은 방식으로 provider를 직접 고르게 했으므로, 저장 시
+	// 어느 provider인지 추측할 필요가 없다. 현재 저장본을 읽어 그 provider 항목만
 	// 갈아끼운다 — 그대로 새 Secret()을 써서 저장하면 다른 provider의 키까지 날아간다.
 	// 실패 시 호출부가 처리하도록 그대로 throw한다(성공 Notice를 잘못 띄우지 않기 위해
 	// 여기서 삼키지 않는다).
-	private async persistApiKey(): Promise<void> {
-		const key = this.apiKeyDraft.trim();
-		const provider = await identifyKeyProvider(key);
-		if (provider === undefined) {
-			throw new Error('등록된 provider(Semantic Scholar 등) 중 어디에도 맞지 않는 키입니다.');
-		}
-		const secret = await File.readSecret();
-		secret.setKey(provider, key);
-		await File.writeSecret(secret);
-	}
-
+private async persistApiKey(): Promise<void> {
+	const secret = await File.readSecret();
+	secret.setKey(this.apiKeyProviderDraft, this.apiKeyDraft.trim());
+	await File.writeSecret(secret);
+}
 	// apiDrafts -> Subscriptions.json. 현재 저장본을 읽어와 apis만 갈아끼운다.
 	//
 	// File.mutateSubscriptions로 읽기-수정-쓰기를 큐에 태운다 — 수집이 막 끝나며
