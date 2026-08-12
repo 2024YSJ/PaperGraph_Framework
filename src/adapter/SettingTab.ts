@@ -171,31 +171,6 @@ export class SettingTab extends PluginSettingTab {
 				}),
 			);
 
-		// 7번(부분 재조회, 임시 기능) — arXiv 응답에서 제목/초록이 비어 있어 논문으로
-		// 승격되지 못했던 항목 중, id는 파싱됐던 것만 다시 물어본다. 대부분은 다음 recent
-		// 재스캔에서 저절로 다시 잡히므로(4일 롤링 창), 이 버튼은 그걸 기다리지 않고 지금
-		// 바로 확인하고 싶을 때만 쓴다 — 목록 화면은 따로 없다, 결과는 Notice로만 안내.
-		new Setting(containerEl)
-			.setName('스킵 항목 재수집 시도')
-			.setDesc(
-				'수집 중 형식이 맞지 않아 건너뛴 항목 중, id는 파악됐지만 제목/초록만 없었던 것만 다시 조회를 시도합니다.',
-			)
-			.addButton((button) =>
-				button.setButtonText('재수집 시도').onClick(async () => {
-					try {
-						await this.plugin.eventListener.checking('ui:collect-retry-skipped');
-						const stats = this.plugin.collectflow.lastRetrySkippedStats;
-						new Notice(
-							stats
-								? `스킵 항목 재수집 완료 — ${stats.recovered}건 복구, ${stats.stillMissing}건 여전히 실패`
-								: '스킵 항목 재수집 완료',
-						);
-					} catch (e) {
-						new Notice(`스킵 항목 재수집 실패: ${e instanceof Error ? e.message : String(e)}`);
-					}
-				}),
-			);
-
 		// 큐 상태. 수집 버튼을 잠그는 대신 "지금 무엇이 돌고 무엇이 줄 서 있는지"를 보여준다.
 		new Setting(containerEl).setName('대기열').then((setting) => {
 			this.queueStatusEl = setting.descEl;

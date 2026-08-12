@@ -3,6 +3,7 @@ import type PaperGraph3D from '../main';
 import type { API } from '../collect/API';
 import type { SearchQuery } from '../collect/SearchQuery';
 import { Log } from '../common/Log';
+import { FailureNotifier } from '../common/Notify';
 import { SubscriptionTargetModal, type SubscriptionTarget } from './SubscriptionTargetModal';
 import {
 	CollectDoneMiddleware,
@@ -99,6 +100,22 @@ export type CollectSubscriptionProgress = SubscriptionProgressEntry;
 export class CollectController implements CollectProgressSink {
 	private activeFlow: ProgressFlow | undefined;
 	private progressListeners: (() => void)[] = [];
+
+	// silent 실행(스케줄러/명령어 팔레트)은 완료 Notice가 없어서, buildPartialFailureSuffix가
+	// 만드는 문구가 아무한테도 안 보인다 — 그런데 그 문구가 다루는 신호 중 "구조적 실패"
+	// (우연이 아니라 계속 반복될 성격의 실패)는 silent 여부와 무관하게 알려야 한다.
+	// FailureNotifier로 이유가 바뀔 때만 알려 스팸 없이 이 공백을 메운다(checkStructuralFailures
+	// 참고).
+	//
+	// 스킵 비율 이상치는 여기 없다(2026-08-13 검토 후 제외) — 원인(arXiv 응답 자체가
+	// 이상했다)에 대해 사용자가 할 수 있는 조치가 없고, recent 수집의 작은 표본에서는
+	// 비율이 우연히도 쉽게 튀어 노이즈가 크다는 판단.
+	private readonly citationRepairFailureNotifier = new FailureNotifier();
+
+	// 인용수 보정이 "시도는 했는데 하나도 못 고쳤다"고 판단할 최소 시도 편수. 1~2편은
+	// 그 논문들이 우연히 S2에 없었을 뿐일 수 있어 노이즈가 크다 — 몇 편 이상 전부
+	// 실패해야 "키/네트워크 문제"라는 구조적 신호로 본다.
+	private static readonly CITATION_REPAIR_MIN_ATTEMPTED = 3;
 
 	constructor(private readonly plugin: PaperGraph3D) {
 		this.registerDiagnostics();
@@ -374,6 +391,9 @@ export class CollectController implements CollectProgressSink {
 				this.notifyProgress();
 			}
 		}
+		// silent 여부·수집 편수와 무관하게 항상 확인한다 — 구조적 실패는 "0편 수집"으로
+		// 끝난 실행에서도 일어날 수 있다.
+		this.checkStructuralFailures();
 		if (flow.collected === undefined) {
 			return undefined;
 		}
@@ -419,6 +439,29 @@ export class CollectController implements CollectProgressSink {
 			parts.push(`${names} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
 		}
 		return parts.length > 0 ? `, ${parts.join(', ')}` : '';
+	}
+
+	// buildPartialFailureSuffix가 다루는 신호들은 완료 Notice에 딸려가는 문구라 silent
+	// 실행(스케줄러 등)에서는 아무도 못 본다. 그중 "우연이 아니라 계속 반복될 성격"인
+	// 신호만 silent 여부와 무관하게 별도 Notice로 알린다 — 나머지(임베딩 실패 몇 편,
+	// 스킵 몇 건 등)는 자동 복구되거나 애초에 흔한 일이라 완료 Notice로 충분하다.
+	//
+	// 이유가 바뀔 때만 알리므로(FailureNotifier) 같은 원인이 반복되는 동안은 조용하다 —
+	// 스케줄러가 몇 시간마다 도는데 매번 뜨면 그 자체가 스팸이 된다.
+	private checkStructuralFailures(): void {
+		const citationStats = this.plugin.collectflow.lastCitationRepairStats;
+		if (citationStats && citationStats.attempted >= CollectController.CITATION_REPAIR_MIN_ATTEMPTED) {
+			if (citationStats.citationsFixed === 0) {
+				this.citationRepairFailureNotifier.notifyFailure(
+					'citation-repair-empty',
+					() =>
+						`PaperGraph3D: 인용수 보정이 ${citationStats.attempted}편을 시도했지만 하나도 ` +
+						`성공하지 못했습니다 — Semantic Scholar 키/네트워크 상태를 확인하세요.`,
+				);
+			} else {
+				this.citationRepairFailureNotifier.notifySuccess();
+			}
+		}
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는

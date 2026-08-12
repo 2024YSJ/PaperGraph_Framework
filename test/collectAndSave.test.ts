@@ -1806,7 +1806,7 @@ describe('CollectAndSave.run — 스킵 항목이 SkippedEntries.json에 기록�
 	});
 });
 
-describe('CollectAndSave.retrySkippedEntries — 부분 재조회', () => {
+describe('CollectAndSave.repair — 스킵 항목 부분 재조회(자동, targetSourceIds 없을 때만)', () => {
 	function seedSkippedEntries(
 		records: {
 			rawId: string;
@@ -1841,7 +1841,9 @@ describe('CollectAndSave.retrySkippedEntries — 부분 재조회', () => {
 		});
 		const { embedding } = fakeEmbedding();
 
-		await collectFlow(embedding).retrySkippedEntries();
+		// retrySkippedEntries 전용 공개 메서드는 없다 — 전수 보정(repair, targetSourceIds
+		// 없음)이 조용히 같이 돈다(2026-08-13: 수동 버튼 제거, 완전 자동화).
+		await collectFlow(embedding).repair();
 
 		const stored = vault.storedPapers();
 		assert.equal(stored.length, 1);
@@ -1865,7 +1867,9 @@ describe('CollectAndSave.retrySkippedEntries — 부분 재조회', () => {
 		});
 		const { embedding } = fakeEmbedding();
 
-		await collectFlow(embedding).retrySkippedEntries();
+		// retrySkippedEntries 전용 공개 메서드는 없다 — 전수 보정(repair, targetSourceIds
+		// 없음)이 조용히 같이 돈다(2026-08-13: 수동 버튼 제거, 완전 자동화).
+		await collectFlow(embedding).repair();
 
 		assert.equal(vault.storedPapers().length, 0);
 		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
@@ -1881,11 +1885,31 @@ describe('CollectAndSave.retrySkippedEntries — 부분 재조회', () => {
 		});
 		const { embedding } = fakeEmbedding();
 
-		await collectFlow(embedding).retrySkippedEntries();
+		// retrySkippedEntries 전용 공개 메서드는 없다 — 전수 보정(repair, targetSourceIds
+		// 없음)이 조용히 같이 돈다(2026-08-13: 수동 버튼 제거, 완전 자동화).
+		await collectFlow(embedding).repair();
 
 		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
 		const remaining = JSON.parse(raw ?? '[]') as { reason: string }[];
 		assert.equal(remaining.length, 1);
 		assert.equal(remaining[0]?.reason, 'no-id');
+	});
+
+	it('targetSourceIds로 좁힌 보정은 SkippedEntries.json을 건드리지 않는다', async () => {
+		seedSkippedEntries([{ rawId: 'http://arxiv.org/abs/2501.00011v1', reason: 'missing-fields' }]);
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			throw new Error(`좁힌 보정인데 스킵 재조회 요청이 나갔다: ${param.url}`);
+		});
+		const { embedding } = fakeEmbedding();
+
+		// 특정 논문만 겨냥한 보정 — 코퍼스 전체 대상인 스킵 재조회는 끼지 않아야 한다.
+		await collectFlow(embedding).repair(['arxiv:9999.99999']);
+
+		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
+		const remaining = JSON.parse(raw ?? '[]') as { rawId: string }[];
+		assert.equal(remaining.length, 1, '좁힌 보정이 스킵 레코드를 건드렸다');
 	});
 });

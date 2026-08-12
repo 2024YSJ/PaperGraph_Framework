@@ -95,6 +95,11 @@ export interface EmbedRepairStats extends EmbedBreakerStats {
 // 인용수 재보강만 돈 실행의 집계 (repairCitations()가 남긴다).
 export interface CitationRepairStats {
 	citationsFixed: number;
+	// 이번 실행에서 실제로 S2에 물어본 논문 수. citationsFixed와 같이 봐야 "시도했는데
+	// 하나도 못 고쳤다"(구조적 실패 — 키 문제, S2 장애 등)와 "애초에 고칠 게 없었다"(0/0,
+	// 정상)를 구분할 수 있다. UI가 이 값으로 Notice 여부를 판단한다(CollectController 참고)
+	// — CollectAndSave 자신은 Notice를 모른다.
+	attempted: number;
 }
 
 // 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + 콘텐츠 동기화 + 조건부 재임베딩)의 집계
@@ -359,19 +364,6 @@ export class CollectAndSave {
 		);
 	}
 
-	// 7번(부분 재조회) 전용 진입점 — SkippedEntries.json에 남은 'missing-fields' 레코드만
-	// API.RetryMissingEntries로 다시 물어본다. 사용자가 설정 탭 버튼을 눌러야만 도는 수동
-	// 동작이다(수집이 끝날 때마다 자동으로 돌지 않는다 — 대부분은 다음 recent 재스캔이
-	// 자연히 다시 잡아주므로, 이 버튼은 그 재스캔을 기다리지 않고 지금 바로 확인하고
-	// 싶을 때 쓴다). 이 기능 전체가 나중에 제거되면 이 메서드와 retrySkippedEntriesNow,
-	// appendSkippedEntries, File.readSkippedEntries/writeSkippedEntries만 지우면 된다.
-	retrySkippedEntries(onStart?: () => void): Promise<void> {
-		return this.enqueue(
-			{ kind: 'repair', label: '스킵 항목 재수집' },
-			() => this.retrySkippedEntriesNow(),
-			onStart,
-		);
-	}
 
 	// 전체 코퍼스 강제 새로고침 — citationsKnown과 무관하게 모든 논문의 인용수를 다시
 	// 조회하고, 콘텐츠(제목/초록/저자) 재조회를 지원하는 출처(API.RefreshContent를 구현한
@@ -689,7 +681,7 @@ export class CollectAndSave {
 	// 재보강(인용수)만 하는 몸통. 논문이 수집된 API별로 묶어 각 구현체의 EnrichCitations에
 	// 맡긴다(citationsKnown 필터는 그 안에 있다). 실패해도 throw하지 않는 [3] 정책 그대로.
 	private async repairCitationsBody(papers: Paper[]): Promise<CitationRepairStats> {
-		const stats: CitationRepairStats = { citationsFixed: 0 };
+		const stats: CitationRepairStats = { citationsFixed: 0, attempted: 0 };
 		if (this.disposed) {
 			return stats;
 		}
@@ -705,6 +697,7 @@ export class CollectAndSave {
 			if (targets.length === 0) {
 				continue;
 			}
+			stats.attempted += targets.length;
 			await File.createApi(apiName, [], secret).EnrichCitations(targets);
 			for (const paper of targets) {
 				if (paper.citationsKnown) {
@@ -853,7 +846,7 @@ export class CollectAndSave {
 		await File.writeSkippedEntries(Array.from(byRawId.values()));
 	}
 
-	// 재조회 전용 진입점 — SkippedEntries.json에서 reason === 'missing-fields'인 레코드만
+	// 재조회 몸통 — SkippedEntries.json에서 reason === 'missing-fields'인 레코드만
 	// 골라 다시 물어본다('no-id' 레코드는 애초에 재수집 대상을 특정할 수 없어 항상
 	// 제외한다). apiName별, 그리고 같은 apiName 안에서도 collectedQuery별로 묶어 각각
 	// API.RetryMissingEntries를 호출한다 — collectedQuery가 다르면 복구된 논문에 붙일
@@ -863,6 +856,14 @@ export class CollectAndSave {
 	// 들어오기 전까지는 한 번도 Paper였던 적이 없으므로, processChunk가 하는 일을 그대로
 	// 반복해야 한다(다만 CollectStats/citation 실패 누적 등 run() 전용 부기는 필요 없어
 	// processChunk를 직접 재사용하지 않고 이 메서드 안에서 필요한 것만 한다).
+	//
+	// 공개 진입점이 없다 — repairNow()가 전수 보정(targetSourceIds 없음) 경로에서만
+	// 조용히 함께 부른다(main.ts 로드 시 1회 + 커맨드 팔레트). 사용자가 직접 누르는
+	// 버튼은 없다(2026-08-13 결정) — 대부분의 missing-fields 스킵은 스스로 다시 물어봐도
+	// 같은 응답이 오므로(arXiv 쪽 데이터가 그 시점에 그렇게 생겼을 뿐, 네트워크
+	// 재시도로 고쳐지는 종류가 아니다) 즉시 재시도는 의미가 적고, recent 수집의 4일
+	// 재스캔 창이 이미 같은 역할을 훨씬 나은 주기로 하고 있다 — 전수 보정만이 그 창을
+	// 벗어난(Backfill) 잔여분을 회수하는 유일한 자리다.
 	private async retrySkippedEntriesNow(): Promise<void> {
 		const all = await File.readSkippedEntries();
 		const retryable = all.filter((r) => r.reason === 'missing-fields');
@@ -968,6 +969,19 @@ export class CollectAndSave {
 		const stats: RepairStats = { ...embedStats, ...citationStats };
 		Log.info('collect', '보정 완료', stats);
 		this.lastRepairStats = stats;
+
+		// 7번(부분 재조회) — 특정 논문만 겨냥한 보정(targetSourceIds 지정)에는 끼지 않는다.
+		// 이건 논문이 아니라 SkippedEntries.json(코퍼스 전체)을 대상으로 하므로, "이
+		// 논문들만 고쳐라"는 좁힌 호출 의도와 안 맞는다. 전수 보정(플러그인 로드/커맨드
+		// 팔레트, targetSourceIds 없음)에서만 조용히 같이 돈다 — 실패해도 나머지 보정
+		// 결과에 영향 주지 않도록 예외를 삼킨다.
+		if (targetSourceIds === undefined) {
+			try {
+				await this.retrySkippedEntriesNow();
+			} catch (error) {
+				Log.error('collect', '자동 스킵 항목 재수집 실패', error);
+			}
+		}
 	}
 
 	// ── 수집 범위 ──────────────────────────────────────────────────
