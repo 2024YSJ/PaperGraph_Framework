@@ -29,18 +29,6 @@ export class Clustering {
 	// 시도해 볼 덩어리 수의 시작점.
 	private static readonly MIN_K = 2;
 
-	// k를 어디까지 늘려볼지는 고정하지 않는다. 구독 수에 제한이 없어(Subscriptions.apis는
-	// 그냥 배열) 주제를 몇 개까지 모을지 알 수 없으므로, 상한을 손으로 정하면 그 숫자가 곧
-	// 근거 없는 천장이 된다.
-	//
-	// 대신 최고 점수를 이만큼 연속으로 못 깨면 거기서 멈춘다. 덩어리가 적은 데이터는 일찍
-	// 끝나고, 많은 데이터는 알아서 더 간다 — 실측: 실제 볼트는 9개만 시도하고 k=4에서 멈췄고
-	// (0.50초), 진짜 28덩어리인 합성 데이터에서는 32개까지 가서 k=27을 찾았다(1.70초).
-	//
-	// 6인 이유: 점수 곡선이 매끄럽지 않아 중간에 몇 번 내려갔다 올라온다(실제 볼트에서
-	// k=4 다음 5·6·7이 내려갔다가 8에서 다시 올랐다). 너무 짧으면 그 골짜기에서 멈춰버린다.
-	private static readonly PATIENCE = 6;
-
 	// 그래도 끝은 있어야 한다. 표본 한 덩어리에 이 정도는 들어가야 "덩어리"라고 볼 수 있으므로,
 	// 표본 크기를 이 값으로 나눈 만큼까지만 늘린다(표본 600 기준 30). 색이 10가지뿐이라
 	// 그보다 많아지면 색이 돌아 쓰여 화면에서 구분되지도 않는다.
@@ -53,11 +41,21 @@ export class Clustering {
 	// 점수의 격차도 0.0146 / 0.0104로 둘 다 넉넉했다. 반면 아래 반복 상한을 줄이면 격차가
 	// 0.0005까지 좁아져 사실상 아무 k나 골라진다. 그래서 아껴야 할 때는 반복이 아니라 표본을
 	// 줄인다.
-	private static readonly SAMPLE_SIZE = 600;
+	// 논문 수에 비례시키되 양 끝을 막는다. 고정값을 쓰면 코퍼스가 커질 때 무너진다 —
+	// 600으로 고정했더니 6017편·5분야에서는 k=4를 잘 골랐지만, 8238편·7분야가 되자 작은
+	// 분야가 표본에 거의 안 잡혀 k=2를 골랐다(실제로 좋은 값은 6이었고, 표본을 3000으로
+	// 올리자 k=5로 회복됐다).
+	private static readonly SAMPLE_MIN = 600;
+	private static readonly SAMPLE_MAX = 3000;
+	private static readonly SAMPLE_RATIO = 3; // 논문 몇 편당 한 편을 표본으로 볼지
+
+	private static sampleSize(count: number): number {
+		return Math.min(Clustering.SAMPLE_MAX, Math.max(Clustering.SAMPLE_MIN, Math.floor(count / Clustering.SAMPLE_RATIO)));
+	}
 
 	// k-means 반복 상한. 실제 볼트에서 전체는 17회, 표본은 k에 따라 12~31회에 스스로 멈추므로
 	// 여유를 둔 안전장치다. 중간에 끊으면 안 된다 — 덜 수렴한 결과로 매긴 점수는 k끼리
-	// 구분이 안 될 만큼 뭉개진다(SAMPLE_SIZE 주석 참고).
+	// 구분이 안 될 만큼 뭉개진다(표본 크기 주석 참고).
 	private static readonly MAX_ITERATIONS = 60;
 
 	// 판정을 보류하는 기준. 자기 덩어리 중심까지의 거리가 두 번째로 가까운 중심까지의
@@ -78,11 +76,16 @@ export class Clustering {
 	private cachedLabels = new Map<string, number>();
 	private cachedResult: ClusterResult | undefined;
 
+	// 직전 계산의 번호. 논문이 늘어도 화면 색이 유지되게 하는 데 쓴다
+	// (inheritNumbers 참고). 캐시와 달리 논문이 바뀌어도 버리지 않는다.
+	private previousLabels = new Map<string, number>();
+
 	// 캐시를 버린다. 논문을 다시 수집했거나 임베딩 모델이 바뀌었을 때 호출자가 부른다.
 	reset(): void {
 		this.cachedKey = '';
 		this.cachedLabels = new Map();
 		this.cachedResult = undefined;
+		this.previousLabels = new Map();
 	}
 
 	// 논문들을 묶고 각 논문의 extra.clusterId를 채운다. 보류된 논문과 임베딩이 없는 논문은
@@ -100,9 +103,9 @@ export class Clustering {
 		if (valid.length >= Clustering.MIN_PAPERS) {
 			const dim = valid[0]?.embedding.length ?? 0;
 			const vectors = Clustering.pack(valid, dim);
-			const k = Clustering.chooseK(vectors, valid.length, dim);
+			const k = Clustering.chooseK(valid);
 			const centroids = Clustering.kmeans(vectors, valid.length, dim, k, Clustering.MAX_ITERATIONS);
-			clusterCount = Clustering.assign(vectors, valid, dim, k, centroids, labels);
+			clusterCount = Clustering.assign(vectors, valid, dim, k, centroids, labels, this.previousLabels);
 		}
 
 		const result: ClusterResult = {
@@ -114,6 +117,8 @@ export class Clustering {
 		this.cachedKey = key;
 		this.cachedLabels = labels;
 		this.cachedResult = result;
+		// 다음 계산이 번호를 물려받을 수 있게 남긴다.
+		this.previousLabels = labels;
 		Clustering.applyLabels(papers, labels);
 		return result;
 	}
@@ -156,69 +161,67 @@ export class Clustering {
 
 	// ── k 자동 결정 ────────────────────────────────────────────────
 
-	// 몇 덩어리로 나누는 것이 자연스러운지 데이터에서 정한다.
+	// 몇 덩어리로 나눌지 정한다.
 	//
-	// k를 2부터 늘려가며 표본을 나눠 보고, "자기 중심에는 가깝고 다른 중심에서는 먼" 정도가
-	// 가장 좋은 k를 고른다(실루엣 점수의 중심점 판). 논문끼리 전부 비교하는 원래 실루엣은
-	// 편수의 제곱이라 못 쓰지만, 중심점만 보면 편수에 비례해 끝난다.
+	// 기하학으로 추측하지 않는다. 실루엣·CH지수·관성 무릎을 전부 재봤지만 실제 볼트에서는
+	// 셋 다 k=2를 가리켰다(순도 55%). 정작 좋은 값은 6~7이었다(순도 85%) — 논문 주제가
+	// 연속적으로 이어져 있어 "몇 덩어리"라는 기하학적 신호가 아예 없기 때문이다. 게다가 그
+	// 점수들은 표본 크기에 휘둘려서, 표본을 600에서 3000으로 바꾸자 답이 2에서 5로 뒤집혔다.
 	//
-	// 최고 기록이 PATIENCE번 연속 안 깨지면 거기서 멈춘다 — 더 늘려봐야 나아지지 않는다는
-	// 뜻이고, k가 커질수록 한 번 나눠보는 비용도 k에 비례해 커지기 때문이다.
-	private static chooseK(vectors: Float64Array, count: number, dim: number): number {
-		const sample = Clustering.sampleRows(vectors, count, dim);
-		const rows = sample.length / dim;
-		const limit = Math.min(Math.floor(rows / Clustering.MIN_SAMPLES_PER_CLUSTER), rows - 1);
-
-		let bestK = Clustering.MIN_K;
-		let bestScore = -Infinity;
-		let missed = 0;
-		for (let k = Clustering.MIN_K; k <= limit; k += 1) {
-			const centroids = Clustering.kmeans(sample, rows, dim, k, Clustering.MAX_ITERATIONS);
-			const score = Clustering.separation(sample, rows, dim, k, centroids);
-			if (score > bestScore) {
-				bestScore = score;
-				bestK = k;
-				missed = 0;
-			} else {
-				missed += 1;
-				if (missed >= Clustering.PATIENCE) {
-					break;
-				}
+	// 대신 이미 알고 있는 값을 쓴다: 논문을 몇 개의 구독으로 모았는가. 추측이 아니라 기록이라
+	// 흔들리지 않고, 탐색이 사라져 훨씬 빠르다.
+	private static chooseK(papers: Paper[]): number {
+		// 서로 다른 구독이 몇 개인지 센다. 논문마다 "어떤 구독으로 수집됐는가"가 남아 있고,
+		// 조건을 여러 개 AND로 묶은 구독도 한 줄('combined')로 합쳐져 저장되므로, 서로 다른
+		// 문자열 개수가 곧 구독 개수다. Subscriptions.json을 읽지 않는 이유는 그 파일이
+		// "지금 구독 중인 것"만 담기 때문이다 — 구독을 지워도 그 논문은 화면에 남아 있으므로,
+		// 실제로 그려지는 논문이 어디서 왔는지를 세는 쪽이 맞다(실측: 파일에는 3개만 남아
+		// 있었지만 논문에는 7개가 기록돼 있었고, 7이 옳은 값이었다).
+		const subscriptions = new Set<string>();
+		for (const paper of papers) {
+			for (const query of paper.collectedQueries ?? []) {
+				subscriptions.add(query.query);
 			}
 		}
-		return bestK;
+
+		// 표본 한 덩어리에 최소 인원은 있어야 하므로 그만큼에서 자른다.
+		const limit = Math.max(
+			Clustering.MIN_K,
+			Math.floor(Clustering.sampleSize(papers.length) / Clustering.MIN_SAMPLES_PER_CLUSTER),
+		);
+		return Math.min(Math.max(subscriptions.size, Clustering.MIN_K), limit);
 	}
 
-	// 표본을 고르게 뽑는다(정렬된 순서에서 일정 간격) — 무작위가 아니라 결정적이어야 한다.
-	private static sampleRows(vectors: Float64Array, count: number, dim: number): Float64Array {
-		if (count <= Clustering.SAMPLE_SIZE) {
+	// 표본을 뽑는다. sourceId 해시가 작은 것부터 필요한 수만큼 — 무작위가 아니라 결정적이고,
+	// 논문이 늘어도 뽑히던 논문이 계속 뽑힌다.
+	//
+	// 예전에는 정렬된 순서에서 일정 간격으로 뽑았는데, 그러면 편수가 바뀔 때마다 간격이
+	// 달라져 표본이 통째로 교체됐다(6000→6400편일 때 1200개 중 225개만 유지). k를 고를
+	// 때마다 사실상 다른 데이터를 보게 되어, 논문 몇백 편 차이로 덩어리 수가 2개에서
+	// 10개까지 널뛰었다. 해시 기준으로는 같은 조건에서 1059개가 유지된다.
+	private static sampleRows(papers: Paper[], vectors: Float64Array, dim: number): Float64Array {
+		const size = Clustering.sampleSize(papers.length);
+		if (papers.length <= size) {
 			return vectors;
 		}
-		const step = count / Clustering.SAMPLE_SIZE;
-		const sample = new Float64Array(Clustering.SAMPLE_SIZE * dim);
-		for (let i = 0; i < Clustering.SAMPLE_SIZE; i += 1) {
-			const source = Math.floor(i * step) * dim;
+		const ranked = papers.map((paper, index) => ({ key: Clustering.hash(paper.sourceId), index }));
+		ranked.sort((a, b) => a.key - b.key || a.index - b.index);
+		const sample = new Float64Array(size * dim);
+		for (let i = 0; i < size; i += 1) {
+			const source = (ranked[i]?.index ?? 0) * dim;
 			sample.set(vectors.subarray(source, source + dim), i * dim);
 		}
 		return sample;
 	}
 
-	// 나눔이 얼마나 잘 됐는지 한 숫자로. 논문마다 (두 번째로 가까운 중심까지 − 자기 중심까지)
-	// 를 더 먼 쪽으로 나눈 값의 평균이다. 1에 가까울수록 덩어리가 뚜렷하다.
-	private static separation(
-		vectors: Float64Array,
-		count: number,
-		dim: number,
-		k: number,
-		centroids: Float64Array,
-	): number {
-		let total = 0;
-		for (let i = 0; i < count; i += 1) {
-			const { own, other } = Clustering.twoNearest(vectors, i, dim, k, centroids);
-			const worst = Math.max(own, other);
-			total += worst > 0 ? (other - own) / worst : 0;
+	// FNV-1a. 표본을 고르는 데만 쓰므로 충돌 내성보다 "언제 어디서 돌려도 같은 값"이 중요하다.
+	private static hash(text: string): number {
+		let value = 2166136261;
+		for (let i = 0; i < text.length; i += 1) {
+			value ^= text.charCodeAt(i);
+			value = Math.imul(value, 16777619);
 		}
-		return total / count;
+		return value >>> 0;
 	}
 
 	// ── k-means ────────────────────────────────────────────────────
@@ -325,6 +328,7 @@ export class Clustering {
 		k: number,
 		centroids: Float64Array,
 		labels: Map<string, number>,
+		previous: Map<string, number>,
 	): number {
 		const sizes = new Map<number, number>();
 		const raw: (number | undefined)[] = [];
@@ -340,7 +344,7 @@ export class Clustering {
 		}
 
 		const ordered = [...sizes.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
-		const renamed = new Map(ordered.map(([cluster], index) => [cluster, index]));
+		const renamed = Clustering.inheritNumbers(ordered, raw, valid, previous);
 		for (let i = 0; i < valid.length; i += 1) {
 			const cluster = raw[i];
 			if (cluster !== undefined) {
@@ -348,5 +352,57 @@ export class Clustering {
 			}
 		}
 		return ordered.length;
+	}
+
+	// 새 덩어리에 붙일 번호를 정한다. 번호가 곧 색이므로, 논문이 늘어 덩어리가 다시 나뉘어도
+	// "대체로 같은 논문들"이 모인 덩어리는 예전 번호를 그대로 물려받아야 화면 색이 유지된다.
+	//
+	// 큰 덩어리부터, 그 안의 논문들이 예전에 가장 많이 속했던 번호를 가져간다. 이미 다른
+	// 덩어리가 가져간 번호는 건너뛰고, 물려받을 게 없으면 아직 안 쓰인 가장 작은 번호를 준다.
+	// 예전 기록이 없는 첫 계산에서는 그냥 크기순(큰 덩어리가 0)이 된다.
+	private static inheritNumbers(
+		ordered: [number, number][],
+		raw: (number | undefined)[],
+		valid: Paper[],
+		previous: Map<string, number>,
+	): Map<number, number> {
+		// 새 덩어리별로 "예전에 어느 번호였던 논문이 몇 편인지" 센다.
+		const votes = new Map<number, Map<number, number>>();
+		for (let i = 0; i < valid.length; i += 1) {
+			const cluster = raw[i];
+			const old = previous.get((valid[i] as Paper).sourceId);
+			if (cluster === undefined || old === undefined) {
+				continue;
+			}
+			const box = votes.get(cluster) ?? new Map<number, number>();
+			box.set(old, (box.get(old) ?? 0) + 1);
+			votes.set(cluster, box);
+		}
+
+		const renamed = new Map<number, number>();
+		const taken = new Set<number>();
+		const leftovers: number[] = [];
+		for (const [cluster] of ordered) {
+			const box = votes.get(cluster);
+			const best = box
+				? [...box.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]).find(([old]) => !taken.has(old))
+				: undefined;
+			if (best) {
+				renamed.set(cluster, best[0]);
+				taken.add(best[0]);
+			} else {
+				leftovers.push(cluster);
+			}
+		}
+		// 물려받지 못한 덩어리는 남은 번호 중 가장 작은 것부터 채운다.
+		let next = 0;
+		for (const cluster of leftovers) {
+			while (taken.has(next)) {
+				next += 1;
+			}
+			renamed.set(cluster, next);
+			taken.add(next);
+		}
+		return renamed;
 	}
 }
