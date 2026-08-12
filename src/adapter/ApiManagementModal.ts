@@ -159,15 +159,8 @@ export class ApiManagementModal extends Modal {
 					.onClick(() => {
 						button.setDisabled(true);
 						void this.persistApiKey()
-							.then(({ provider, valid, detail }) => {
-								if (valid) {
-									new Notice(`${provider} 키를 저장하고 확인했습니다 — 정상 동작합니다.`);
-								} else {
-									new Notice(
-										`${provider} 키를 저장했습니다. 다만 확인 중 문제가 있었습니다: ` +
-											`${detail ?? '알 수 없음'} — 나중에 다시 확인하세요.`,
-									);
-								}
+							.then(({ provider }) => {
+								new Notice(`${provider} 키를 저장하고 확인했습니다 — 정상 동작합니다.`);
 							})
 							.catch((e: unknown) => {
 								new Notice(`API 키 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
@@ -400,15 +393,12 @@ export class ApiManagementModal extends Modal {
 	// 물어보며 자동 판별할 필요가 없다), 그 provider의 validator 하나에만 실제 요청을
 	// 보내 저장과 동시에 검증한다.
 	//
-	// invalid-key(401/403 등 명확히 틀린 키)면 저장을 막는다 — 잘못 저장하면 다음 보강
-	// 요청마다 같은 실패가 반복된다. network-error(일시적 문제일 수 있음)는 저장은 하되
-	// 결과를 그대로 호출자에게 돌려줘 Notice로 알리게 한다 — 오프라인일 때도 키 등록
-	// 자체는 막지 않기 위함이다.
-	private async persistApiKey(): Promise<{
-		provider: string;
-		valid: boolean;
-		detail?: string;
-	}> {
+	// valid:true로 실제 확인된 키만 저장한다 — invalid-key(401/403 등 명확히 틀린 키)는
+	// 물론이고, network-error(오프라인 등 이 순간엔 판단이 안 되는 경우)도 막는다.
+	// "일단 저장해두고 나중에 확인"을 허용하면, 확인되지 않은 키가 계속 저장돼 있는
+	// 채로 다음 보강 요청마다 같은 실패가 조용히 반복될 수 있다 — 지금 확실히 통하는
+	// 키만 들어오게 한다(2026-08-13 결정).
+	private async persistApiKey(): Promise<{ provider: string }> {
 		const provider = this.apiKeyProviderDraft;
 		const key = this.apiKeyValueDraft.trim();
 		if (key.length === 0) {
@@ -419,14 +409,18 @@ export class ApiManagementModal extends Modal {
 			throw new Error(`등록되지 않은 provider입니다: ${provider}`);
 		}
 		const result = await validator.validate(key);
-		if (!result.valid && result.reason === 'invalid-key') {
-			throw new Error(`${provider} 키가 유효하지 않습니다 — 저장하지 않았습니다.`);
+		if (!result.valid) {
+			const reason =
+				result.reason === 'invalid-key'
+					? '키가 유효하지 않습니다'
+					: `확인할 수 없습니다${result.detail ? ` (${result.detail})` : ''} — 네트워크 상태를 확인하고 다시 시도하세요`;
+			throw new Error(`${provider} 키를 ${reason} — 저장하지 않았습니다.`);
 		}
 		const secret = await File.readSecret();
 		secret.setKey(provider, key);
 		await File.writeSecret(secret);
 		this.registeredKeys[provider] = key;
-		return { provider, valid: result.valid, detail: result.detail };
+		return { provider };
 	}
 
 	// 등록된 키 하나를 즉시 삭제한다 — 검증이 필요 없는(존재를 없애는) 동작이라 「저장」
@@ -673,6 +667,12 @@ export class ApiManagementModal extends Modal {
 				);
 		}
 
+		// 이미 상한(3개)을 채웠으면 더 추가할 수 없으니 버튼 자체를 안 그린다 — 눌러도
+		// Notice로 막히기만 하는 죽은 버튼을 남겨두지 않는다.
+		if (api.conditions.length >= MAX_CONDITIONS_PER_API) {
+			return;
+		}
+
 		new Setting(containerEl)
 			.setName('조건 추가')
 			.setDesc(`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). 여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요.`)
@@ -696,11 +696,8 @@ export class ApiManagementModal extends Modal {
 					if (api.newConditionQuery.trim().length === 0) {
 						return;
 					}
-					// 004의 결합 규칙 — 한 구독의 조건은 최대 3개, 전부 AND.
-					if (api.conditions.length >= MAX_CONDITIONS_PER_API) {
-						new Notice(`조건은 API당 최대 ${MAX_CONDITIONS_PER_API}개까지 등록할 수 있습니다.`);
-						return;
-					}
+					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상
+					// 여유가 있다.
 					api.conditions.push({
 						searchType: api.newConditionType,
 						query: api.newConditionQuery.trim(),
