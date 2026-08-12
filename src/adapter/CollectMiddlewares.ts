@@ -20,6 +20,17 @@ export interface SubscriptionProgressEntry {
 	// 진행률처럼 안 보이는 문제가 있었다 — total은 API가 알려준 실제 총 편수라 페이지가
 	// 넘어가도 그대로다.
 	total: number;
+	// 이번 실행에서 몇 번째 구독인지(0-based)와 전체 구독 수 — CollectAndSave.collect()가
+	// onApiStart/onApiDone에 이미 넘겨주는 index/total을 CollectController가 그대로
+	// 옮겨 담는다(6번: 여러 구독 중 몇 번째인지 표시).
+	index: number;
+	subscriptionCount: number;
+	// 지금까지 도착한 청크(=페이지) 수. CollectFoundMiddleware가 'all' 호출마다 1씩
+	// 늘린다 — 페이지 하나가 곧 청크 하나이므로 별도 API 콜백 없이 기존 훅만으로 얻는다.
+	// "처리 중 (147/320편)"이 실제로는 페이지 단위(PAGE_SIZE=100, 페이지 사이 3초)로
+	// 뭉쳐서 올라가 마치 멈췄다 점프하는 것처럼 보이는 문제(7번)를, 지금 몇 번째 묶음을
+	// 받고 있는지 같이 보여줘서 설명 가능하게 만든다.
+	pageCount: number;
 }
 
 // 이 미들웨어들이 실제로 읽고 쓰는 진행 상태만 노출한 좁은 인터페이스. CollectController의
@@ -64,6 +75,7 @@ export class CollectFoundMiddleware implements Middleware {
 			const entry = flow.subscriptions[flow.currentIndex];
 			if (entry) {
 				entry.found += papers.length;
+				entry.pageCount += 1;
 			}
 		}
 
@@ -91,4 +103,25 @@ export class CollectDoneMiddleware implements Middleware {
 		}
 		this.sink.notifyUpdated();
 	}
+}
+
+// 구독 하나의 진행 상태를 사람이 읽을 한 줄로 요약한다. CollectController의 Notice와
+// SettingTab의 대기열 박스가 예전엔 이 로직을 각자 따로 조립했는데(문구가 갈라지기
+// 쉬움), 한 곳으로 모아 둘 다 이 함수를 쓴다.
+//
+// 순번(N/M번째 구독) 접두어는 구독이 둘 이상일 때만 붙인다 — 구독 하나짜리 보통의
+// 실행에도 "(1/1번째 구독)"을 붙이면 오히려 문구만 길어져 "너무 길다"는 기존 피드백을
+// 반복하게 된다.
+export function formatSubscriptionProgress(sub: SubscriptionProgressEntry): string {
+	const ordinal = sub.subscriptionCount > 1 ? `(${sub.index + 1}/${sub.subscriptionCount}번째 구독) ` : '';
+	const name = `${sub.apiName} ${sub.conditionsText}`;
+	if (sub.status === 'done') {
+		return `✓ ${ordinal}${name} 논문 수집 완료 (${sub.found}편)`;
+	}
+	if (sub.total < 0) {
+		return `→ ${ordinal}${name} 논문 수집 중... (총 편수 확인 중)`;
+	}
+	// 페이지(=청크)가 3초 간격으로 도착해 done/total이 100편 단위로 뭉쳐 오르는 것처럼
+	// 보일 수 있다 — 지금 몇 번째 묶음을 받고 있는지 같이 보여줘 그 점프를 설명한다.
+	return `→ ${ordinal}${name} 논문 처리 중 (${sub.done}/${sub.total}편 · ${sub.pageCount}번째 묶음 확인)`;
 }

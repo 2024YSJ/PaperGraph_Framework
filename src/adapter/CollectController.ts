@@ -6,6 +6,7 @@ import { SubscriptionTargetModal, type SubscriptionTarget } from './Subscription
 import {
 	CollectDoneMiddleware,
 	CollectFoundMiddleware,
+	formatSubscriptionProgress,
 	type CollectProgressSink,
 	type CollectProgressState,
 	type SubscriptionProgressEntry,
@@ -210,7 +211,31 @@ export class CollectController implements CollectProgressSink {
 		).open();
 	}
 
-	// 수집 요청 하나를 진행률 Notice와 함께 실행한다.
+	// 스케줄러(자동 수집)·명령어 팔레트("최근 논문 수집 실행")가 쓰는 경로 — 백그라운드
+	// 실행이라 SubscriptionTargetModal로 구독을 고르게 할 수 없으니 항상 등록된 구독
+	// 전체를 대상으로 한다. runWithProgress(silent=true)를 그대로 써서 activeFlow가
+	// 수동 실행과 같은 자리(단일 진실 공급원)에 쌓이게 한다 — Notice만 안 만든다.
+	// runCollectFlow는 쓰지 않는다 — 그건 실패를 삼키고 Notice로만 알리는데, 이 경로는
+	// 원래 실패를 그대로 던져 호출자가 처리하는 계약이었다(main.ts의 두 호출부가 각자
+	// 다르게 반응한다 — Scheduler는 로그만 남기고, 명령어 팔레트는 자기 Notice를 띄운다).
+	// 대안(CollectController를 거치지 않고 별도 sink를 하나 더 등록하는 방식)도 검토했으나
+	// activeFlow가 두 곳으로 갈라져 "활성 흐름은 항상 하나"라는 이 클래스의 전제가 깨지고
+	// (runWithProgress의 onStart 주석 참고), 대기열 표시 로직이 두 곳에 중복되는 문제가
+	// 있어 기각했다 — devLog(010) 참고.
+	runRecentAuto(): Promise<string | void> {
+		const label = '최근 논문 수집';
+		return this.runWithProgress(
+			label,
+			(onStart, onTotal, onApiStart, onApiDone) =>
+				this.plugin.collectflow.run('recent', undefined, onStart, onTotal, onApiStart, onApiDone),
+			true,
+		);
+	}
+
+	// 수집 요청 하나를 진행률과 함께 실행한다. silent=true면 Notice를 만들지 않는다
+	// (스케줄러/명령어 팔레트처럼 원래 조용히 도는 게 설계 의도인 실행용 — runRecentAuto
+	// 참고) — activeFlow/구독별 진행(SettingTab이 읽는 단일 진실 공급원)은 silent 여부와
+	// 무관하게 항상 채워진다.
 	//
 	// 큐 때문에 "요청했지만 아직 시작 안 한" 상태가 생기므로, 진행 상태는 인스턴스 필드가
 	// 아니라 요청마다 만드는 ProgressFlow에 담는다. 필드 하나를 공유하면 두 번째 요청이
@@ -227,6 +252,7 @@ export class CollectController implements CollectProgressSink {
 			onApiStart: (api: API, index: number, total: number) => void,
 			onApiDone: (api: API, index: number, total: number) => void,
 		) => Promise<void>,
+		silent = false,
 	): Promise<string | void> {
 		const flow: ProgressFlow = {
 			label,
@@ -237,7 +263,9 @@ export class CollectController implements CollectProgressSink {
 			subscriptions: [],
 			currentIndex: undefined,
 		};
-		flow.notice = new Notice(this.renderProgress(flow), 0);
+		if (!silent) {
+			flow.notice = new Notice(this.renderProgress(flow), 0);
+		}
 		try {
 			await action(
 				() => {
@@ -263,14 +291,17 @@ export class CollectController implements CollectProgressSink {
 					this.updateProgress(flow);
 					this.notifyProgress();
 				},
-				(api, index) => {
+				(api, index, total) => {
 					flow.subscriptions[index] = {
 						apiName: api.apiName,
-						conditionsText: api.querys.map((q) => q.query).join(' AND '),
+						conditionsText: api.querys.map((q) => q.query).join('·'),
 						status: 'running',
 						found: 0,
 						done: 0,
 						total: -1,
+						index,
+						subscriptionCount: total,
+						pageCount: 0,
 					};
 					flow.currentIndex = index;
 					this.updateProgress(flow);
@@ -343,24 +374,8 @@ export class CollectController implements CollectProgressSink {
 				return;
 			}
 			for (const sub of flow.subscriptions) {
-				el.createDiv({ text: CollectController.describeSubscription(sub) });
+				el.createDiv({ text: formatSubscriptionProgress(sub) });
 			}
 		});
-	}
-
-	// 짧은 한 줄로 요약한다 — "재스캔 구간 포함" 같은 개발자용 배경 설명은 뺀다(5번:
-	// 너무 길다는 피드백). 완료된 구독은 몇 편을 모았는지만, 진행 중인 구독은 처리
-	// 상황만 보여준다.
-	private static describeSubscription(sub: SubscriptionProgressEntry): string {
-		const name = `${sub.apiName} ${sub.conditionsText}`;
-		if (sub.status === 'done') {
-			return `✓ ${name} — ${sub.found}편 수집 완료`;
-		}
-		if (sub.total < 0) {
-			// 아직 API가 총 편수를 안 알려준 시점(요청 보낸 직후) — found를 분모로 쓰면
-			// 페이지가 넘어갈 때마다 분모가 같이 늘어 진행률처럼 안 보인다.
-			return `→ ${name} — 수집 중... (총 편수 확인 중)`;
-		}
-		return `→ ${name} — 처리 중 (${sub.done}/${sub.total}편)`;
 	}
 }

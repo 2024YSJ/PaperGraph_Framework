@@ -149,7 +149,12 @@ export default class PaperGraph3D extends Plugin {
 
 		const collectRecentTask = new Task();
 		collectRecentTask.taskName = 'collect:recent';
-		collectRecentTask.func = () => this.collectflow.run('recent');
+		// collectflow.run()을 진행률 콜백 없이 부르면 대기열 박스에 구독별 진행(순번 포함)이
+		// 하나도 안 뜬다 — CollectController.runRecentAuto()를 거쳐 수동 실행과 같은 자리
+		// (activeFlow)에 진행 상태가 쌓이게 한다. Notice는 안 뜬다(runRecentAuto가 silent로
+		// 돈다 — 자동 수집/명령어 팔레트는 원래 조용히 도는 게 설계 의도였다). 왜 별도 sink로
+		// 우회하지 않고 CollectController를 거치는 쪽을 택했는지는 devLog(010) 참고.
+		collectRecentTask.func = () => this.collectController.runRecentAuto();
 		this.taskManager.setTask(collectRecentTask);
 
 		const collectRepairTask = new Task();

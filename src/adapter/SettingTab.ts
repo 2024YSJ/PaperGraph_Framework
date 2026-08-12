@@ -4,6 +4,7 @@ import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
 import { ApiManagementModal } from './ApiManagementModal';
+import { formatSubscriptionProgress } from './CollectMiddlewares';
 
 export class SettingTab extends PluginSettingTab {
 	plugin: PaperGraph3D;
@@ -52,29 +53,21 @@ export class SettingTab extends PluginSettingTab {
 		}
 		// 대기 중인 작업은 label 자체가 이미 자연어다(예: "arXiv 딥러닝 논문 수집") —
 		// CollectController가 고른 구독으로 라벨을 만들어 큐에 넣으므로 여기서는 그대로
-		// 이어붙이기만 한다(5번: 시스템 ID 대신 사람이 읽을 문구).
+		// 이어붙이기만 한다(5번: 시스템 ID 대신 사람이 읽을 문구). 어순은 동사가 끝에
+		// 오도록 "○○ 실행 중"/"○○ 대기 중"으로 통일한다.
 		el.createDiv({
 			text:
 				waiting.length === 0
-					? `실행 중: ${active.label}`
-					: `실행 중: ${active.label} — 대기 중: ${waiting.map((job) => job.label).join(', ')}`,
+					? `${active.label} 실행 중`
+					: `${active.label} 실행 중 — ${waiting.map((job) => job.label).join(', ')} 대기 중`,
 		});
 
 		// 지금까지 시작된 구독마다 한 줄씩 — 보정처럼 구독 개념이 없는 작업이거나 아직
-		// 첫 구독도 시작 안 한 시점에는 빈 배열이라 아무것도 안 그린다. total(API가 알려준
-		// 실제 총 편수)을 분모로 쓴다 — found를 쓰면 페이지가 넘어갈 때마다 분모 자체가
-		// 같이 늘어 "0/100 -> 101/200"처럼 진행률처럼 안 보인다(CollectController의
-		// describeSubscription과 같은 이유로 같은 규칙을 쓴다).
+		// 첫 구독도 시작 안 한 시점에는 빈 배열이라 아무것도 안 그린다. 문구 조립은
+		// CollectController의 Notice와 같은 포맷터(formatSubscriptionProgress)를 써서
+		// 두 표시가 갈라지지 않게 한다.
 		for (const sub of this.plugin.collectController.activeSubscriptions) {
-			let text: string;
-			if (sub.status === 'done') {
-				text = `✓ ${sub.apiName} ${sub.conditionsText} — ${sub.found}편 수집 완료`;
-			} else if (sub.total < 0) {
-				text = `→ ${sub.apiName} ${sub.conditionsText} 수집 중... (총 편수 확인 중)`;
-			} else {
-				text = `→ ${sub.apiName} ${sub.conditionsText} 처리 중 (${sub.done}/${sub.total}편)`;
-			}
-			el.createDiv({ text });
+			el.createDiv({ text: formatSubscriptionProgress(sub) });
 		}
 	}
 

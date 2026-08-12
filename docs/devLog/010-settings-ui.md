@@ -117,9 +117,83 @@ Middleware/Task로만 확장"하는 게 원칙이기 때문이다.
 최종적으로는 계산 로직은 그대로 두고 `SettingTab.ts`의 표시 문구만 "확인 N편(재스캔
 구간 포함) · 처리 M편"으로 바꿔, 실제 신규 여부를 구분하지 않고도 오해를 줄였다.
 
+## 8월 12일 후속 — 대기열 자연어화·구독 순번·페이지 점프 설명, 그리고 sink를 다시 하나로 합친 경위
+
+세 가지 후속 불만을 더 처리했다: (1) 대기열 문구가 여전히 `apiName` 원본 id·영어
+`AND`·대시 위주라 개발자 톤이었다, (2) 구독이 여럿일 때 지금 몇 번째인지 안 보였다,
+(3) 진행 숫자가 페이지 크기(100편)만큼 뭉쳐서 뛰어 보였다.
+
+**문구 통일 + 조건 구분자**: `CollectController`의 Notice와 `SettingTab`의 대기열 박스가
+각자 따로 조립하던 문구 로직을 `CollectMiddlewares.ts`의 `formatSubscriptionProgress()`
+하나로 합쳤다. 조건 join 구분자도 `' AND '`(영어 대문자)에서 `'·'`로 바꿨다.
+
+**구독 순번**: `CollectAndSave.collect()`의 `onApiStart`/`onApiDone`이 이미
+`(api, index, total)`을 넘기는데, `CollectController`가 `total`을 받지 않고 버리고
+있었다. 그 값을 받아 `SubscriptionProgressEntry.index`/`subscriptionCount`에 채워
+"(2/3번째 구독)"처럼 표시한다. 구독이 하나뿐인 보통의 실행에는 접두어를 안 붙인다 — 안
+그러면 "너무 길다"는 예전 피드백을 반복하게 된다.
+
+**페이지 점프 설명**: "100편씩 뜀" 리포트를 다시 조사했다 — 실제 데이터 유실이 아니라
+`ArxivAPI`의 `PAGE_SIZE=100`/`PAGE_DELAY_MS=3000ms`(`API.ts`)로 페이지가 3초 간격으로
+도착하는데, "최근 논문 수집"은 재스캔 구간을 매번 다시 훑어 대부분 이미 저장된 논문이라
+`embedOrReuse`가 즉시 재사용(사실상 순간 처리)되기 때문이었다. `CollectFoundMiddleware`가
+'all' 호출마다(=페이지 하나 도착마다) `pageCount`를 늘려 "N번째 묶음 확인"을 같이
+보여주는 것으로 설명 가능하게 했다 — 렌더링을 인위적으로 늦추는 방식(수집 자체를
+느리게 만듦)은 채택하지 않았다.
+
+### 자동 수집·명령어 팔레트에서 진행이 아예 안 보이던 문제 (설계를 두 번 바꿨다 — 다음 담당자 참고)
+
+위 세 가지를 확인하던 중, `main.ts`가 스케줄러(자동 수집)와 명령어 팔레트("최근 논문
+수집 실행")를 위해 `collectflow.run('recent')`를 진행률 콜백 없이 **직접** 불러온다는 걸
+발견했다. `CollectController`를 전혀 거치지 않으니 `activeFlow`가 채워지지 않고, 이
+두 경로로 실행하면 대기열 박스에 그 실행의 구독별 진행이 하나도 안 보였다(순번은커녕
+진행률 자체가 없었다).
+
+**1차 시도 — `CollectController.runRecentAuto()` + `runCollectFlow`.** 되돌렸다. 자동
+수집/명령어 팔레트는 원래 조용히 도는 게 설계 의도였는데(예전에도 성공 Notice가 없었다),
+`runCollectFlow`를 그대로 태우면서 이 경로에 없던 Notice 팝업이 새로 생겼다.
+
+**2차 시도 — `CollectController.ts`를 아예 안 건드리는 별도 sink.**
+`CollectMiddlewares.ts`에 Notice 없는 `BackgroundCollectProgress` sink를 새로 만들고,
+`main.ts`에서 `CollectFoundMiddleware`/`CollectDoneMiddleware`를 그 sink용으로 하나 더
+등록했다(같은 미들웨어 클래스가 `sink`를 인자로 받으므로 가능). Notice 문제는 해결됐지만
+검토 결과 두 가지 새 문제가 드러나 **되돌렸다**:
+
+- `CollectController.runWithProgress`의 원래 전제 — "지금 실행되는 큐 작업이 항상
+  하나이므로, 시작한 흐름이 곧 미들웨어가 갱신할 대상이다" — 가 `activeFlow`(수동 실행)와
+  `BackgroundCollectProgress.flow`(자동/명령어 실행)라는 두 개의 "활성 흐름"으로
+  쪼개지면서 깨졌다. 지금은 `CollectAndSave`의 큐가 직렬이라 겉으로는 안 겹치지만, 안전이
+  구조가 아니라 우연에 기대고 있었다: `main.ts`의
+  `.finally(() => backgroundCollectProgress.endRun())`은 `collectflow.run()`이 돌려준
+  프라미스에 **나중에** 붙는 콜백인데, `CollectAndSave.enqueue()`는 같은 프라미스에
+  **먼저** `this.tail = result.then(...)`을 붙여 다음 대기 작업을 깨운다. Promise 콜백은
+  붙인 순서대로 실행되므로, 이론적으로는 자동 실행이 끝나자마자 대기 중이던 수동 실행이
+  시작될 때 `endRun()`보다 먼저 `onStart`가 불릴 수 있는 구조였다 — 지금은 `runNow()`
+  초반에 `File.readSubscriptions()` 같은 실제 비동기 I/O가 있어 그 사이 `endRun()`이
+  먼저 끝나는 것뿐이라, 그 I/O가 나중에 최적화로 사라지면 실제로 터질 수 있는 레이스였다.
+- 구독 항목 조립 로직(`apiName`/`conditionsText`/`index`/`subscriptionCount`/`pageCount`
+  초기화)이 `CollectController.runWithProgress`와 `BackgroundCollectProgress.beginRun()`
+  두 곳에 그대로 중복돼, 나중에 한쪽만 고치면 두 실행 경로의 문구가 조용히 어긋날
+  위험이 있었다.
+
+**최종 — `CollectController.ts`로 다시 합쳤다.** `runWithProgress()`에 `silent` 플래그를
+추가해 Notice 생성만 건너뛰고, `activeFlow` 갱신(=대기열 박스가 읽는 단일 진실 공급원)은
+silent 여부와 무관하게 항상 같은 자리에서 일어나게 했다. 새로 추가한
+`runRecentAuto()`가 이 플래그로 조용히 실행한다. `runCollectFlow`(실패를 삼키고 Notice로만
+알림)는 쓰지 않는다 — 이 경로는 원래 실패를 그대로 던져 호출자가 처리하는 계약이었다
+(Scheduler는 로그만 남기고, 명령어 팔레트는 자기 Notice를 띄운다). `main.ts`의
+`collectRecentTask.func`는 이제 `this.collectController.runRecentAuto()` 하나만 부른다.
+
+**판단 기준**: "이 파일은 손대지 않는다"는 제약보다 "활성 흐름은 항상 하나"라는 이
+클래스의 핵심 불변조건을 지키는 쪽을 우선했다 — 특정 파일을 피하려고 진실 공급원을
+둘로 쪼개면, 당장은 안 터져도 나중에 실행 순서가 조금만 바뀌어도 재현하기 어려운 버그가
+될 수 있다는 판단이다.
+
 ## 검증
 
-`npm run build` / `npm run lint`(0 errors, 기존과 동일한 경고만) / `npm test`(무관한 기존
-실패 1건 — `dev` 브랜치에서도 재현되는 큐 관련 테스트, 이번 작업과 무관) 통과. Obsidian
-실기기에 설치해 리본 아이콘·수집 메뉴·API/구독 관리 모달·임베딩 모델 버튼을 직접 눌러
-확인했다.
+`npm run build` / `npm run lint`(0 errors, 기존과 동일한 경고만) / `npm test`(114 pass, 0
+fail) 통과. Obsidian 실기기에 설치해 리본 아이콘·수집 메뉴·API/구독 관리 모달·임베딩
+모델 버튼을 직접 눌러 확인했다(8월 10일 1차 개편분). 8월 12일 후속(구독 순번·페이지
+점프 설명·자동 실행 경로 통합)은 빌드/린트/테스트로 확인했고, 실기기에서 구독 2개 이상
+등록 후 수동 실행·자동 수집·명령어 팔레트 각각으로 재확인하는 건 다음 확인 때 마저
+한다.
