@@ -12,9 +12,12 @@ import {
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
+import { Scheduler } from './common/Scheduler';
 import { File } from './common/File';
 import { Log } from './common/Log';
 import { SettingTab } from './adapter/SettingTab';
+import { ApiManagementModal } from './adapter/ApiManagementModal';
+import { CollectController } from './adapter/CollectController';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 
 export default class PaperGraph3D extends Plugin {
@@ -22,9 +25,21 @@ export default class PaperGraph3D extends Plugin {
 	visualflow!: VisualizationFlow;
 	eventListener!: EventListener;
 	taskManager!: TaskManager;
+	collectController!: CollectController;
+	scheduler!: Scheduler;
 
 	async onload() {
 		this.init();
+
+		// 3번: 보정 자동화 — 매 수집 직후의 자동 보정(CollectAndSave.runNow)은 그 실행에서
+		// 실패한 논문만 메모리로 즉시 재시도해 디스크 전수 스캔이 없지만, 그 방식으로는
+		// "예전 세션에서 실패한 채 방치된 논문"(sourceId -> 경로 인덱스가 없어 달리 찾을
+		// 방법이 없다)을 못 잡는다. 그 방치분은 로드 1회에만 전수 스캔으로 훑어 되살린다 —
+		// 수집마다가 아니라 로드마다이므로 빈도가 훨씬 낮다. 모델 미설치 등으로 실패해도
+		// 플러그인 시작 자체를 막지 않는다(fire-and-forget).
+		void this.collectflow.repair().catch((error) => {
+			Log.error('collect', '로드 시 자동 보정 실패', error);
+		});
 
 		this.registerView(
 			VIEW_TYPE_PAPERGRAPH3D,
@@ -33,10 +48,23 @@ export default class PaperGraph3D extends Plugin {
 
 		this.addSettingTab(new SettingTab(this.app, this));
 
-		// ⚠️ 두 커맨드 모두 EventListener.checking()/TaskManager.runTask()가 아직 스텁이라
-		// (둘 다 항상 throw — 담당자 미배정, 8/1 회의록 역할분담에 없음) run()/repair()에
-		// 도달하지 못한다. 이벤트 배선이 구현되기 전까지는 설정 탭의 수집/보정 버튼이
-		// collectflow를 직접 호출하는 유일한 실동작 경로다.
+		// 6번: 자동 수집 스케줄링 — 5분마다 설정(Schedule.json)을 다시 읽어 "지금이
+		// 실행할 때인가"를 판단한다(Scheduler.tick). 매번 다시 읽으므로 설정 탭에서 주기를
+		// 바꿔도 재시작 없이 다음 tick부터 반영된다. registerInterval로 등록해야 플러그인이
+		// 언로드될 때 Obsidian이 알아서 타이머를 치운다 — 직접 clearInterval을 관리하면
+		// onunload에서 빼먹었을 때 언로드 후에도 백그라운드에서 수집이 계속 걸린다.
+		this.registerInterval(
+			window.setInterval(() => {
+				void this.scheduler.tick().catch((error) => {
+					Log.error('scheduler', '자동 수집 확인 실패', error);
+				});
+			}, 5 * 60 * 1000),
+		);
+		// 로드 직후에도 한 번 확인한다 — 마지막 자동 실행 이후 플러그인이 오래 꺼져
+		// 있었다면 다음 tick(최대 5분 뒤)까지 기다리지 않고 바로 따라잡는다.
+		void this.scheduler.tick().catch((error) => {
+			Log.error('scheduler', '자동 수집 확인 실패', error);
+		});
 
 		this.addCommand({
 			id: 'collect-recent',
@@ -44,8 +72,8 @@ export default class PaperGraph3D extends Plugin {
 			callback: async () => {
 				try {
 					await this.eventListener.checking('ui:collect-recent');
-				} catch {
-					new Notice('아직 구현되지 않음: 최근 논문 수집');
+				} catch (e) {
+					new Notice(`최근 논문 수집 실패: ${e instanceof Error ? e.message : String(e)}`);
 				}
 			},
 		});
@@ -60,14 +88,30 @@ export default class PaperGraph3D extends Plugin {
 			callback: async () => {
 				try {
 					await this.eventListener.checking('ui:collect-repair');
-				} catch {
-					new Notice('아직 구현되지 않음: 보정');
+				} catch (e) {
+					new Notice(`보정 실패: ${e instanceof Error ? e.message : String(e)}`);
 				}
 			},
 		});
 
 		this.addRibbonIcon('network', '시각화 열기', () => {
 			void this.activateVisualizationView();
+		});
+
+		this.addRibbonIcon('download', '수집', (evt) => {
+			this.collectController.openCollectMenu(evt, this.app);
+		});
+
+		this.addCommand({
+			id: 'open-subscription-manager',
+			name: '구독 관리 열기',
+			callback: () => {
+				new ApiManagementModal(this.app).open();
+			},
+		});
+
+		this.addRibbonIcon('rss', '구독 관리', () => {
+			new ApiManagementModal(this.app).open();
 		});
 	}
 
@@ -93,12 +137,24 @@ export default class PaperGraph3D extends Plugin {
 		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
 		Log.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
+		// collectflow가 준비된 뒤에 만들어야 한다 — 생성자에서 바로 진단 미들웨어를
+		// collectflow에 등록한다(CollectController 참고).
+		this.collectController = new CollectController(this);
 		this.eventListener = new EventListener();
 		this.taskManager = new TaskManager();
+		// checking()이 taskName -> 실제 실행으로 이어지려면 TaskManager가 있어야 한다 —
+		// 이벤트 등록(setEventListener)과 TaskManager 생성이 여기 같은 자리에서 동시에
+		// 새로 만들어져 생성자로는 서로를 받을 수 없다.
+		this.eventListener.bindTaskManager(this.taskManager);
 
 		const collectRecentTask = new Task();
 		collectRecentTask.taskName = 'collect:recent';
-		collectRecentTask.func = () => this.collectflow.run('recent');
+		// collectflow.run()을 진행률 콜백 없이 부르면 대기열 박스에 구독별 진행(순번 포함)이
+		// 하나도 안 뜬다 — CollectController.runRecentAuto()를 거쳐 수동 실행과 같은 자리
+		// (activeFlow)에 진행 상태가 쌓이게 한다. Notice는 안 뜬다(runRecentAuto가 silent로
+		// 돈다 — 자동 수집/명령어 팔레트는 원래 조용히 도는 게 설계 의도였다). 왜 별도 sink로
+		// 우회하지 않고 CollectController를 거치는 쪽을 택했는지는 devLog(010) 참고.
+		collectRecentTask.func = () => this.collectController.runRecentAuto();
 		this.taskManager.setTask(collectRecentTask);
 
 		const collectRepairTask = new Task();
@@ -108,6 +164,10 @@ export default class PaperGraph3D extends Plugin {
 
 		this.eventListener.setEventListener('ui:collect-recent', 'collect:recent');
 		this.eventListener.setEventListener('ui:collect-repair', 'collect:repair');
+		// 6번: 스케줄러도 같은 'collect:recent' 작업을 탄다 — 자동이든 수동이든 "최근 논문
+		// 수집"은 하나의 작업이고, 스케줄러는 그걸 언제 부를지만 결정한다.
+		this.eventListener.setEventListener('scheduler:collect-recent', 'collect:recent');
+		this.scheduler = new Scheduler(this.eventListener);
 	}
 
 	async activateVisualizationView(): Promise<void> {

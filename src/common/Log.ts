@@ -14,14 +14,12 @@ import { Vault } from 'obsidian';
 // 파일로도 남겨두면 그 파일 하나만 받으면 된다.
 //
 // ── 지우는 법 (진단이 끝나면) ────────────────────────────────────────
+//   (010: 「수집 로그」 Setting 블록은 확정 설정 탭에서 이미 제거했고, 그에 맞춰
+//    fileEnabled 기본값도 false로 바꿔뒀다 — 아래는 나머지를 마저 걷어낼 때의 순서.)
 //   1. 이 파일(src/common/Log.ts) 삭제
 //   2. `Log.` 호출 줄 전부 제거 (rg "Log\." src)
 //   3. main.ts의 Log.init(...) 한 줄 제거
-//   4. SettingTab의 「수집 로그」 Setting 블록 제거
-//   5. 이미 만들어진 로그 파일은 사용자가 「로그 파일 삭제」 버튼으로 지우거나,
-//      플러그인 폴더에서 collect-log.md를 직접 지우면 된다.
-// 파일에 남기는 부분만 먼저 떼고 콘솔 로그는 남기고 싶다면 setFileEnabled(false)를
-// 기본값으로 바꾸는 것으로 충분하다.
+//   4. 이미 만들어진 로그 파일은 플러그인 폴더에서 collect-log.md를 직접 지우면 된다.
 
 type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -63,8 +61,9 @@ export class Log {
 	private static vault: Vault | undefined;
 	private static pluginDir = '';
 	// 파일 기록 여부. 콘솔 출력은 이 값과 무관하게 항상 나간다 — 끄고 싶은 건 vault를
-	// 더럽히는 파일 쪽이지 콘솔이 아니다.
-	private static fileEnabled = true;
+	// 더럽히는 파일 쪽이지 콘솔이 아니다. 기본값 false — 「수집 로그」 설정 UI가 제거되어
+	// 이 값을 켤 수단이 없으므로, 켜진 채 vault에 조용히 쓰이는 상태를 기본으로 두지 않는다.
+	private static fileEnabled = false;
 
 	// 파일 쓰기를 직렬화하는 체인. read-modify-write라 동시에 두 개가 돌면 서로를 덮어쓴다.
 	// 수집은 순차 실행이지만 EnrichCitations 등 비동기 경로가 섞이므로 여기서 보장한다.

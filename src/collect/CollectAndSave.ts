@@ -16,7 +16,19 @@ export interface CollectTestOptions {
 	hours?: number;
 	from?: number;
 	to?: number;
+	// 이번 실행에서 돌 구독만 좁힌다. 생략(undefined)하면 등록된 구독 전체를 돈다 —
+	// 지금까지의 기본 동작을 그대로 유지한다. 항목은 (apiName, querys)로 구독을 가리키며,
+	// 8번 작업(File.hasDuplicateSubscription)이 이 조합을 구독의 유일한 신원으로
+	// 보장하므로 이것만으로 특정 구독을 정확히 골라낼 수 있다.
+	targetSubscriptions?: { apiName: string; querys: SearchQuery[] }[];
 }
+
+// 이번 실행에서 인용수 실패로 메모리에 붙들고 있을 Paper(임베딩 벡터 포함)의 상한.
+// S2가 rate-limit/장애 중이면 대형 Backfill(수만 편)에서 거의 전부가 실패로 남을 수
+// 있는데, 그걸 다 붙들면 청크 스트리밍으로 없앤 "전체를 메모리에 올리는" 문제가 되살아난다
+// (processChunk 참고). 상한을 넘는 나머지는 이번 실행에서는 못 잡아도, 다음 플러그인
+// 로드 때의 전수 보정(main.ts)이 결국 잡는다 — 데이터 유실은 아니고 재시도 시점만 늦다.
+const MAX_TRACKED_CITATION_FAILURES = 500;
 
 // 한 API(구독)가 이번 실행에서 훑을 구간. hours가 있으면 SearchRecentPaper로, 없으면
 // Backfill로 부른다. advancesCursor는 "이 실행 결과를 그 API의 updateTime에 반영해도
@@ -249,11 +261,16 @@ export class CollectAndSave {
 		testOptions?: CollectTestOptions,
 		onStart?: () => void,
 		onTotal?: (subtotal: number) => void,
+		// 구독 하나를 시작/종료할 때마다 불린다(2번: 구독별 독립 진행 표시). index/total은
+		// 이번 실행이 도는 구독 목록 안에서의 순번 — 몇 번째 구독인지 UI가 "2/3 구독"처럼
+		// 표시할 수 있게 한다.
+		onApiStart?: (api: API, index: number, total: number) => void,
+		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
 		const label = mode === 'recent' ? '최근 논문 수집' : 'Backfill';
 		return this.enqueue(
 			{ kind: mode, label },
-			() => this.runNow(mode, testOptions, onTotal),
+			() => this.runNow(mode, testOptions, onTotal, onApiStart, onApiDone),
 			onStart,
 		);
 	}
@@ -301,12 +318,26 @@ export class CollectAndSave {
 		mode: 'recent' | 'backfill',
 		testOptions?: CollectTestOptions,
 		onTotal?: (subtotal: number) => void,
+		onApiStart?: (api: API, index: number, total: number) => void,
+		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
 		this.sub = await File.readSubscriptions();
-		const apis = this.sub.apis ?? [];
-		if (apis.length === 0) {
+		const allApis = this.sub.apis ?? [];
+		if (allApis.length === 0) {
 			throw new Error(
 				'PaperGraph3D: 등록된 구독이 없습니다. 설정 탭에서 API와 검색 조건을 먼저 추가하세요.',
+			);
+		}
+
+		// targetSubscriptions가 있으면 이번 실행은 그 구독들만 돈다(4번 타겟팅). 선택한
+		// 구독이 그 사이 삭제/수정돼 하나도 안 남았으면(신원이 바뀌어 매칭 실패) "구독이
+		// 아예 없다"와는 다른 원인이므로 별도 메시지로 구분한다.
+		const apis = testOptions?.targetSubscriptions
+			? File.filterSubscriptions(allApis, testOptions.targetSubscriptions)
+			: allApis;
+		if (apis.length === 0) {
+			throw new Error(
+				'PaperGraph3D: 선택한 구독을 찾을 수 없습니다 — 그 사이 삭제되었거나 조건이 바뀌었을 수 있습니다.',
 			);
 		}
 
@@ -322,7 +353,11 @@ export class CollectAndSave {
 		}
 
 		Log.info('collect', `실행 시작 (${mode})`, {
-			apis: apis.map((api) => ({ apiName: api.apiName, updateTime: api.updateTime })),
+			apis: apis.map((api) => ({
+				apiName: api.apiName,
+				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
+				updateTime: api.updateTime,
+			})),
 		});
 		this.embedding.resetCircuitBreaker();
 		const stats: CollectStats = {
@@ -331,6 +366,7 @@ export class CollectAndSave {
 			embedWaits: 0,
 			embedGaveUp: false,
 		};
+		const failures: { citation: Paper[] } = { citation: [] };
 		let chunks = 0;
 		const cursorUpdates = await this.collect(
 			apis,
@@ -338,15 +374,17 @@ export class CollectAndSave {
 			testOptions,
 			(chunk) => {
 				chunks += 1;
-				return this.processChunk(chunk, stats);
+				return this.processChunk(chunk, stats, failures);
 			},
 			onTotal,
+			onApiStart,
+			onApiDone,
 		);
 		if (chunks === 0) {
 			// 한 편도 안 걸린 실행에서도 'all'은 빈 배열로 한 번 불린다. 미들웨어가 실행마다
 			// 반드시 한 번은 호출된다는 보장이 없으면, 실행 단위로 초기화하는 미들웨어가
 			// "논문이 0편인 실행"에서 조용히 건너뛰어진다.
-			await this.processChunk([], stats);
+			await this.processChunk([], stats, failures);
 		}
 
 		Log.info('collect', '임베딩/저장 완료', stats);
@@ -366,14 +404,31 @@ export class CollectAndSave {
 		});
 		await File.updateApiCursors(cursorUpdates);
 
-		// 인용수 재보강을 자동으로 뒤이어 돌린다 — await하지 않는다: repairCitations()도
-		// enqueue()를 타는데, 지금 이 함수(runNow) 자체가 아직 끝나지 않은 큐 작업의 task()
-		// 안에서 실행 중이라 여기서 기다리면 "이 작업이 끝나야 다음 작업(방금 큐에 넣은
-		// repairCitations)이 시작"→"그 다음 작업을 기다리는 이 작업은 안 끝남"이 서로를
-		// 기다리는 순환 대기가 된다. fire-and-forget으로 큐 뒤에 줄만 세운다.
-		void this.repairCitations().catch((error) => {
-			Log.error('collect', '자동 인용수 보정 실패', error);
-		});
+		// 3번: 보정 자동화(인용수) — 이번 실행에서 인용수를 못 채운 논문은 이미 메모리에
+		// 있으므로(failures.citation), File.readAllPapers()로 코퍼스를 다시 훑지 않고 그
+		// 논문들만 바로 재시도한다.
+		//
+		// enqueue()로 별도 큐 작업을 만들지 않고 여기서 직접 await한다 — repairCitationsBody는
+		// private 몸통 메서드라 그 자체는 큐를 안 탄다(순환 대기 위험이 없다. enqueue()를 다시
+		// 타는 건 공개 메서드 repairCitations()뿐이다). 예전엔 이걸 fire-and-forget으로
+		// 큐 뒤에 줄 세웠는데, 그러면 이 함수가 캡처한 Paper 객체 참조가 나중에(다른 실행이
+		// 여러 번 지난 뒤일 수도 있음) 지연 실행되면서 실행 당시 시점과 어긋난 상태로 저장될
+		// 여지가 생긴다 — 직접 기다리면 그 문제 자체가 없다.
+		//
+		// 임베딩 실패는 그래도 여기서 즉시 재시도하지 않는다 — 방금 이 실행에서 서킷브레이커가
+		// 이미 몇 번을 기다려보고 포기한 상태일 수 있는데(embedOrReuse), repairEmbeddingsBody가
+		// 브레이커를 리셋하고 바로 다시 두드리면 모델이 정말 고장났을 때 트립→리셋→트립을
+		// 반복하며 헛수고만 늘린다. 임베딩 재시도는 main.ts의 플러그인 로드 시 1회 전수
+		// 보정(더 낮은 빈도)에 맡긴다.
+		if (failures.citation.length > 0) {
+			try {
+				const citationRepairStats = await this.repairCitationsBody(failures.citation);
+				Log.info('collect', '자동 인용수 보정 완료(이번 실행분)', citationRepairStats);
+				this.lastCitationRepairStats = citationRepairStats;
+			} catch (error) {
+				Log.error('collect', '자동 인용수 보정 실패', error);
+			}
+		}
 	}
 
 	// 청크 하나를 끝까지 처리한다: 미들웨어(all) -> loop { 임베딩 -> 미들웨어(forEach) -> 저장 }.
@@ -393,7 +448,16 @@ export class CollectAndSave {
 	// 않는다"(collect() 참고)와 "다음 큐 작업을 시작하지 않는다"(enqueue 참고)는 안전한
 	// 경계에서만 멈춘다 — 이미 시작한 구독 하나는 자연스러운 완료(성공/실패/상한)까지
 	// 진행되도록 둔다.
-	private async processChunk(papers: Paper[], stats: CollectStats): Promise<void> {
+	// failures는 이번 실행에서 인용수를 못 채운 채 남은 논문을 그대로 모아둔다 —
+	// runNow()가 끝난 뒤 이 목록을 바로 재시도용 몸통(repairCitationsBody)에 넘기기
+	// 위함이다(3번: 보정 자동화). 방금 처리한 Paper 객체가 이미 메모리에 있으므로, 굳이
+	// File.readAllPapers()로 코퍼스를 다시 스캔하지 않고도 "이번에 실패한 것"을 정확히
+	// 알 수 있다. 임베딩 실패는 여기 담지 않는다 — runNow() 끝의 주석 참고.
+	private async processChunk(
+		papers: Paper[],
+		stats: CollectStats,
+		failures: { citation: Paper[] },
+	): Promise<void> {
 		await this.runMiddlewares('all', papers);
 
 		for (const paper of papers) {
@@ -403,6 +467,9 @@ export class CollectAndSave {
 			await this.embedOrReuse(paper, stats);
 			if (!paper.embeddingSucceeded) {
 				stats.embedFailed += 1;
+			}
+			if (!paper.citationsKnown && failures.citation.length < MAX_TRACKED_CITATION_FAILURES) {
+				failures.citation.push(paper);
 			}
 			await this.runMiddlewares('forEach', paper);
 			// 저장 실패는 [1] 정책대로 전파하되, 어느 논문에서 끊겼는지는 남긴다 —
@@ -616,6 +683,8 @@ export class CollectAndSave {
 		testOptions: CollectTestOptions | undefined,
 		onChunk: (papers: Paper[]) => Promise<void>,
 		onTotal?: (subtotal: number) => void,
+		onApiStart?: (api: API, index: number, total: number) => void,
+		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<{ apiName: string; querys: SearchQuery[]; cursor: number }[]> {
 		const options: CollectOptions = {
 			prefill: (papers) => this.prefillFromStore(papers),
@@ -641,12 +710,29 @@ export class CollectAndSave {
 			if (index > 0) {
 				await delay(api.requestDelayMs);
 			}
+			// 이 구독이 실제로 몇 편을 내놓든(0편이어도) "지금 이 구독을 시작/종료했다"는
+			// 사실 자체를 직접 알린다 — 예전에는 Paper.collectedApis를 청크에서 역추론했는데,
+			// 그 방식은 결과가 0편인 구독의 시작/종료가 UI에 아예 안 잡히는 문제가 있었다
+			// (2번: 구독별 독립 진행 표시의 선행 조건).
+			onApiStart?.(api, index, apis.length);
+			// 지금 어느 구독(apiName + 조건)이 도는지 명시적으로 남긴다 — 이게 없으면
+			// 로그만 보고는 "수집 중"이라는 사실만 알 뿐 무엇을 수집하는지 알 수 없다.
+			Log.info('collect', '구독 수집 시작', {
+				index: `${index + 1}/${apis.length}`,
+				apiName: api.apiName,
+				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
+			});
 			const window = this.resolveWindow(mode, testOptions, api);
 			if (window.hours === undefined) {
 				await api.Backfill(window.from, window.to, options);
 			} else {
 				await api.SearchRecentPaper(window.hours, options);
 			}
+			onApiDone?.(api, index, apis.length);
+			Log.info('collect', '구독 수집 완료', {
+				apiName: api.apiName,
+				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
+			});
 			if (window.advancesCursor) {
 				cursorUpdates.push({
 					apiName: api.apiName,
