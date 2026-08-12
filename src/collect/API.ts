@@ -4,6 +4,7 @@ import type { Secret } from './Secret';
 import { Log } from '../common/Log';
 import {
 	chunk,
+	ConfigurationError,
 	delay,
 	hasRequiredFields,
 	parseXmlOrThrow,
@@ -742,7 +743,7 @@ export class ArxivAPI implements API {
 		sortOrder: 'ascending' | 'descending',
 	): string {
 		if (this.querys.length === 0) {
-			throw new Error('ArxivAPI: querys is empty');
+			throw new ConfigurationError('ArxivAPI: querys is empty');
 		}
 		const baseQuery = this.buildSearchQuery();
 		const searchQuery = dateFilter ? `${baseQuery} AND ${dateFilter}` : baseQuery;
@@ -772,7 +773,7 @@ export class ArxivAPI implements API {
 		// truthy라서 "Unknown searchType" 가드를 통과해버리고 쿼리에 함수 소스가 박힌다.
 		const prefix = ArxivAPI.FIELD_PREFIX[query.searchType];
 		if (typeof prefix !== 'string') {
-			throw new Error(`Unknown searchType for arXiv: ${query.searchType}`);
+			throw new ConfigurationError(`Unknown searchType for arXiv: ${query.searchType}`);
 		}
 		const value = query.query.replace(/"/g, '');
 		return prefix === 'cat' ? `${prefix}:${value}` : `${prefix}:"${value}"`;
@@ -858,7 +859,7 @@ export class ArxivAPI implements API {
 			return;
 		}
 		const reason = ArxivAPI.text(entry.querySelector('summary')) || rawId;
-		throw new Error(`arXiv rejected the query: ${reason}`);
+		throw new ConfigurationError(`arXiv rejected the query: ${reason}`);
 	}
 
 	// <opensearch:totalResults>를 읽어 이 검색의 전체 건수를 돌려준다. 페이지를 더 받을지

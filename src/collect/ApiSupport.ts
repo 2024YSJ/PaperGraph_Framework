@@ -77,6 +77,90 @@ export class ResponseParseError extends Error {
 	}
 }
 
+// 네트워크/서버 문제가 아니라 "구독 설정 자체가 잘못됐다"는 뜻의 실패 — 조건이
+// 비어 있거나(ArxivAPI.buildUrl), 서버가 조건 자체를 거부한 경우(assertNotErrorEntry의
+// "200 OK인데 사실은 에러" 기벽)가 여기 해당한다. 재시도로는 절대 안 풀리고, 사용자가
+// 구독 관리에서 조건을 고쳐야만 해결된다 — HttpRequestError(일시적일 수 있음)와는
+// 성격이 달라 구분한다.
+export class ConfigurationError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'ConfigurationError';
+	}
+}
+
+// 실패 하나를 로그/Notice 한 줄에 바로 쓸 수 있는 형태로 분류한다.
+export interface FailureDescription {
+	// 같은 종류의 실패를 grep/필터링으로 묶어볼 수 있는 안정적인 짧은 태그. 숫자
+	// ID(E001 등)는 별도 조회표 없이는 뜻을 알 수 없어서 대신 뜻이 바로 읽히는 문자열을
+	// 쓴다 — 이 코드베이스가 이미 [1]/[2]/[3] 정책 태그로 쓰는 관례와 같다(API.ts 상단
+	// 주석 참고).
+	code: 'HTTP_TIMEOUT' | 'HTTP_5XX' | 'HTTP_429' | 'HTTP_AUTH' | 'HTTP_4XX' | 'PARSE' | 'CONFIG' | 'UNKNOWN';
+	// 로그/Notice에 바로 넣을 짧은 문구. HttpRequestError의 원래 message는 요청 URL
+	// 전체(검색어 인코딩 포함)를 담고 있어 길고 잡음이 많아서, URL은 빼고 상태코드/사유만
+	// 남긴다.
+	label: string;
+	// "그래서 사용자가 뭘 해야 하는가" — 빈 문자열이면 특별히 할 일이 없다는 뜻(예:
+	// 5xx는 자동 재시도로 끝나는 게 정상 대응이라 추가 조치가 없다).
+	hint: string;
+}
+
+export function describeFailure(error: unknown): FailureDescription {
+	if (error instanceof HttpRequestError) {
+		if (error.status === STATUS_CLIENT_TIMEOUT) {
+			return {
+				code: 'HTTP_TIMEOUT',
+				label: '응답 없음(timeout)',
+				hint: '네트워크 연결 상태를 확인하세요.',
+			};
+		}
+		if (error.status === 429) {
+			return {
+				code: 'HTTP_429',
+				label: 'HTTP 429 (요청 과다)',
+				hint: '요청이 너무 잦아 제한됐습니다 — API 키를 등록하면 한도가 늘어납니다.',
+			};
+		}
+		if (error.status === 401 || error.status === 403) {
+			return {
+				code: 'HTTP_AUTH',
+				label: `HTTP ${error.status}`,
+				hint: 'API 키가 유효하지 않거나 만료됐을 수 있습니다 — 설정에서 키를 다시 확인하세요.',
+			};
+		}
+		if (error.status >= 500) {
+			return {
+				code: 'HTTP_5XX',
+				label: `HTTP ${error.status}${error.exhausted ? ', 재시도 소진' : ''}`,
+				hint: '서버 쪽 일시적 문제로 보입니다 — 다음 실행 때 자동으로 다시 시도됩니다. 계속되면 서비스 상태를 확인하세요.',
+			};
+		}
+		return {
+			code: 'HTTP_4XX',
+			label: `HTTP ${error.status}`,
+			hint: '요청 자체가 거부됐습니다 — 구독 조건(키워드/저자/분류 표기)을 확인하세요.',
+		};
+	}
+	if (error instanceof ResponseParseError) {
+		return {
+			code: 'PARSE',
+			label: `응답 파싱 실패(${error.source})`,
+			hint: '일시적 응답 문제일 수 있습니다 — 반복되면 출처 서비스의 응답 형식이 바뀌었을 수 있습니다.',
+		};
+	}
+	if (error instanceof ConfigurationError) {
+		return {
+			code: 'CONFIG',
+			label: error.message,
+			hint: '구독 관리에서 이 구독의 조건을 확인하세요 — 조건이 비어 있거나 서버가 거부하는 형식일 수 있습니다.',
+		};
+	}
+	if (error instanceof Error) {
+		return { code: 'UNKNOWN', label: error.message, hint: '' };
+	}
+	return { code: 'UNKNOWN', label: String(error), hint: '' };
+}
+
 export function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }

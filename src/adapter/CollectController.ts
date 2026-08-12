@@ -435,8 +435,15 @@ export class CollectController implements CollectProgressSink {
 			parts.push('일부 구간은 다 훑지 못해 다음 실행에서 이어집니다');
 		}
 		if (stats.failedSubscriptions.length > 0) {
-			const names = stats.failedSubscriptions.map((f) => f.apiName).join(', ');
-			parts.push(`${names} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
+			// 사유(f.error, CollectAndSave.collect의 describeFailure — "HTTP 503" 등 짧은
+			// 형태)와 힌트(f.hint — "그래서 뭘 확인하면 되는지")까지 같이 보여준다. 어느
+			// 구독인지만 알아서는 왜 실패했는지, 내가 뭘 할 수 있는지(예: 401이면 키 문제,
+			// 503이면 기다리면 됨) 알 수 없다 — 힌트가 빈 문자열이면(원인을 특정 못 함)
+			// 사유만 보여준다.
+			const detail = stats.failedSubscriptions
+				.map((f) => `${f.apiName}(${f.error}${f.hint ? ` — ${f.hint}` : ''})`)
+				.join(', ');
+			parts.push(`${detail} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
 		}
 		return parts.length > 0 ? `, ${parts.join(', ')}` : '';
 	}

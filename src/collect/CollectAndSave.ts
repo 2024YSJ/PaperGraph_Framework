@@ -4,7 +4,7 @@ import { Middleware } from '../common/Middleware';
 import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { API, type CollectOptions, type SkippedEntryRecord } from './API';
-import { delay, runQuietly } from './ApiSupport';
+import { delay, describeFailure, runQuietly } from './ApiSupport';
 import { Paper } from './Paper';
 import type { SearchQuery } from './SearchQuery';
 
@@ -64,7 +64,7 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 이번 실행에서 끝까지 실패한 구독들. 한 구독의 실패가 나머지 구독의 진행/커서 갱신을
 	// 막지 않도록 collect()가 구독 경계에서 격리하는데(아래 collect() 주석 참고), 그
 	// 대가로 "무엇이 실패했는지"를 어딘가에는 남겨야 한다 — 그게 여기다.
-	failedSubscriptions: { apiName: string; querys: SearchQuery[]; error: string }[];
+	failedSubscriptions: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[];
 	// [2] 정책으로 arXiv 응답에서 건너뛴 항목 수의 합(API.CollectionCoverage.skippedEntries,
 	// 구독마다 누적). Paper로 승격되지 못해 어디에도 저장되지 않는 항목이라, 여기서 집계하지
 	// 않으면 "N편 수집" 요약만 보고는 이런 항목이 있었다는 사실 자체를 알 수 없다.
@@ -499,8 +499,9 @@ export class CollectAndSave {
 			// 던질지만 판단한다. 성공한 구독이 하나라도 있으면 던지지 않는다(부분 성공은
 			// 실패가 아니다) — 실패 목록 자체는 stats.failedSubscriptions에 남아 있으니
 			// 완료 Notice(6번 작업)가 나중에 그 정보를 읽어 알릴 수 있다.
+			const hintText = firstFailure.hint ? ` — ${firstFailure.hint}` : '';
 			throw new Error(
-				`PaperGraph3D: 모든 구독의 수집이 실패했습니다 — ${firstFailure.apiName}: ${firstFailure.error}`,
+				`PaperGraph3D: 모든 구독의 수집이 실패했습니다 — ${firstFailure.apiName}: ${firstFailure.error}${hintText}`,
 			);
 		}
 
@@ -1052,7 +1053,7 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<{
 		cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[];
-		subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string }[];
+		subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[];
 		skippedRecords: SkippedEntryRecord[];
 	}> {
 		const options: CollectOptions = {
@@ -1061,7 +1062,7 @@ export class CollectAndSave {
 			onTotal,
 		};
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
-		const subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string }[] = [];
+		const subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[] = [];
 		// 7번(부분 재조회)용 원자재 — CollectStats에는 안 넣는다(그 인터페이스는 이 기능이
 		// 없어져도 남아야 하는 핵심 통계라 임시 기능과 섞지 않는다). runNow()가 이 배열을
 		// 그대로 SkippedEntries.json에 append한다.
@@ -1132,12 +1133,25 @@ export class CollectAndSave {
 				// 실패했다고 그 논문들을 되돌리지 않는다. 커서만 안 올라가 다음 실행이
 				// 같은 구간을 다시 훑는다.
 				onApiDone?.(api, index, apis.length);
-				const message = error instanceof Error ? error.message : String(error);
-				subscriptionFailures.push({ apiName: api.apiName, querys: api.querys, error: message });
-				Log.error('collect', '구독 수집 실패 — 다음 구독으로 진행', error, {
-					apiName: api.apiName,
-					querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
-				});
+				// describeFailure가 짧은 사유(코드/상태코드) + "그래서 뭘 확인하면 되는지"
+				// 힌트까지 함께 준다 — HttpRequestError의 원래 message는 요청 URL 전체
+				// (검색어 인코딩 포함)를 담고 있어 Notice/로그 한 줄에 넣기엔 너무 길고
+				// 잡음이 많다. 전체 스택은 Log.error의 error 인자로 이미 따로 남는다.
+				const { code, label, hint } = describeFailure(error);
+				subscriptionFailures.push({ apiName: api.apiName, querys: api.querys, error: label, hint });
+				// 메시지 문자열 자체에 "어느 구독이 왜 죽었는지, 뭘 확인해야 하는지"가 다
+				// 들어가야 한다 — 로그를 죽 훑을 때 매 줄 뒤의 JSON을 펼쳐보지 않고도 원인과
+				// 대응을 바로 알 수 있게. code를 대괄호로 붙이는 건 이 코드베이스가 이미
+				// [1]/[2]/[3] 정책 태그를 쓰는 관례를 그대로 따른 것 — grep 한 번으로 같은
+				// 종류의 실패를 모아볼 수 있다.
+				const querysText = api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND ');
+				const hintText = hint ? ` — ${hint}` : '';
+				Log.error(
+					'collect',
+					`구독 수집 실패 [${code}] — [${api.apiName}] ${querysText} — ${label}${hintText} — 다음 구독으로 진행`,
+					error,
+					{ apiName: api.apiName, querys: api.querys.map((q) => `${q.searchType}:${q.query}`) },
+				);
 			}
 		}
 		return { cursorUpdates, subscriptionFailures, skippedRecords };
