@@ -152,6 +152,50 @@ export class SettingTab extends PluginSettingTab {
 					}),
 			);
 
+		// citationsKnown이 이미 true인 논문은 수집 경로가 다시 조회하지 않는다(재시도 정책상
+		// 필요 없어서). 이 버튼은 그 스킵 규칙을 무시하고 저장된 전체 코퍼스의 인용수·제목·
+		// 초록을 강제로 다시 조회한다(지원하는 출처만, 출처 중립 — API.RefreshContent 참고).
+		// 내용이 실제로 달라진 논문만 임베딩도 함께 다시 계산한다.
+		new Setting(containerEl)
+			.setName('새로고침')
+			.setDesc(
+				'저장된 모든 논문의 인용수·제목·초록을 다시 조회하고, 내용이 바뀐 논문만 임베딩을 다시 계산합니다.',
+			)
+			.addButton((button) =>
+				button.setButtonText('새로고침').onClick(async () => {
+					try {
+						await this.plugin.eventListener.checking('ui:collect-refresh');
+					} catch (e) {
+						new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
+					}
+				}),
+			);
+
+		// 7번(부분 재조회, 임시 기능) — arXiv 응답에서 제목/초록이 비어 있어 논문으로
+		// 승격되지 못했던 항목 중, id는 파싱됐던 것만 다시 물어본다. 대부분은 다음 recent
+		// 재스캔에서 저절로 다시 잡히므로(4일 롤링 창), 이 버튼은 그걸 기다리지 않고 지금
+		// 바로 확인하고 싶을 때만 쓴다 — 목록 화면은 따로 없다, 결과는 Notice로만 안내.
+		new Setting(containerEl)
+			.setName('스킵 항목 재수집 시도')
+			.setDesc(
+				'수집 중 형식이 맞지 않아 건너뛴 항목 중, id는 파악됐지만 제목/초록만 없었던 것만 다시 조회를 시도합니다.',
+			)
+			.addButton((button) =>
+				button.setButtonText('재수집 시도').onClick(async () => {
+					try {
+						await this.plugin.eventListener.checking('ui:collect-retry-skipped');
+						const stats = this.plugin.collectflow.lastRetrySkippedStats;
+						new Notice(
+							stats
+								? `스킵 항목 재수집 완료 — ${stats.recovered}건 복구, ${stats.stillMissing}건 여전히 실패`
+								: '스킵 항목 재수집 완료',
+						);
+					} catch (e) {
+						new Notice(`스킵 항목 재수집 실패: ${e instanceof Error ? e.message : String(e)}`);
+					}
+				}),
+			);
+
 		// 큐 상태. 수집 버튼을 잠그는 대신 "지금 무엇이 돌고 무엇이 줄 서 있는지"를 보여준다.
 		new Setting(containerEl).setName('대기열').then((setting) => {
 			this.queueStatusEl = setting.descEl;
@@ -272,7 +316,7 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('열기')
 					.setCta()
 					.onClick(() => {
-						new ApiManagementModal(this.app).open();
+						new ApiManagementModal(this.app, this.plugin).open();
 					}),
 			);
 

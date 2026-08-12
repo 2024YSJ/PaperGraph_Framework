@@ -3,8 +3,8 @@ import { Embedding } from './Embedding';
 import { Middleware } from '../common/Middleware';
 import { File } from '../common/File';
 import { Log } from '../common/Log';
-import { API, type CollectOptions } from './API';
-import { delay } from './ApiSupport';
+import { API, type CollectOptions, type SkippedEntryRecord } from './API';
+import { delay, runQuietly } from './ApiSupport';
 import { Paper } from './Paper';
 import type { SearchQuery } from './SearchQuery';
 
@@ -61,6 +61,22 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 벡터가 빈 채로 저장된 논문 수. 임베딩 실패는 수집을 멈추지 않지만([3] 정책과 같은
 	// 취지 — 메타데이터는 살린다), 조용히 넘어가면 사용자가 알 방법이 없어 집계해 알린다.
 	embedFailed: number;
+	// 이번 실행에서 끝까지 실패한 구독들. 한 구독의 실패가 나머지 구독의 진행/커서 갱신을
+	// 막지 않도록 collect()가 구독 경계에서 격리하는데(아래 collect() 주석 참고), 그
+	// 대가로 "무엇이 실패했는지"를 어딘가에는 남겨야 한다 — 그게 여기다.
+	failedSubscriptions: { apiName: string; querys: SearchQuery[]; error: string }[];
+	// [2] 정책으로 arXiv 응답에서 건너뛴 항목 수의 합(API.CollectionCoverage.skippedEntries,
+	// 구독마다 누적). Paper로 승격되지 못해 어디에도 저장되지 않는 항목이라, 여기서 집계하지
+	// 않으면 "N편 수집" 요약만 보고는 이런 항목이 있었다는 사실 자체를 알 수 없다.
+	skippedEntries: number;
+	// 구독 하나라도 라운드 상한(MAX_PAGES)이나 커서 정체로 truncated된 채 끝났으면 true.
+	// 그 구간은 이번 실행에서 다 못 훑었다는 뜻 — 다음 실행이 이어받지만, 그 사실 자체는
+	// 알려야 한다("이번엔 일부만 봤다").
+	anyTruncated: boolean;
+	// citationsKnown=false로 남은 논문 중 MAX_TRACKED_CITATION_FAILURES를 넘겨 이번 실행의
+	// 자동 재시도(repairCitationsBody) 대상에서 빠진 수. 이 논문들은 유실은 아니고(다음
+	// 플러그인 로드 시 전수 보정이 결국 잡는다 — 위 상수 주석 참고) 재시도만 늦어진다.
+	citationRetryOverflow: number;
 }
 
 // 한 번의 보정 실행이 무엇을 했는지 (예전 combined 경로 — repair()가 남긴다).
@@ -81,8 +97,26 @@ export interface CitationRepairStats {
 	citationsFixed: number;
 }
 
+// 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + 콘텐츠 동기화 + 조건부 재임베딩)의 집계
+// (refreshAll()이 남긴다). citationsKnown 여부와 무관하게 코퍼스 전체를 대상으로 하므로
+// "고쳐진 수"가 아니라 "다시 확인한 수"다 — repair 계열의 *Fixed와 이름을 구분한다.
+// EmbedBreakerStats를 확장하는 이유는 CollectStats/RepairStats와 같다 — embedOrReuse가
+// 서킷브레이커 대응에 그 두 필드를 읽고 쓴다.
+export interface RefreshStats extends EmbedBreakerStats {
+	citationsRefreshed: number;
+	// 제목/초록이 실제로 달라져(콘텐츠 재조회 전후 비교) 재임베딩까지 이어진 논문 수.
+	reembedded: number;
+}
+
+// 7번(부분 재조회) 실행 하나의 집계 (retrySkippedEntries()가 남긴다). recovered는
+// SkippedEntries.json에서 지워진 수, stillMissing은 다시 물어봐도 여전히 없어서 남은 수.
+export interface RetrySkippedStats {
+	recovered: number;
+	stillMissing: number;
+}
+
 // 큐에 들어간 작업의 종류. UI가 "무엇이 돌고 있는지"를 표시하는 데 쓴다.
-export type CollectJobKind = 'recent' | 'backfill' | 'repair';
+export type CollectJobKind = 'recent' | 'backfill' | 'repair' | 'refresh';
 
 export interface CollectJob {
 	kind: CollectJobKind;
@@ -132,10 +166,27 @@ export class CollectAndSave {
 	lastEmbedRepairStats: EmbedRepairStats | undefined;
 	// 직전 인용수 재보강 전용 실행(repairCitations, 수집 후 자동 실행)의 집계.
 	lastCitationRepairStats: CitationRepairStats | undefined;
+	// 직전 전체 새로고침(refreshAll, 사용자가 누르는 「새로고침」 버튼)의 집계.
+	lastRefreshStats: RefreshStats | undefined;
+	// 직전 7번(부분 재조회, retrySkippedEntries) 실행의 집계.
+	lastRetrySkippedStats: RetrySkippedStats | undefined;
 
 	// 한 실행에서 서킷브레이커 쿨다운을 몇 번까지 기다려줄지. 이 횟수를 넘으면 모델이
 	// 회복 불가능한 상태라고 보고 임베딩을 포기한다 — embedOrReuse 주석 참고.
 	private static readonly MAX_BREAKER_WAITS = 2;
+
+	// 수집 직후 자동 인용수 보정(runNow 끝)이 직전에 "시도했지만 한 건도 못 고쳤다"로
+	// 끝났으면, 이 시간 안에는 다시 자동으로 시도하지 않는다. S2가 rate-limit/장애 중이면
+	// 그 원인은 몇 분 안에 안 풀리는 게 보통인데, 자동 보정은 수집 주기(스케줄러는 기본
+	// 몇 시간 간격이지만 사용자가 짧게 잡을 수도 있다)마다 매번 같은 실패 논문 수백 건을
+	// 다시 두드리게 된다 — 개별 요청은 이미 재시도/딜레이가 있지만([3] 정책,
+	// ArxivAPI.fetchCitationBatch), 그걸 매 실행마다 반복하는 것 자체가 낭비다. 사용자가
+	// 명시적으로 누르는 「보정」/「인용수 보정」 버튼(repair/repairCitations 공개 메서드)은
+	// 이 쿨다운을 보지 않는다 — "지금 다시 해봐라"는 요청이므로 방금 실패했어도 존중한다.
+	private static readonly AUTO_CITATION_REPAIR_COOLDOWN_MS = 10 * 60 * 1000;
+	// 직전 자동 인용수 보정이 "시도했지만 0건도 못 고쳤다"로 끝난 시각. undefined면 쿨다운
+	// 없음(한 번도 실패로 끝난 적 없거나, 그 뒤로 성공한 적이 있다).
+	private lastCitationRepairAllFailedAt: number | undefined;
 
 	get isBusy(): boolean {
 		return this.activeJob !== undefined;
@@ -308,6 +359,43 @@ export class CollectAndSave {
 		);
 	}
 
+	// 7번(부분 재조회) 전용 진입점 — SkippedEntries.json에 남은 'missing-fields' 레코드만
+	// API.RetryMissingEntries로 다시 물어본다. 사용자가 설정 탭 버튼을 눌러야만 도는 수동
+	// 동작이다(수집이 끝날 때마다 자동으로 돌지 않는다 — 대부분은 다음 recent 재스캔이
+	// 자연히 다시 잡아주므로, 이 버튼은 그 재스캔을 기다리지 않고 지금 바로 확인하고
+	// 싶을 때 쓴다). 이 기능 전체가 나중에 제거되면 이 메서드와 retrySkippedEntriesNow,
+	// appendSkippedEntries, File.readSkippedEntries/writeSkippedEntries만 지우면 된다.
+	retrySkippedEntries(onStart?: () => void): Promise<void> {
+		return this.enqueue(
+			{ kind: 'repair', label: '스킵 항목 재수집' },
+			() => this.retrySkippedEntriesNow(),
+			onStart,
+		);
+	}
+
+	// 전체 코퍼스 강제 새로고침 — citationsKnown과 무관하게 모든 논문의 인용수를 다시
+	// 조회하고, 콘텐츠(제목/초록/저자) 재조회를 지원하는 출처(API.RefreshContent를 구현한
+	// 것들)는 최신값으로 동기화한다. 실제로 내용이 달라진 논문만 재임베딩까지 이어진다
+	// (refreshAllBody가 호출 전후 스냅샷으로 판단). 어떤 출처가 콘텐츠 재조회를 지원하는지는
+	// 여기서 알 필요가 없다 — refreshAllBody가 API별로 RefreshContent 존재 여부만 보고
+	// 위임한다. repair 계열과 달리 "실패한 것만"이 아니라 "전부 다시" 확인하는 게 목적이라
+	// 별도 job kind('refresh')로 둔다 — 사용자가 명시적으로 누르는 수동 동작(설정 탭
+	// 「새로고침」 버튼)이다.
+	//
+	// onProgress는 API/구독 단위가 아니라 전체 코퍼스 논문 수 기준 flat done/total이다 —
+	// 인용수/콘텐츠 재확인은 "구독별로 다른 진행"을 보여줄 이유가 없다(run()의 구독별
+	// 진행률과 의도적으로 다른 모양).
+	refreshAll(
+		onStart?: () => void,
+		onProgress?: (done: number, total: number) => void,
+	): Promise<void> {
+		return this.enqueue(
+			{ kind: 'refresh', label: '새로고침' },
+			() => this.refreshAllNow(onProgress),
+			onStart,
+		);
+	}
+
 	// 실제 수집 몸통 — 큐가 한 번에 하나만 부른다.
 	//
 	// 흐름 (다이어그램 명시):
@@ -365,13 +453,18 @@ export class CollectAndSave {
 			embedFailed: 0,
 			embedWaits: 0,
 			embedGaveUp: false,
+			failedSubscriptions: [],
+			skippedEntries: 0,
+			anyTruncated: false,
+			citationRetryOverflow: 0,
 		};
 		const failures: { citation: Paper[] } = { citation: [] };
 		let chunks = 0;
-		const cursorUpdates = await this.collect(
+		const { cursorUpdates, subscriptionFailures, skippedRecords } = await this.collect(
 			apis,
 			mode,
 			testOptions,
+			stats,
 			(chunk) => {
 				chunks += 1;
 				return this.processChunk(chunk, stats, failures);
@@ -380,6 +473,16 @@ export class CollectAndSave {
 			onApiStart,
 			onApiDone,
 		);
+		stats.failedSubscriptions = subscriptionFailures;
+		if (skippedRecords.length > 0) {
+			// 7번(부분 재조회)의 임시 로그 — 쓰기 실패는 수집 자체를 막지 않는다(이 파일은
+			// 진단/재시도 보조용이지 수집 결과의 일부가 아니다).
+			try {
+				await this.appendSkippedEntries(skippedRecords);
+			} catch (error) {
+				Log.error('collect', 'SkippedEntries.json 기록 실패', error);
+			}
+		}
 		if (chunks === 0) {
 			// 한 편도 안 걸린 실행에서도 'all'은 빈 배열로 한 번 불린다. 미들웨어가 실행마다
 			// 반드시 한 번은 호출된다는 보장이 없으면, 실행 단위로 초기화하는 미들웨어가
@@ -393,6 +496,21 @@ export class CollectAndSave {
 			Log.warn('collect', '임베딩에 실패한 논문이 있다 — 보정 패스로 재시도할 수 있다', stats);
 		}
 		this.lastStats = stats;
+
+		// 구독 격리(collect() 주석 참고) — 일부 구독만 실패했으면 나머지가 정상 진행됐다는
+		// 뜻이므로 전체를 실패로 던지지 않는다. 다만 이번 실행에서 시도한 구독이 전부
+		// 실패했으면(성공한 구독이 하나도 없으면) 예전처럼 실행 자체를 실패로 던진다 —
+		// 그래야 수동 실행 경로(커맨드 팔레트/버튼)의 "실패했습니다" Notice가 여전히 뜬다.
+		const firstFailure = subscriptionFailures[0];
+		if (firstFailure !== undefined && subscriptionFailures.length === apis.length) {
+			// collect()가 이미 구독별로 자세히 로그를 남겼다 — 여기서는 전체 실행을 실패로
+			// 던질지만 판단한다. 성공한 구독이 하나라도 있으면 던지지 않는다(부분 성공은
+			// 실패가 아니다) — 실패 목록 자체는 stats.failedSubscriptions에 남아 있으니
+			// 완료 Notice(6번 작업)가 나중에 그 정보를 읽어 알릴 수 있다.
+			throw new Error(
+				`PaperGraph3D: 모든 구독의 수집이 실패했습니다 — ${firstFailure.apiName}: ${firstFailure.error}`,
+			);
+		}
 
 		// 구독마다 독립 커서라 갱신 대상도 구독마다 다르다 — collect()가 advancesCursor인
 		// 구독만 골라 돌려준다(Backfill/테스트 hours로 돈 구독은 여기 안 낀다).
@@ -421,12 +539,29 @@ export class CollectAndSave {
 		// 반복하며 헛수고만 늘린다. 임베딩 재시도는 main.ts의 플러그인 로드 시 1회 전수
 		// 보정(더 낮은 빈도)에 맡긴다.
 		if (failures.citation.length > 0) {
-			try {
-				const citationRepairStats = await this.repairCitationsBody(failures.citation);
-				Log.info('collect', '자동 인용수 보정 완료(이번 실행분)', citationRepairStats);
-				this.lastCitationRepairStats = citationRepairStats;
-			} catch (error) {
-				Log.error('collect', '자동 인용수 보정 실패', error);
+			const cooldownRemaining = this.lastCitationRepairAllFailedAt
+				? CollectAndSave.AUTO_CITATION_REPAIR_COOLDOWN_MS -
+					(Date.now() - this.lastCitationRepairAllFailedAt)
+				: 0;
+			if (cooldownRemaining > 0) {
+				Log.info('collect', '자동 인용수 보정 건너뜀 — 직전 시도가 전부 실패해 쿨다운 중', {
+					targets: failures.citation.length,
+					cooldownRemainingMs: cooldownRemaining,
+				});
+			} else {
+				try {
+					const citationRepairStats = await this.repairCitationsBody(failures.citation);
+					Log.info('collect', '자동 인용수 보정 완료(이번 실행분)', citationRepairStats);
+					this.lastCitationRepairStats = citationRepairStats;
+					// 대상은 있었는데 한 건도 못 고쳤으면 S2가 지금 막혀 있다고 보고 쿨다운을
+					// 건다. 하나라도 고쳤으면(부분 성공) 서비스가 살아있다는 뜻이라 쿨다운을 안
+					// 걸고, 걸려 있던 것도 해제한다.
+					this.lastCitationRepairAllFailedAt =
+						citationRepairStats.citationsFixed === 0 ? Date.now() : undefined;
+				} catch (error) {
+					Log.error('collect', '자동 인용수 보정 실패', error);
+					this.lastCitationRepairAllFailedAt = Date.now();
+				}
 			}
 		}
 	}
@@ -468,8 +603,12 @@ export class CollectAndSave {
 			if (!paper.embeddingSucceeded) {
 				stats.embedFailed += 1;
 			}
-			if (!paper.citationsKnown && failures.citation.length < MAX_TRACKED_CITATION_FAILURES) {
-				failures.citation.push(paper);
+			if (!paper.citationsKnown) {
+				if (failures.citation.length < MAX_TRACKED_CITATION_FAILURES) {
+					failures.citation.push(paper);
+				} else {
+					stats.citationRetryOverflow += 1;
+				}
 			}
 			await this.runMiddlewares('forEach', paper);
 			// 저장 실패는 [1] 정책대로 전파하되, 어느 논문에서 끊겼는지는 남긴다 —
@@ -584,6 +723,95 @@ export class CollectAndSave {
 		return stats;
 	}
 
+	// 새로고침 몸통 — repairCitationsBody와 같은 API별 순회 구조지만 citationsKnown 필터가
+	// 없다(강제 재조회가 목적). RefreshContent를 구현한 API(예: ArxivAPI)는 콘텐츠까지
+	// 동기화한다 — optional 메서드라 구현하지 않은 API는 자연히 건너뛴다. 여기서는 어떤
+	// API가 이걸 지원하는지 전혀 몰라도 된다(출처 중립).
+	//
+	// "실제로 바뀌었는지"는 RefreshContent 호출 전후 title/abstract 스냅샷을 비교해
+	// 이 메서드가 직접 판단한다 — API 구현체는 "최신값을 가져와 반영한다"까지만 책임지고,
+	// 그 값으로 재임베딩할지는 도메인(CollectAndSave)의 결정이라는 관심사 분리
+	// (EnrichCitations가 인용수만 채우고 그걸 어디에 쓸지는 호출부가 정하는 것과 같은 구도).
+	//
+	// 진행률은 API별이 아니라 코퍼스 전체 논문 수 기준 flat done/total이다 — old
+	// PaperGraph3D 프로젝트의 bulkRefresh.ts와 같은 단순한 형태.
+	private async refreshAllBody(
+		papers: Paper[],
+		onProgress?: (done: number, total: number) => void,
+	): Promise<RefreshStats> {
+		const stats: RefreshStats = {
+			citationsRefreshed: 0,
+			reembedded: 0,
+			embedWaits: 0,
+			embedGaveUp: false,
+		};
+		if (this.disposed) {
+			return stats;
+		}
+		this.embedding.resetCircuitBreaker();
+		const secret = await File.readSecret();
+		const total = papers.length;
+		let done = 0;
+		for (const apiName of File.supportedApiNames()) {
+			if (this.disposed) {
+				// API(서비스) 경계 — repairCitationsBody와 같은 원칙.
+				break;
+			}
+			const targets = papers.filter((paper) => paper.collectedApis.includes(apiName));
+			if (targets.length === 0) {
+				continue;
+			}
+			const api = File.createApi(apiName, [], secret);
+			await api.EnrichCitations(targets, { force: true });
+
+			// RefreshContent 호출 전 스냅샷 — 호출 후 이 값과 달라진 논문만 재임베딩한다.
+			const before = new Map(
+				targets.map((paper) => [paper.sourceId, { title: paper.title, abstract: paper.abstract }]),
+			);
+			if (api.RefreshContent) {
+				await api.RefreshContent(targets);
+			}
+
+			for (const paper of targets) {
+				const prev = before.get(paper.sourceId);
+				const contentChanged =
+					prev !== undefined && (paper.title !== prev.title || paper.abstract !== prev.abstract);
+				if (contentChanged) {
+					// embedOrReuse는 embeddingSucceeded가 이미 true면 재계산을 스킵한다 — 이
+					// 리셋 한 줄이 곧 "재임베딩 강제 트리거"다. 서킷브레이커 대응(쿨다운
+					// 대기/포기)은 embedOrReuse의 기존 로직을 그대로 탄다.
+					paper.embeddingSucceeded = false;
+					await this.embedOrReuse(paper, stats);
+					if (paper.embeddingSucceeded) {
+						stats.reembedded += 1;
+					}
+				}
+				try {
+					await File.writePaper(paper);
+				} catch (error) {
+					Log.error('collect', '새로고침 중 논문 저장 실패', error, {
+						sourceId: paper.sourceId,
+					});
+					throw error;
+				}
+				stats.citationsRefreshed += 1;
+				done += 1;
+				onProgress?.(done, total);
+			}
+		}
+		return stats;
+	}
+
+	// 새로고침 전용 진입점 — 대상을 좁히지 않는다(코퍼스 전체). 사용자가 설정 탭 「새로고침」
+	// 버튼을 누를 때만 실행되는 수동 경로다(repairCitationsNow처럼 수집 후 자동으로 도는
+	// 경로가 아니다).
+	private async refreshAllNow(onProgress?: (done: number, total: number) => void): Promise<void> {
+		const papers = await this.loadRepairTargets();
+		const stats = await this.refreshAllBody(papers, onProgress);
+		Log.info('collect', '새로고침 완료', stats);
+		this.lastRefreshStats = stats;
+	}
+
 	// 재임베딩 전용 진입점 — PCA가 needsReembedding으로 좁혀준 목록을 받아 그것만 돈다.
 	// 「진짜 UI」에서는 재임베딩을 이 경로(PCA 트리거)로만 실행한다: 인용수는 건드리지
 	// 않으므로 시각화를 열 때마다 불필요한 S2 호출이 함께 도는 일이 없다.
@@ -608,6 +836,122 @@ export class CollectAndSave {
 		const stats = await this.repairCitationsBody(papers);
 		Log.info('collect', '인용수 보정 완료', stats);
 		this.lastCitationRepairStats = stats;
+	}
+
+	// ── 7번: skippedEntries 부분 재조회 (임시 기능) ─────────────────────
+	//
+	// collect()가 이번 실행에서 모은 스킵 레코드를 SkippedEntries.json에 이어 붙인다.
+	// 같은 rawId가 여러 번 스킵되면(재스캔 창 안에서 매번 다시 걸림) 마지막 레코드로
+	// 덮어써 중복이 쌓이지 않게 한다 — 그 항목이 여전히 스킵되고 있다는 사실은 skippedAt
+	// 갱신만으로 충분히 드러난다.
+	private async appendSkippedEntries(records: SkippedEntryRecord[]): Promise<void> {
+		const existing = await File.readSkippedEntries();
+		const byRawId = new Map(existing.map((r) => [r.rawId, r]));
+		for (const record of records) {
+			byRawId.set(record.rawId, record);
+		}
+		await File.writeSkippedEntries(Array.from(byRawId.values()));
+	}
+
+	// 재조회 전용 진입점 — SkippedEntries.json에서 reason === 'missing-fields'인 레코드만
+	// 골라 다시 물어본다('no-id' 레코드는 애초에 재수집 대상을 특정할 수 없어 항상
+	// 제외한다). apiName별, 그리고 같은 apiName 안에서도 collectedQuery별로 묶어 각각
+	// API.RetryMissingEntries를 호출한다 — collectedQuery가 다르면 복구된 논문에 붙일
+	// 출처 조건(paper.collectedQueries)이 달라지므로 하나로 묶어 보내면 안 된다.
+	//
+	// 복구된 논문은 정상 수집과 같은 처리(임베딩 → 미들웨어 → 저장)를 거친다 — 이 경로로
+	// 들어오기 전까지는 한 번도 Paper였던 적이 없으므로, processChunk가 하는 일을 그대로
+	// 반복해야 한다(다만 CollectStats/citation 실패 누적 등 run() 전용 부기는 필요 없어
+	// processChunk를 직접 재사용하지 않고 이 메서드 안에서 필요한 것만 한다).
+	private async retrySkippedEntriesNow(): Promise<void> {
+		const all = await File.readSkippedEntries();
+		const retryable = all.filter((r) => r.reason === 'missing-fields');
+		const stats: RetrySkippedStats = { recovered: 0, stillMissing: 0 };
+		if (retryable.length === 0) {
+			this.lastRetrySkippedStats = stats;
+			return;
+		}
+		if (!(await this.embedding.isModelInstalled())) {
+			throw new Error(
+				'PaperGraph3D: 임베딩 모델이 설치되어 있지 않습니다. 설정 탭에서 모델을 먼저 설치하세요.',
+			);
+		}
+		this.embedding.resetCircuitBreaker();
+
+		// (apiName, collectedQuery) 조합별로 묶는다 — 같은 조합 안에서만 rawId를 함께 물어볼
+		// 수 있다.
+		const groups = new Map<string, { apiName: string; collectedQuery: SearchQuery; records: SkippedEntryRecord[] }>();
+		for (const record of retryable) {
+			const key = `${record.apiName}::${JSON.stringify(record.collectedQuery)}`;
+			const group = groups.get(key) ?? { apiName: record.apiName, collectedQuery: record.collectedQuery, records: [] };
+			group.records.push(record);
+			groups.set(key, group);
+		}
+
+		const secret = await File.readSecret();
+		const stillMissingRecords: SkippedEntryRecord[] = [];
+		const embedStats: EmbedBreakerStats = { embedWaits: 0, embedGaveUp: false };
+		for (const group of groups.values()) {
+			if (this.disposed) {
+				// 아직 처리 안 한 그룹은 레코드를 그대로 남긴다 — 다음 재수집 시도가 이어받는다.
+				stillMissingRecords.push(...group.records);
+				continue;
+			}
+			const api = File.createApi(group.apiName, [], secret);
+			if (!api.RetryMissingEntries) {
+				// 이 출처는 부분 재조회를 지원하지 않는다 — 레코드를 그대로 둔다.
+				stillMissingRecords.push(...group.records);
+				continue;
+			}
+			const rawIds = group.records.map((r) => r.rawId);
+			const { recovered, stillMissingRawIds } = await api.RetryMissingEntries(rawIds, group.collectedQuery);
+
+			// rawId(arXiv id URL)의 로컬 id(sourceId의 ':' 뒤 부분)만 뽑아 매칭한다 —
+			// ArxivAPI.extractId/stripVersion과 같은 규칙이지만 그건 private이라, 여기서는
+			// "저장 실패한 복구 논문을 원래 레코드로 되짚는" 최소한의 용도로만 따로 둔다.
+			const localIdOf = (rawId: string): string | undefined => rawId.split('/abs/')[1]?.replace(/v\d+$/, '');
+			const recordByLocalId = new Map(
+				group.records
+					.map((r): [string, SkippedEntryRecord] | undefined => {
+						const localId = localIdOf(r.rawId);
+						return localId ? [localId, r] : undefined;
+					})
+					.filter((entry): entry is [string, SkippedEntryRecord] => entry !== undefined),
+			);
+
+			for (const paper of recovered) {
+				await this.prefillFromStore([paper]);
+				await runQuietly(() => api.EnrichCitations([paper]), 'retrySkippedEntries.EnrichCitations');
+				await this.embedOrReuse(paper, embedStats);
+				await this.runMiddlewares('all', [paper]);
+				await this.runMiddlewares('forEach', paper);
+				try {
+					await File.writePaper(paper);
+					stats.recovered += 1;
+				} catch (error) {
+					Log.error('collect', '재수집한 논문 저장 실패', error, { sourceId: paper.sourceId });
+					// 저장 실패는 복구 실패와 같다 — 이 레코드를 다시 스킵 목록에 남긴다.
+					const failedRecord = recordByLocalId.get(paper.sourceId.split(':')[1] ?? '');
+					if (failedRecord) {
+						stillMissingRecords.push(failedRecord);
+					}
+				}
+			}
+
+			const stillMissingSet = new Set(stillMissingRawIds);
+			for (const record of group.records) {
+				if (stillMissingSet.has(record.rawId)) {
+					stillMissingRecords.push(record);
+				}
+			}
+		}
+
+		stats.stillMissing = stillMissingRecords.length;
+		// 'no-id' 레코드(애초에 대상이 아니었던 것)는 그대로 보존한다.
+		const untouched = all.filter((r) => r.reason !== 'missing-fields');
+		await File.writeSkippedEntries([...untouched, ...stillMissingRecords]);
+		Log.info('collect', '스킵 항목 재수집 완료', stats);
+		this.lastRetrySkippedStats = stats;
 	}
 
 	// 예전 combined 경로 — 재임베딩과 재보강을 같은 대상 집합에 대해 함께 돈다. 수동 「보정」
@@ -671,27 +1015,43 @@ export class CollectAndSave {
 	}
 
 	// API를 순차로 돌며 수집한다. 병렬로 부르면 같은 호스트에 동시 요청이 나가 arXiv의
-	// 요청 간격 권고를 깨뜨린다. 수집 자체의 실패([1] 정책)는 그대로 전파한다 — 그러면
-	// 이 함수도 예외로 끝나고, 이미 처리한 구독의 cursorUpdates까지 호출자에게 도달하지
-	// 못한다. 즉 한 구독이 실패하면 이번 실행에서는 어떤 구독의 커서도 갱신되지 않는다
-	// (예전에도 advanceCursor를 전체 성공 후 한 번만 불렀던 것과 같은 보수적 동작).
+	// 요청 간격 권고를 깨뜨린다.
+	//
+	// 구독 격리: 한 구독의 수집 실패([1] 정책)는 그 구독만 건너뛰고 나머지 구독은 계속
+	// 진행한다 — 예전에는 한 구독이 throw하면 이 함수 전체가 예외로 끝나 이미 처리한
+	// 구독의 cursorUpdates까지 호출자에게 도달하지 못했다. 문제는 arXiv "쿼리 거부됨"
+	// 같은 실패는 일시적 장애가 아니라 그 구독의 설정 자체가 잘못됐다는 뜻이라, 자동
+	// 실행(스케줄러)에서는 매번 같은 지점에서 죽어 나머지 정상 구독까지 영구히 막혔다.
+	// 실패한 구독은 cursorUpdates에서 빠지므로(advancesCursor 여부와 무관하게 아예 안
+	// 올라간다) 다음 실행이 같은 구간을 다시 시도한다 — 실패를 봤다고 커서를 전진시키지
+	// 않는 원칙은 그대로 지킨다. 실패 목록은 실패자(runNow)가 로그/Notice로 알린다.
 	//
 	// 논문을 모아서 받지 않고 청크가 나올 때마다 onChunk로 처리한다 — processChunk 주석 참고.
 	private async collect(
 		apis: API[],
 		mode: 'recent' | 'backfill',
 		testOptions: CollectTestOptions | undefined,
+		stats: CollectStats,
 		onChunk: (papers: Paper[]) => Promise<void>,
 		onTotal?: (subtotal: number) => void,
 		onApiStart?: (api: API, index: number, total: number) => void,
 		onApiDone?: (api: API, index: number, total: number) => void,
-	): Promise<{ apiName: string; querys: SearchQuery[]; cursor: number }[]> {
+	): Promise<{
+		cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[];
+		subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string }[];
+		skippedRecords: SkippedEntryRecord[];
+	}> {
 		const options: CollectOptions = {
 			prefill: (papers) => this.prefillFromStore(papers),
 			onChunk,
 			onTotal,
 		};
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
+		const subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string }[] = [];
+		// 7번(부분 재조회)용 원자재 — CollectStats에는 안 넣는다(그 인터페이스는 이 기능이
+		// 없어져도 남아야 하는 핵심 통계라 임시 기능과 섞지 않는다). runNow()가 이 배열을
+		// 그대로 SkippedEntries.json에 append한다.
+		const skippedRecords: SkippedEntryRecord[] = [];
 
 		for (const [index, api] of apis.entries()) {
 			// 플러그인이 언로드됐으면 아직 시작하지 않은 구독은 시작하지 않는다. 이미
@@ -722,26 +1082,51 @@ export class CollectAndSave {
 				apiName: api.apiName,
 				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
 			});
-			const window = this.resolveWindow(mode, testOptions, api);
-			if (window.hours === undefined) {
-				await api.Backfill(window.from, window.to, options);
-			} else {
-				await api.SearchRecentPaper(window.hours, options);
-			}
-			onApiDone?.(api, index, apis.length);
-			Log.info('collect', '구독 수집 완료', {
-				apiName: api.apiName,
-				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
-			});
-			if (window.advancesCursor) {
-				cursorUpdates.push({
+			try {
+				const window = this.resolveWindow(mode, testOptions, api);
+				if (window.hours === undefined) {
+					await api.Backfill(window.from, window.to, options);
+				} else {
+					await api.SearchRecentPaper(window.hours, options);
+				}
+				onApiDone?.(api, index, apis.length);
+				Log.info('collect', '구독 수집 완료', {
 					apiName: api.apiName,
-					querys: api.querys,
-					cursor: CollectAndSave.resolveCursor(api, window.to),
+					querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
+				});
+				// 이 구독이 남긴 coverage를 실행 전체 집계에 얹는다 — [2] 정책으로 건너뛴
+				// 항목과 truncated 여부는 논문 하나하나가 아니라 구독(수집 구간) 단위로
+				// 나오므로, processChunk가 아니라 여기서만 읽을 수 있다.
+				const coverage = api.lastCoverage;
+				if (coverage !== undefined) {
+					stats.skippedEntries += coverage.skippedEntries;
+					if (coverage.truncated) {
+						stats.anyTruncated = true;
+					}
+					skippedRecords.push(...coverage.skipped);
+				}
+				if (window.advancesCursor) {
+					cursorUpdates.push({
+						apiName: api.apiName,
+						querys: api.querys,
+						cursor: CollectAndSave.resolveCursor(api, window.to),
+					});
+				}
+			} catch (error) {
+				// 이 구독은 실패로 남기고 다음 구독으로 넘어간다 — 이미 이 구독이 emit한
+				// 청크(onChunk를 통해 processChunk가 저장까지 끝낸 논문)는 그대로 유효하다.
+				// 실패했다고 그 논문들을 되돌리지 않는다. 커서만 안 올라가 다음 실행이
+				// 같은 구간을 다시 훑는다.
+				onApiDone?.(api, index, apis.length);
+				const message = error instanceof Error ? error.message : String(error);
+				subscriptionFailures.push({ apiName: api.apiName, querys: api.querys, error: message });
+				Log.error('collect', '구독 수집 실패 — 다음 구독으로 진행', error, {
+					apiName: api.apiName,
+					querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
 				});
 			}
 		}
-		return cursorUpdates;
+		return { cursorUpdates, subscriptionFailures, skippedRecords };
 	}
 
 	// 잘린(truncated) API는 그 지점까지만 인정한다. 요청한 구간의 끝(requestedTo)을

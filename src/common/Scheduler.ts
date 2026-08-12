@@ -1,6 +1,7 @@
 import { EventListener } from './EventListener';
 import { File } from './File';
 import { Log } from './Log';
+import { FailureNotifier } from './Notify';
 
 // 자동(백그라운드) 수집 스케줄러 — 설정된 주기·시간대에 맞춰 최근 논문 수집을 건다.
 //
@@ -13,6 +14,14 @@ import { Log } from './Log';
 // 이 클래스는 "지금이 실행할 때인가"만 판단하는 tick() 하나만 제공한다.
 export class Scheduler {
 	constructor(private readonly eventListener: EventListener) {}
+
+	// 자동 수집은 원래 실패해도 조용히 로그만 남기도록 설계돼 있었다 — "Scheduler는
+	// Obsidian UI를 몰라야 한다"보다는, 5분마다 도는 tick마다 Notice가 뜨면 스팸이 되기
+	// 때문이었다. 문제는 그 판단이 "전혀 안 띄운다"로 굳어져서, 모델이 삭제됐다거나
+	// arXiv가 쿼리를 계속 거부하는 것처럼 며칠씩 이어지는 실패를 사용자가 알 방법이
+	// 전혀 없었다. FailureNotifier로 "이유가 바뀔 때만" 알리면 스팸 없이 이 공백을
+	// 메울 수 있다.
+	private readonly failureNotifier = new FailureNotifier();
 
 	async tick(): Promise<void> {
 		const settings = await File.readScheduleSettings();
@@ -48,8 +57,10 @@ export class Scheduler {
 		});
 		try {
 			await this.eventListener.checking('scheduler:collect-recent');
+			this.failureNotifier.notifySuccess();
 		} catch (error) {
 			Log.error('scheduler', '자동 수집 실패', error);
+			this.notifyFailure(error);
 		}
 	}
 
@@ -63,9 +74,22 @@ export class Scheduler {
 		Log.info('scheduler', '자동 수집 시작 (켜는 즉시 1회)');
 		try {
 			await this.eventListener.checking('scheduler:collect-recent');
+			this.failureNotifier.notifySuccess();
 		} catch (error) {
 			Log.error('scheduler', '자동 수집 실패', error);
+			this.notifyFailure(error);
 		}
+	}
+
+	// FailureNotifier에 넘길 reason은 에러 메시지 그대로 쓴다 — CollectAndSave가 이미
+	// 사람이 읽을 수 있는 메시지(모델 미설치, 구독 없음, 전 구독 실패 등)로 throw하므로
+	// 별도 분류 없이 메시지 동일 여부로 "같은 이유"를 판단해도 충분하다.
+	private notifyFailure(error: unknown): void {
+		const reason = error instanceof Error ? error.message : String(error);
+		this.failureNotifier.notifyFailure(
+			reason,
+			(r) => `PaperGraph3D: 자동 수집이 실패하고 있습니다 — ${r}`,
+		);
 	}
 
 	// start===end면 "시간대 제한 없음"으로 취급한다(ScheduleSettings.ts 참고). start가

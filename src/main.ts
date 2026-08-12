@@ -1,4 +1,5 @@
 import { Notice, Plugin } from 'obsidian';
+import type { SearchQuery } from './collect/SearchQuery';
 import { CollectAndSave } from './collect/CollectAndSave';
 import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
@@ -106,12 +107,12 @@ export default class PaperGraph3D extends Plugin {
 			id: 'open-subscription-manager',
 			name: '구독 관리 열기',
 			callback: () => {
-				new ApiManagementModal(this.app).open();
+				new ApiManagementModal(this.app, this).open();
 			},
 		});
 
 		this.addRibbonIcon('rss', '구독 관리', () => {
-			new ApiManagementModal(this.app).open();
+			new ApiManagementModal(this.app, this).open();
 		});
 	}
 
@@ -157,13 +158,43 @@ export default class PaperGraph3D extends Plugin {
 		collectRecentTask.func = () => this.collectController.runRecentAuto();
 		this.taskManager.setTask(collectRecentTask);
 
+		// 신규 구독 등록 직후 그 구독 하나만 자동으로 1회 수집하기 위한 별도 작업.
+		// 'collect:recent'(전체 대상, 무인자)와 계약이 다르므로 이름을 따로 둔다 — 인자를
+		// 받아 분기하면 runTask(taskName, ...args)가 unknown[]이라 타입 안전성이 없어진다.
+		const collectRecentOneTask = new Task();
+		collectRecentOneTask.taskName = 'collect:recent-one';
+		collectRecentOneTask.func = (...args: unknown[]) => {
+			const target = args[0] as { apiName: string; querys: SearchQuery[] };
+			return this.collectController.runRecentOneAuto(target);
+		};
+		this.taskManager.setTask(collectRecentOneTask);
+
 		const collectRepairTask = new Task();
 		collectRepairTask.taskName = 'collect:repair';
 		collectRepairTask.func = () => this.collectflow.repair();
 		this.taskManager.setTask(collectRepairTask);
 
+		// 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + arXiv 개정판 감지) — 설정 탭
+		// 「새로고침」 버튼 전용. repair와 달리 실패한 것만이 아니라 전부 다시 확인하므로
+		// 별도 작업/이벤트로 둔다.
+		const collectRefreshTask = new Task();
+		collectRefreshTask.taskName = 'collect:refresh';
+		collectRefreshTask.func = () => this.collectController.refreshAllAuto();
+		this.taskManager.setTask(collectRefreshTask);
+
+		// 7번(부분 재조회, 임시 기능) — 설정 탭의 「스킵 항목 재수집 시도」 버튼 전용. 이
+		// 기능이 나중에 통째로 제거되면 이 블록과 SettingTab의 버튼, CollectAndSave의
+		// retrySkippedEntries 계열만 지우면 된다.
+		const collectRetrySkippedTask = new Task();
+		collectRetrySkippedTask.taskName = 'collect:retry-skipped';
+		collectRetrySkippedTask.func = () => this.collectflow.retrySkippedEntries();
+		this.taskManager.setTask(collectRetrySkippedTask);
+
 		this.eventListener.setEventListener('ui:collect-recent', 'collect:recent');
+		this.eventListener.setEventListener('ui:collect-recent-one', 'collect:recent-one');
 		this.eventListener.setEventListener('ui:collect-repair', 'collect:repair');
+		this.eventListener.setEventListener('ui:collect-refresh', 'collect:refresh');
+		this.eventListener.setEventListener('ui:collect-retry-skipped', 'collect:retry-skipped');
 		// 6번: 스케줄러도 같은 'collect:recent' 작업을 탄다 — 자동이든 수동이든 "최근 논문
 		// 수집"은 하나의 작업이고, 스케줄러는 그걸 언제 부를지만 결정한다.
 		this.eventListener.setEventListener('scheduler:collect-recent', 'collect:recent');

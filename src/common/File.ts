@@ -2,7 +2,7 @@ import { TFile, Vault } from 'obsidian';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { Paper } from '../collect/Paper';
-import { API, ArxivAPI } from '../collect/API';
+import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
 import { SearchQuery } from '../collect/SearchQuery';
 import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
 
@@ -81,6 +81,23 @@ export class File {
 
 	static writeScheduleSettings(settings: ScheduleSettings): Promise<void> {
 		return File.writeConfig('Schedule.json', settings);
+	}
+
+	// 7번(부분 재조회) — [2] 정책으로 스킵된 항목의 임시 기록. Schedule.json과 같은 방식
+	// (평문, 플러그인 폴더). 이 기능이 통째로 제거되면 이 두 함수와 SkippedEntries.json
+	// 하나만 지우면 된다 — 다른 config들과 달리 마이그레이션/기본값 병합을 두지 않는다
+	// (레코드가 없으면 그냥 빈 배열, 필드가 안 맞으면 그 레코드는 버려도 무방한 임시
+	// 데이터라 굳이 옛 형식과 호환시킬 이유가 없다).
+	static readSkippedEntries(): Promise<SkippedEntryRecord[]> {
+		return File.readConfig(
+			'SkippedEntries.json',
+			(raw) => (Array.isArray(raw) ? (raw as SkippedEntryRecord[]) : []),
+			() => [],
+		);
+	}
+
+	static writeSkippedEntries(records: SkippedEntryRecord[]): Promise<void> {
+		return File.writeConfig('SkippedEntries.json', records);
 	}
 
 	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json

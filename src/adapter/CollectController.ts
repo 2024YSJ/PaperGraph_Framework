@@ -1,6 +1,7 @@
 import { App, Menu, Notice } from 'obsidian';
 import type PaperGraph3D from '../main';
 import type { API } from '../collect/API';
+import type { SearchQuery } from '../collect/SearchQuery';
 import { Log } from '../common/Log';
 import { SubscriptionTargetModal, type SubscriptionTarget } from './SubscriptionTargetModal';
 import {
@@ -232,6 +233,53 @@ export class CollectController implements CollectProgressSink {
 		);
 	}
 
+	// 신규 구독 등록 직후, 방금 등록한 구독 하나만 대상으로 자동 수집한다. runRecentAuto와
+	// 마찬가지로 silent(Notice 없음) — 등록 성공 Notice가 이미 떴으므로 별도 안내가
+	// 필요 없고, activeFlow/대기열 표시는 그대로 채워진다.
+	runRecentOneAuto(target: { apiName: string; querys: SearchQuery[] }): Promise<string | void> {
+		const label = describeTargets('최근 논문 수집', [target]);
+		return this.runWithProgress(
+			label,
+			(onStart, onTotal, onApiStart, onApiDone) =>
+				this.plugin.collectflow.run(
+					'recent',
+					{ targetSubscriptions: [target] },
+					onStart,
+					onTotal,
+					onApiStart,
+					onApiDone,
+				),
+			true,
+		);
+	}
+
+	// 전체 코퍼스 강제 새로고침(인용수 재조회 + 콘텐츠 동기화 + 조건부 재임베딩) — 설정 탭
+	// 「새로고침」 버튼이 부른다. runWithProgress(구독별 ProgressFlow.subscriptions 배열
+	// 전제)를 재사용하지 않는다 — refreshAll의 진행은 API/구독 단위가 아니라 코퍼스 전체
+	// 논문 수 기준 flat done/total이라 그 배열 구조와 안 맞는다. 대신 Notice 하나를 직접
+	// 갱신하는 가벼운 전용 처리를 쓴다 — Backfill/최근수집이 쓰는 "N/총M편" 어휘를 그대로
+	// 맞춘다.
+	async refreshAllAuto(): Promise<string | void> {
+		const label = '새로고침';
+		const notice = new Notice(`${label} — 준비 중...`, 0);
+		try {
+			await this.plugin.collectflow.refreshAll(undefined, (done, total) => {
+				notice.setMessage(`${label} — 처리 중 (${done}/${total}편)`);
+			});
+			const stats = this.plugin.collectflow.lastRefreshStats;
+			const detail = stats ? `${stats.citationsRefreshed}편 확인, ${stats.reembedded}편 재임베딩` : undefined;
+			new Notice(`${label} — 완료했습니다.${detail ? ` (${detail})` : ''}`);
+			Log.info('ui', `${label} 완료`, { detail });
+			return detail;
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			new Notice(`${label} — 실패했습니다: ${message}`);
+			Log.error('ui', `${label} 실패`, e);
+		} finally {
+			notice.hide();
+		}
+	}
+
 	// 수집 요청 하나를 진행률과 함께 실행한다. silent=true면 Notice를 만들지 않는다
 	// (스케줄러/명령어 팔레트처럼 원래 조용히 도는 게 설계 의도인 실행용 — runRecentAuto
 	// 참고) — activeFlow/구독별 진행(SettingTab이 읽는 단일 진실 공급원)은 silent 여부와
@@ -335,10 +383,42 @@ export class CollectController implements CollectProgressSink {
 		// 피하려고 다음 플러그인 로드 때의 전수 보정으로 미뤘다(CollectAndSave.runNow 끝
 		// 주석 참고). 그러니 여기서는 "지금 몇 편 실패했다"만 사실대로 알리고, 언제
 		// 복구되는지도 같이 말한다.
-		const failed = this.plugin.collectflow.lastStats?.embedFailed ?? 0;
-		return failed > 0
-			? `${flow.collected}편 수집, 그중 ${failed}편 임베딩 실패 — 다음 플러그인 로드 때 자동으로 재시도됩니다`
-			: `${flow.collected}편 수집`;
+		//
+		// embedFailed 외에도 "부분 성공"을 나타내는 신호가 더 있다(CollectAndSave.CollectStats
+		// 참고) — 조용히 넘어가면 사용자는 완료 Notice만 보고 전부 다 됐다고 오해한다.
+		// 전부 정상이면(추가 신호가 하나도 없으면) 예전처럼 편수만 보여준다 — 매번 문구가
+		// 늘어나면 정작 이상이 있을 때 눈에 덜 띈다.
+		return `${flow.collected}편 수집${this.buildPartialFailureSuffix()}`;
+	}
+
+	// CollectStats의 부분 실패 신호들을 사람이 읽을 문구로 이어붙인다. 신호가 하나도
+	// 없으면 빈 문자열 — 정상 실행에서는 완료 Notice가 예전 그대로("N편 수집")로 보이게
+	// 한다.
+	private buildPartialFailureSuffix(): string {
+		const stats = this.plugin.collectflow.lastStats;
+		if (!stats) {
+			return '';
+		}
+		const parts: string[] = [];
+		if (stats.embedFailed > 0) {
+			parts.push(`${stats.embedFailed}편 임베딩 실패 — 다음 플러그인 로드 때 자동으로 재시도됩니다`);
+		}
+		if (stats.citationRetryOverflow > 0) {
+			// 이번 실행의 자동 재시도(500편 상한)에서 빠진 것뿐, 유실은 아니다 — 다음
+			// 플러그인 로드 때의 전수 보정이 결국 잡는다(MAX_TRACKED_CITATION_FAILURES 주석).
+			parts.push(`${stats.citationRetryOverflow}편은 인용수 재시도 대상이 너무 많아 이번엔 건너뜀`);
+		}
+		if (stats.skippedEntries > 0) {
+			parts.push(`${stats.skippedEntries}건은 데이터 형식이 맞지 않아 건너뜀`);
+		}
+		if (stats.anyTruncated) {
+			parts.push('일부 구간은 다 훑지 못해 다음 실행에서 이어집니다');
+		}
+		if (stats.failedSubscriptions.length > 0) {
+			const names = stats.failedSubscriptions.map((f) => f.apiName).join(', ');
+			parts.push(`${names} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
+		}
+		return parts.length > 0 ? `, ${parts.join(', ')}` : '';
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는

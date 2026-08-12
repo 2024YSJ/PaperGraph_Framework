@@ -703,11 +703,13 @@ describe('CollectAndSave.run — 커서', () => {
 		);
 	});
 
-	it('한 구독이 실패해도 앞서 성공한 구독의 커서는 갱신되지 않는다 — 보수적 동작', async () => {
-		// collect()는 예외가 나면 그때까지 모은 cursorUpdates를 호출자에게 못 넘긴다.
-		// 부분 갱신을 허용하면 실패한 구독을 재시도할 때 성공했던 구독까지 다시 도는
-		// 낭비는 없지만, "이번 실행이 정말 끝까지 끝났다"는 보장이 흐려진다 — 기존
-		// advanceCursor의 전체-성공-후-일괄 방식을 그대로 유지한다.
+	it('한 구독이 실패해도 성공한 구독의 커서는 갱신되고, 실패한 구독만 남는다 — 구독 격리', async () => {
+		// collect()는 구독 경계에서 실패를 격리한다(CollectAndSave.collect 주석 참고).
+		// 한 구독의 실패가 나머지 구독의 진행/커서 갱신을 막지 않는다 — arXiv "쿼리
+		// 거부됨" 같은 실패는 그 구독의 설정 자체가 잘못됐다는 뜻이라, 격리하지 않으면
+		// 자동 실행(스케줄러)에서 정상 구독까지 영구히 막힌다. 실패한 구독은 커서가
+		// 그대로 남아 다음 실행이 같은 구간을 다시 시도한다. 전체 구독이 다 실패했을
+		// 때만 run() 자체가 실패로 던져진다(그 케이스는 별도 테스트).
 		let call = 0;
 		mockRequests((param) => {
 			if (param.url.includes('semanticscholar')) {
@@ -730,13 +732,36 @@ describe('CollectAndSave.run — 커서', () => {
 		);
 		const { embedding } = fakeEmbedding();
 
-		await assert.rejects(() => collectFlow(embedding).run('recent'));
+		// 일부 구독만 실패했으므로 전체 실행은 실패로 던져지지 않는다.
+		await collectFlow(embedding).run('recent');
 
 		const stored = JSON.parse(
 			vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}',
 		) as { apis: { querys: { query: string }[]; updateTime: number }[] };
 		const succeeded = stored.apis.find((api) => api.querys[0]?.query === 'succeeds');
-		assert.equal(succeeded?.updateTime, 0, '실패한 실행인데 일부 구독의 커서가 갱신됐다');
+		const failed = stored.apis.find((api) => api.querys[0]?.query === 'fails');
+		assert.notEqual(succeeded?.updateTime, 0, '성공한 구독의 커서가 갱신되지 않았다');
+		assert.equal(failed?.updateTime, 0, '실패한 구독의 커서가 잘못 갱신됐다');
+	});
+
+	it('등록된 구독이 전부 실패하면 run() 자체가 실패로 끝난다', async () => {
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			return response(500, 'boom');
+		});
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: 'fails' }], updateTime: 0 },
+				],
+			}),
+		);
+		const { embedding } = fakeEmbedding();
+
+		await assert.rejects(() => collectFlow(embedding).run('recent'));
 	});
 });
 
@@ -1746,5 +1771,121 @@ describe('CollectAndSave — 임베딩 서킷브레이커', () => {
 		// 임베딩은 실패했어도 논문 자체는 저장된다(보정 패스가 벡터를 채운다).
 		assert.equal(vault.storedPapers().length, 8, '임베딩 실패로 논문까지 버려졌다');
 		assert.ok(vault.storedPapers().every((stored) => !stored.paper.embeddingSucceeded));
+	});
+});
+
+// ── 7번: skippedEntries 부분 재조회 (임시 기능) ────────────────────────
+describe('CollectAndSave.run — 스킵 항목이 SkippedEntries.json에 기록된다', () => {
+	it('id는 파싱됐는데 제목/초록이 빈 항목은 reason=missing-fields로 기록된다', async () => {
+		writeSubscriptionsFile(['ai']);
+		arxivOnly(feed([entry({ title: null, summary: null })], 1));
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).run('recent', { hours: 24 });
+
+		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
+		assert.ok(raw !== undefined, 'SkippedEntries.json이 기록되지 않았다');
+		const records = JSON.parse(raw) as { rawId: string; reason: string }[];
+		assert.equal(records.length, 1);
+		assert.equal(records[0]?.reason, 'missing-fields');
+		assert.equal(records[0]?.rawId, 'http://arxiv.org/abs/2501.00001v1');
+	});
+
+	it('id 자체가 없는 항목은 reason=no-id로 기록된다', async () => {
+		writeSubscriptionsFile(['ai']);
+		arxivOnly(feed([entry({ id: null })], 1));
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).run('recent', { hours: 24 });
+
+		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
+		assert.ok(raw !== undefined);
+		const records = JSON.parse(raw) as { reason: string }[];
+		assert.equal(records.length, 1);
+		assert.equal(records[0]?.reason, 'no-id');
+	});
+});
+
+describe('CollectAndSave.retrySkippedEntries — 부분 재조회', () => {
+	function seedSkippedEntries(
+		records: {
+			rawId: string;
+			reason: 'no-id' | 'missing-fields';
+		}[],
+	): void {
+		vault.files.set(
+			`${PLUGIN_DIR}/SkippedEntries.json`,
+			JSON.stringify(
+				records.map((r) => ({
+					rawId: r.rawId,
+					title: '',
+					reason: r.reason,
+					apiName: 'arxiv',
+					collectedQuery: { searchType: 'keyword', query: 'ai' },
+					skippedAt: 0,
+				})),
+			),
+		);
+	}
+
+	it('id_list 재조회로 필드가 채워지면 SkippedEntries.json에서 지워지고 Paper로 저장된다', async () => {
+		seedSkippedEntries([{ rawId: 'http://arxiv.org/abs/2501.00009v1', reason: 'missing-fields' }]);
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			if (param.url.includes('id_list=')) {
+				return response(200, feed([entry({ id: 'http://arxiv.org/abs/2501.00009v1' })], 1));
+			}
+			throw new Error(`예상 밖 요청: ${param.url}`);
+		});
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).retrySkippedEntries();
+
+		const stored = vault.storedPapers();
+		assert.equal(stored.length, 1);
+		assert.equal(stored[0]?.paper.sourceId, 'arxiv:2501.00009');
+		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
+		const remaining = JSON.parse(raw ?? '[]') as unknown[];
+		assert.equal(remaining.length, 0, '복구된 레코드가 파일에 그대로 남아 있다');
+	});
+
+	it('재조회해도 여전히 필드가 없으면 레코드가 그대로 남는다', async () => {
+		seedSkippedEntries([{ rawId: 'http://arxiv.org/abs/2501.00010v1', reason: 'missing-fields' }]);
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			if (param.url.includes('id_list=')) {
+				// id_list에 없는 것으로 응답(철회/여전히 깨짐) — 복구 실패.
+				return response(200, feed([], 0));
+			}
+			throw new Error(`예상 밖 요청: ${param.url}`);
+		});
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).retrySkippedEntries();
+
+		assert.equal(vault.storedPapers().length, 0);
+		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
+		const remaining = JSON.parse(raw ?? '[]') as { rawId: string }[];
+		assert.equal(remaining.length, 1);
+		assert.equal(remaining[0]?.rawId, 'http://arxiv.org/abs/2501.00010v1');
+	});
+
+	it("reason이 'no-id'인 레코드는 재조회 대상에서 제외되고 네트워크 요청도 없다", async () => {
+		seedSkippedEntries([{ rawId: '', reason: 'no-id' }]);
+		mockRequests((param) => {
+			throw new Error(`no-id 레코드인데 네트워크 요청이 나갔다: ${param.url}`);
+		});
+		const { embedding } = fakeEmbedding();
+
+		await collectFlow(embedding).retrySkippedEntries();
+
+		const raw = vault.files.get(`${PLUGIN_DIR}/SkippedEntries.json`);
+		const remaining = JSON.parse(raw ?? '[]') as { reason: string }[];
+		assert.equal(remaining.length, 1);
+		assert.equal(remaining[0]?.reason, 'no-id');
 	});
 });
