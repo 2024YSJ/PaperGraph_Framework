@@ -1,4 +1,4 @@
-import ForceGraph3D from '3d-force-graph';
+import ForceGraph3D, { type ForceGraph3DInstance } from '3d-force-graph';
 import { ArrowHelper, CanvasTexture, Scene, Sprite, SpriteMaterial, Vector3 } from 'three';
 import { GraphData, GraphNode } from './GraphData';
 import type { PCAResult } from './PCA';
@@ -26,6 +26,10 @@ export class Visualization {
 
 	// 컨테이너 크기 변화를 추적해 그래프 크기를 맞춘다(스크롤바 방지). 재렌더 시 정리.
 	private resizeObserver?: ResizeObserver;
+
+	// 현재 3d-force-graph 인스턴스. 재렌더·뷰 닫힘 때 _destructor()로 정리해 WebGL
+	// 컨텍스트가 새지 않게 한다(안 그러면 반복 리로드/재오픈에서 컨텍스트 한도를 넘겨 깨진다).
+	private forceGraph?: ForceGraph3DInstance;
 
 	setContainer(el: HTMLElement): void {
 		this.container = el;
@@ -76,10 +80,11 @@ export class Visualization {
 			throw new Error('Visualization.render: container가 없다 (setContainer 필요)');
 		}
 		container.replaceChildren(); // 재렌더 대비 초기화
-		this.resizeObserver?.disconnect(); // 이전 렌더의 옵저버 정리
+		this.dispose(); // 이전 인스턴스/옵저버 정리(WebGL 컨텍스트 해제)
 
 		// controlType 'orbit': 좌클릭 드래그=회전, 우클릭 드래그=이동(pan), 휠=줌.
 		const forceGraph = new ForceGraph3D(container, { controlType: 'orbit' });
+		this.forceGraph = forceGraph;
 		forceGraph
 			.graphData({ nodes: graph.nodes, links: graph.links })
 			// 좌표를 fx/fy/fz로 고정하므로 force 시뮬레이션은 불필요 — 0틱으로 꺼서
@@ -144,6 +149,16 @@ export class Visualization {
 				/* 전체 화면 거부 시 무시 */
 			});
 		}
+	}
+
+	// 3d-force-graph 인스턴스와 리사이즈 옵저버를 정리한다. 뷰가 닫힐 때(VisualizationView.
+	// onClose)와 재렌더 직전에 부른다 — WebGL 컨텍스트를 해제해 반복 재오픈/리로드에서
+	// 컨텍스트가 쌓여 한도를 넘기는 것을 막는다.
+	dispose(): void {
+		this.resizeObserver?.disconnect();
+		this.resizeObserver = undefined;
+		this.forceGraph?._destructor();
+		this.forceGraph = undefined;
 	}
 
 	// z 방향으로 축을 긋고, 연도 경계마다 라벨 스프라이트를 배치한다. 축은 논문 z 범위
