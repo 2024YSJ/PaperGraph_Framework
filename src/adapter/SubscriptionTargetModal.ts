@@ -42,6 +42,9 @@ export class SubscriptionTargetModal extends Modal {
 	private loaded = false;
 	private from: string;
 	private to: string;
+	// apiName(출처)별로 묶어 보여줄 때, 어느 그룹이 접혀 있는지 — ApiManagementModal의
+	// 같은 필드와 같은 이유(render()가 매번 새로 그려도 유지돼야 함)로 인스턴스 필드다.
+	private collapsedGroups = new Set<string>();
 
 	constructor(
 		app: App,
@@ -76,7 +79,8 @@ export class SubscriptionTargetModal extends Modal {
 			this.options = subscriptions.apis.map((api) => ({
 				apiName: api.apiName,
 				querys: api.querys,
-				label: `${api.apiName}: ${api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND ')}`,
+				// apiName 접두어는 뺀다 — 그룹 헤더(render()의 renderGroups)가 이미 보여준다.
+				label: api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
 				selected: true,
 			}));
 		} catch (e) {
@@ -121,13 +125,24 @@ export class SubscriptionTargetModal extends Modal {
 				}),
 			);
 
-		for (const option of this.options) {
-			new Setting(contentEl).setName(option.label).addToggle((toggle) =>
-				toggle.setValue(option.selected).onChange((value) => {
-					option.selected = value;
-				}),
-			);
+		const groupNames = new Set(this.options.map((option) => option.apiName));
+		if (groupNames.size > 1) {
+			new Setting(contentEl)
+				.addButton((button) =>
+					button.setButtonText('전체 펼치기').onClick(() => {
+						this.collapsedGroups.clear();
+						this.render();
+					}),
+				)
+				.addButton((button) =>
+					button.setButtonText('전체 접기').onClick(() => {
+						this.collapsedGroups = new Set(groupNames);
+						this.render();
+					}),
+				);
 		}
+
+		this.renderGroups(contentEl);
 
 		if (this.needsDateRange) {
 			new Setting(contentEl).setName('시작일').addText((text) => {
@@ -177,5 +192,66 @@ export class SubscriptionTargetModal extends Modal {
 					this.close();
 				}),
 		);
+	}
+
+	// options를 apiName(출처)별로 묶어 접을 수 있는 그룹으로 그린다 —
+	// ApiManagementModal.renderSubscriptionGroups와 같은 관례(그룹 헤더 + 요약 배지 +
+	// 들여쓴 자식 컨테이너)를 따른다. 두 UI가 같은 구독 데이터를 다른 화면(등록/관리 vs
+	// 실행 전 선택)에서 보여주는 것뿐이라, 그룹화 방식이 어긋나면 사용자가 두 화면을
+	// 다른 개념 모형으로 이해하게 된다.
+	private renderGroups(containerEl: HTMLElement): void {
+		const groups = new Map<string, SubscriptionOption[]>();
+		for (const option of this.options) {
+			const list = groups.get(option.apiName) ?? [];
+			list.push(option);
+			groups.set(option.apiName, list);
+		}
+		for (const [apiName, options] of groups) {
+			this.renderGroup(containerEl, apiName, options);
+		}
+	}
+
+	private renderGroup(containerEl: HTMLElement, apiName: string, options: SubscriptionOption[]): void {
+		const collapsed = this.collapsedGroups.has(apiName);
+		const selectedCount = options.filter((option) => option.selected).length;
+
+		const heading = new Setting(containerEl).setName(`${collapsed ? '▸' : '▾'} ${apiName}`).setHeading();
+		heading.nameEl.createSpan({
+			text: ` · ${options.length}개 중 ${selectedCount}개 선택`,
+			attr: {
+				style: 'font-size:0.8em; font-weight:normal; color: var(--text-muted); margin-left:6px;',
+			},
+		});
+		heading.settingEl.addEventListener('click', () => {
+			if (collapsed) {
+				this.collapsedGroups.delete(apiName);
+			} else {
+				this.collapsedGroups.add(apiName);
+			}
+			this.render();
+		});
+		heading.settingEl.setCssProps({ cursor: 'pointer' });
+
+		if (collapsed) {
+			return;
+		}
+
+		const childContainer = containerEl.createDiv({
+			attr: {
+				style:
+					'margin-left:16px; border-left:2px solid var(--background-modifier-border); padding-left:12px;',
+			},
+		});
+		for (const option of options) {
+			new Setting(childContainer).setName(option.label).addToggle((toggle) =>
+				toggle.setValue(option.selected).onChange((value) => {
+					option.selected = value;
+					// 배지("N개 중 K개 선택")가 실시간으로 맞으려면 다시 그려야 한다 — 예전엔
+					// 로컬 상태만 바꾸고 안 그렸는데, 그룹 배지가 생기면서 그 값이 화면과
+					// 어긋나지 않아야 한다.
+					this.render();
+				}),
+			);
+		}
 	}
 }

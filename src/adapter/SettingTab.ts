@@ -152,6 +152,25 @@ export class SettingTab extends PluginSettingTab {
 					}),
 			);
 
+		// citationsKnown이 이미 true인 논문은 수집 경로가 다시 조회하지 않는다(재시도 정책상
+		// 필요 없어서). 이 버튼은 그 스킵 규칙을 무시하고 저장된 전체 코퍼스의 인용수·제목·
+		// 초록을 강제로 다시 조회한다(지원하는 출처만, 출처 중립 — API.RefreshContent 참고).
+		// 내용이 실제로 달라진 논문만 임베딩도 함께 다시 계산한다.
+		new Setting(containerEl)
+			.setName('새로고침')
+			.setDesc(
+				'저장된 모든 논문의 인용수·제목·초록을 다시 조회하고, 내용이 바뀐 논문만 임베딩을 다시 계산합니다.',
+			)
+			.addButton((button) =>
+				button.setButtonText('새로고침').onClick(async () => {
+					try {
+						await this.plugin.eventListener.checking('ui:collect-refresh');
+					} catch (e) {
+						new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
+					}
+				}),
+			);
+
 		// 큐 상태. 수집 버튼을 잠그는 대신 "지금 무엇이 돌고 무엇이 줄 서 있는지"를 보여준다.
 		new Setting(containerEl).setName('대기열').then((setting) => {
 			this.queueStatusEl = setting.descEl;
@@ -272,7 +291,7 @@ export class SettingTab extends PluginSettingTab {
 					.setButtonText('열기')
 					.setCta()
 					.onClick(() => {
-						new ApiManagementModal(this.app).open();
+						new ApiManagementModal(this.app, this.plugin).open();
 					}),
 			);
 

@@ -1,7 +1,9 @@
 import { App, Menu, Notice } from 'obsidian';
 import type PaperGraph3D from '../main';
 import type { API } from '../collect/API';
+import type { SearchQuery } from '../collect/SearchQuery';
 import { Log } from '../common/Log';
+import { FailureNotifier } from '../common/Notify';
 import { SubscriptionTargetModal, type SubscriptionTarget } from './SubscriptionTargetModal';
 import {
 	CollectDoneMiddleware,
@@ -98,6 +100,22 @@ export type CollectSubscriptionProgress = SubscriptionProgressEntry;
 export class CollectController implements CollectProgressSink {
 	private activeFlow: ProgressFlow | undefined;
 	private progressListeners: (() => void)[] = [];
+
+	// silent 실행(스케줄러/명령어 팔레트)은 완료 Notice가 없어서, buildPartialFailureSuffix가
+	// 만드는 문구가 아무한테도 안 보인다 — 그런데 그 문구가 다루는 신호 중 "구조적 실패"
+	// (우연이 아니라 계속 반복될 성격의 실패)는 silent 여부와 무관하게 알려야 한다.
+	// FailureNotifier로 이유가 바뀔 때만 알려 스팸 없이 이 공백을 메운다(checkStructuralFailures
+	// 참고).
+	//
+	// 스킵 비율 이상치는 여기 없다(2026-08-13 검토 후 제외) — 원인(arXiv 응답 자체가
+	// 이상했다)에 대해 사용자가 할 수 있는 조치가 없고, recent 수집의 작은 표본에서는
+	// 비율이 우연히도 쉽게 튀어 노이즈가 크다는 판단.
+	private readonly citationRepairFailureNotifier = new FailureNotifier();
+
+	// 인용수 보정이 "시도는 했는데 하나도 못 고쳤다"고 판단할 최소 시도 편수. 1~2편은
+	// 그 논문들이 우연히 S2에 없었을 뿐일 수 있어 노이즈가 크다 — 몇 편 이상 전부
+	// 실패해야 "키/네트워크 문제"라는 구조적 신호로 본다.
+	private static readonly CITATION_REPAIR_MIN_ATTEMPTED = 3;
 
 	constructor(private readonly plugin: PaperGraph3D) {
 		this.registerDiagnostics();
@@ -232,6 +250,53 @@ export class CollectController implements CollectProgressSink {
 		);
 	}
 
+	// 신규 구독 등록 직후, 방금 등록한 구독 하나만 대상으로 자동 수집한다. runRecentAuto와
+	// 마찬가지로 silent(Notice 없음) — 등록 성공 Notice가 이미 떴으므로 별도 안내가
+	// 필요 없고, activeFlow/대기열 표시는 그대로 채워진다.
+	runRecentOneAuto(target: { apiName: string; querys: SearchQuery[] }): Promise<string | void> {
+		const label = describeTargets('최근 논문 수집', [target]);
+		return this.runWithProgress(
+			label,
+			(onStart, onTotal, onApiStart, onApiDone) =>
+				this.plugin.collectflow.run(
+					'recent',
+					{ targetSubscriptions: [target] },
+					onStart,
+					onTotal,
+					onApiStart,
+					onApiDone,
+				),
+			true,
+		);
+	}
+
+	// 전체 코퍼스 강제 새로고침(인용수 재조회 + 콘텐츠 동기화 + 조건부 재임베딩) — 설정 탭
+	// 「새로고침」 버튼이 부른다. runWithProgress(구독별 ProgressFlow.subscriptions 배열
+	// 전제)를 재사용하지 않는다 — refreshAll의 진행은 API/구독 단위가 아니라 코퍼스 전체
+	// 논문 수 기준 flat done/total이라 그 배열 구조와 안 맞는다. 대신 Notice 하나를 직접
+	// 갱신하는 가벼운 전용 처리를 쓴다 — Backfill/최근수집이 쓰는 "N/총M편" 어휘를 그대로
+	// 맞춘다.
+	async refreshAllAuto(): Promise<string | void> {
+		const label = '새로고침';
+		const notice = new Notice(`${label} — 준비 중...`, 0);
+		try {
+			await this.plugin.collectflow.refreshAll(undefined, (done, total) => {
+				notice.setMessage(`${label} — 처리 중 (${done}/${total}편)`);
+			});
+			const stats = this.plugin.collectflow.lastRefreshStats;
+			const detail = stats ? `${stats.citationsRefreshed}편 확인, ${stats.reembedded}편 재임베딩` : undefined;
+			new Notice(`${label} — 완료했습니다.${detail ? ` (${detail})` : ''}`);
+			Log.info('ui', `${label} 완료`, { detail });
+			return detail;
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			new Notice(`${label} — 실패했습니다: ${message}`);
+			Log.error('ui', `${label} 실패`, e);
+		} finally {
+			notice.hide();
+		}
+	}
+
 	// 수집 요청 하나를 진행률과 함께 실행한다. silent=true면 Notice를 만들지 않는다
 	// (스케줄러/명령어 팔레트처럼 원래 조용히 도는 게 설계 의도인 실행용 — runRecentAuto
 	// 참고) — activeFlow/구독별 진행(SettingTab이 읽는 단일 진실 공급원)은 silent 여부와
@@ -326,6 +391,9 @@ export class CollectController implements CollectProgressSink {
 				this.notifyProgress();
 			}
 		}
+		// silent 여부·수집 편수와 무관하게 항상 확인한다 — 구조적 실패는 "0편 수집"으로
+		// 끝난 실행에서도 일어날 수 있다.
+		this.checkStructuralFailures();
 		if (flow.collected === undefined) {
 			return undefined;
 		}
@@ -335,10 +403,72 @@ export class CollectController implements CollectProgressSink {
 		// 피하려고 다음 플러그인 로드 때의 전수 보정으로 미뤘다(CollectAndSave.runNow 끝
 		// 주석 참고). 그러니 여기서는 "지금 몇 편 실패했다"만 사실대로 알리고, 언제
 		// 복구되는지도 같이 말한다.
-		const failed = this.plugin.collectflow.lastStats?.embedFailed ?? 0;
-		return failed > 0
-			? `${flow.collected}편 수집, 그중 ${failed}편 임베딩 실패 — 다음 플러그인 로드 때 자동으로 재시도됩니다`
-			: `${flow.collected}편 수집`;
+		//
+		// embedFailed 외에도 "부분 성공"을 나타내는 신호가 더 있다(CollectAndSave.CollectStats
+		// 참고) — 조용히 넘어가면 사용자는 완료 Notice만 보고 전부 다 됐다고 오해한다.
+		// 전부 정상이면(추가 신호가 하나도 없으면) 예전처럼 편수만 보여준다 — 매번 문구가
+		// 늘어나면 정작 이상이 있을 때 눈에 덜 띈다.
+		return `${flow.collected}편 수집${this.buildPartialFailureSuffix()}`;
+	}
+
+	// CollectStats의 부분 실패 신호들을 사람이 읽을 문구로 이어붙인다. 신호가 하나도
+	// 없으면 빈 문자열 — 정상 실행에서는 완료 Notice가 예전 그대로("N편 수집")로 보이게
+	// 한다.
+	private buildPartialFailureSuffix(): string {
+		const stats = this.plugin.collectflow.lastStats;
+		if (!stats) {
+			return '';
+		}
+		const parts: string[] = [];
+		if (stats.embedFailed > 0) {
+			parts.push(`${stats.embedFailed}편 임베딩 실패 — 다음 플러그인 로드 때 자동으로 재시도됩니다`);
+		}
+		if (stats.citationRetryOverflow > 0) {
+			// 이번 실행의 자동 재시도(500편 상한)에서 빠진 것뿐, 유실은 아니다 — 다음
+			// 플러그인 로드 때의 전수 보정이 결국 잡는다(MAX_TRACKED_CITATION_FAILURES 주석).
+			parts.push(`${stats.citationRetryOverflow}편은 인용수 재시도 대상이 너무 많아 이번엔 건너뜀`);
+		}
+		if (stats.skippedEntries > 0) {
+			parts.push(`${stats.skippedEntries}건은 데이터 형식이 맞지 않아 건너뜀`);
+		}
+		if (stats.anyTruncated) {
+			parts.push('일부 구간은 다 훑지 못해 다음 실행에서 이어집니다');
+		}
+		if (stats.failedSubscriptions.length > 0) {
+			// 사유(f.error, CollectAndSave.collect의 describeFailure — "HTTP 503" 등 짧은
+			// 형태)와 힌트(f.hint — "그래서 뭘 확인하면 되는지")까지 같이 보여준다. 어느
+			// 구독인지만 알아서는 왜 실패했는지, 내가 뭘 할 수 있는지(예: 401이면 키 문제,
+			// 503이면 기다리면 됨) 알 수 없다 — 힌트가 빈 문자열이면(원인을 특정 못 함)
+			// 사유만 보여준다.
+			const detail = stats.failedSubscriptions
+				.map((f) => `${f.apiName}(${f.error}${f.hint ? ` — ${f.hint}` : ''})`)
+				.join(', ');
+			parts.push(`${detail} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
+		}
+		return parts.length > 0 ? `, ${parts.join(', ')}` : '';
+	}
+
+	// buildPartialFailureSuffix가 다루는 신호들은 완료 Notice에 딸려가는 문구라 silent
+	// 실행(스케줄러 등)에서는 아무도 못 본다. 그중 "우연이 아니라 계속 반복될 성격"인
+	// 신호만 silent 여부와 무관하게 별도 Notice로 알린다 — 나머지(임베딩 실패 몇 편,
+	// 스킵 몇 건 등)는 자동 복구되거나 애초에 흔한 일이라 완료 Notice로 충분하다.
+	//
+	// 이유가 바뀔 때만 알리므로(FailureNotifier) 같은 원인이 반복되는 동안은 조용하다 —
+	// 스케줄러가 몇 시간마다 도는데 매번 뜨면 그 자체가 스팸이 된다.
+	private checkStructuralFailures(): void {
+		const citationStats = this.plugin.collectflow.lastCitationRepairStats;
+		if (citationStats && citationStats.attempted >= CollectController.CITATION_REPAIR_MIN_ATTEMPTED) {
+			if (citationStats.citationsFixed === 0) {
+				this.citationRepairFailureNotifier.notifyFailure(
+					'citation-repair-empty',
+					() =>
+						`PaperGraph3D: 인용수 보정이 ${citationStats.attempted}편을 시도했지만 하나도 ` +
+						`성공하지 못했습니다 — Semantic Scholar 키/네트워크 상태를 확인하세요.`,
+				);
+			} else {
+				this.citationRepairFailureNotifier.notifySuccess();
+			}
+		}
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는

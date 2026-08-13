@@ -1,5 +1,8 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
+import type PaperGraph3D from '../main';
 import { File } from '../common/File';
+import { Log } from '../common/Log';
+import { FailureNotifier } from '../common/Notify';
 import { SearchQuery } from '../collect/SearchQuery';
 import { KEY_VALIDATORS } from '../collect/SecretValidation';
 
@@ -62,7 +65,21 @@ export class ApiManagementModal extends Modal {
 	// 어떤 조상이 실제로 스크롤되는지 브라우저가 알아서 찾아주므로 이 가정 자체가 필요 없다.
 	private scrollToNewCard = false;
 
-	constructor(app: App) {
+	// 구독 카드를 apiName(출처)별로 묶어 보여줄 때, 어느 그룹이 접혀 있는지. render()가
+	// contentEl.empty()로 매번 다시 그려도 이 Set은 인스턴스 필드라 유지된다. 기본은
+	// 빈 Set(전부 펼침) — 예전처럼 전부 보이는 상태를 그대로 유지한다.
+	private collapsedGroups = new Set<string>();
+
+	// 신규 구독 자동 수집(runRecentOneAuto)은 silent라 Notice가 없고, 실패도 원래
+	// 로그만 남기고 조용히 넘어갔다 — 그러면 "저장 성공" Notice만 뜨고 뒤이은 실패는
+	// 사용자가 알 방법이 없었다. FailureNotifier로 이유가 바뀔 때만 알려 스팸 없이
+	// 이 공백을 메운다. 모달을 열 때마다 새 인스턴스라 게이팅도 그때그때 초기화되는데,
+	// 이 동작은 한 모달 세션 안에서 반복 저장할 때만 스팸을 막으면 충분해 문제 없다.
+	private readonly recentOneFailureNotifier = new FailureNotifier();
+
+	// plugin 참조는 저장 성공 직후 방금 등록한 구독 하나만 자동 수집하기 위해
+	// EventListener('ui:collect-recent-one')를 호출할 때 필요하다.
+	constructor(app: App, private readonly plugin: PaperGraph3D) {
 		super(app);
 	}
 
@@ -142,15 +159,8 @@ export class ApiManagementModal extends Modal {
 					.onClick(() => {
 						button.setDisabled(true);
 						void this.persistApiKey()
-							.then(({ provider, valid, detail }) => {
-								if (valid) {
-									new Notice(`${provider} 키를 저장하고 확인했습니다 — 정상 동작합니다.`);
-								} else {
-									new Notice(
-										`${provider} 키를 저장했습니다. 다만 확인 중 문제가 있었습니다: ` +
-											`${detail ?? '알 수 없음'} — 나중에 다시 확인하세요.`,
-									);
-								}
+							.then(({ provider }) => {
+								new Notice(`${provider} 키를 저장하고 확인했습니다 — 정상 동작합니다.`);
 							})
 							.catch((e: unknown) => {
 								new Notice(`API 키 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
@@ -253,6 +263,9 @@ export class ApiManagementModal extends Modal {
 							newConditionQuery: '',
 							saved: false, // 아직 디스크에 없다 — 「저장」을 눌러야 진짜 구독이 된다.
 						});
+						// 이 apiName 그룹이 접혀 있었으면 펼친다 — 안 그러면 방금 추가한 카드가
+						// 접힌 그룹 안에 숨어 scrollToNewCard가 무의미해진다.
+						this.collapsedGroups.delete(this.apiNameDraft);
 						// 여기서는 저장하지 않는다 — 조건 0개인 채로 저장하면 다음 수집이
 						// "querys is empty"로 반드시 실패한다(persistSubscriptions의 필터와
 						// 짝이다). 아래 카드에서 조건을 채우고 「저장」을 눌러야 실제로 기록된다.
@@ -265,9 +278,7 @@ export class ApiManagementModal extends Modal {
 					}),
 			);
 
-		for (const api of this.apiDrafts) {
-			this.renderApiDraft(contentEl, api);
-		}
+		this.renderSubscriptionGroups(contentEl);
 
 		// 저장 버튼은 화면 전체에 딱 1개, 맨 아래에만 둔다 — 미저장 카드는 위의
 		// hasUnsavedDraft 가드 덕분에 항상 최대 1개뿐이므로, "지금 저장할 대상"도 항상
@@ -287,6 +298,29 @@ export class ApiManagementModal extends Modal {
 								.then((ok) => {
 									if (ok) {
 										new Notice(`${unsavedDraft.apiName} 구독을 저장했습니다.`);
+										// 신규 구독 등록 직후 그 구독 하나만 자동으로 1회 수집한다
+										// (TaskManager 경유 — collect:recent-one). 저장 자체는 이미
+										// 성공했으므로 실패해도 실행을 막지는 않지만, 완전히 조용히
+										// 넘어가진 않는다 — 이유가 바뀔 때만 Notice로도 알린다
+										// (FailureNotifier, 스팸 방지).
+										const querys = unsavedDraft.conditions.map(
+											(c): SearchQuery => ({ searchType: c.searchType, query: c.query }),
+										);
+										void this.plugin.eventListener
+											.checking('ui:collect-recent-one', {
+												apiName: unsavedDraft.apiName,
+												querys,
+											})
+											.then(() => this.recentOneFailureNotifier.notifySuccess())
+											.catch((e) => {
+												Log.error('ui', '신규 구독 자동 수집 실패', e);
+												const reason = e instanceof Error ? e.message : String(e);
+												this.recentOneFailureNotifier.notifyFailure(
+													reason,
+													(r) =>
+														`PaperGraph3D: ${unsavedDraft.apiName} 구독의 자동 수집이 실패했습니다 — ${r}`,
+												);
+											});
 									}
 								})
 								.finally(() => {
@@ -359,15 +393,12 @@ export class ApiManagementModal extends Modal {
 	// 물어보며 자동 판별할 필요가 없다), 그 provider의 validator 하나에만 실제 요청을
 	// 보내 저장과 동시에 검증한다.
 	//
-	// invalid-key(401/403 등 명확히 틀린 키)면 저장을 막는다 — 잘못 저장하면 다음 보강
-	// 요청마다 같은 실패가 반복된다. network-error(일시적 문제일 수 있음)는 저장은 하되
-	// 결과를 그대로 호출자에게 돌려줘 Notice로 알리게 한다 — 오프라인일 때도 키 등록
-	// 자체는 막지 않기 위함이다.
-	private async persistApiKey(): Promise<{
-		provider: string;
-		valid: boolean;
-		detail?: string;
-	}> {
+	// valid:true로 실제 확인된 키만 저장한다 — invalid-key(401/403 등 명확히 틀린 키)는
+	// 물론이고, network-error(오프라인 등 이 순간엔 판단이 안 되는 경우)도 막는다.
+	// "일단 저장해두고 나중에 확인"을 허용하면, 확인되지 않은 키가 계속 저장돼 있는
+	// 채로 다음 보강 요청마다 같은 실패가 조용히 반복될 수 있다 — 지금 확실히 통하는
+	// 키만 들어오게 한다(2026-08-13 결정).
+	private async persistApiKey(): Promise<{ provider: string }> {
 		const provider = this.apiKeyProviderDraft;
 		const key = this.apiKeyValueDraft.trim();
 		if (key.length === 0) {
@@ -378,14 +409,18 @@ export class ApiManagementModal extends Modal {
 			throw new Error(`등록되지 않은 provider입니다: ${provider}`);
 		}
 		const result = await validator.validate(key);
-		if (!result.valid && result.reason === 'invalid-key') {
-			throw new Error(`${provider} 키가 유효하지 않습니다 — 저장하지 않았습니다.`);
+		if (!result.valid) {
+			const reason =
+				result.reason === 'invalid-key'
+					? '키가 유효하지 않습니다'
+					: `확인할 수 없습니다${result.detail ? ` (${result.detail})` : ''} — 네트워크 상태를 확인하고 다시 시도하세요`;
+			throw new Error(`${provider} 키를 ${reason} — 저장하지 않았습니다.`);
 		}
 		const secret = await File.readSecret();
 		secret.setKey(provider, key);
 		await File.writeSecret(secret);
 		this.registeredKeys[provider] = key;
-		return { provider, valid: result.valid, detail: result.detail };
+		return { provider };
 	}
 
 	// 등록된 키 하나를 즉시 삭제한다 — 검증이 필요 없는(존재를 없애는) 동작이라 「저장」
@@ -506,9 +541,102 @@ export class ApiManagementModal extends Modal {
 		this.render();
 	}
 
+	// apiDrafts를 apiName(수집 출처)별로 묶어 접을 수 있는 그룹으로 그린다. 같은 apiName에
+	// 여러 구독(조건 묶음)을 등록할 수 있는데(위 "API 추가" 주석 참고), 예전에는 그 카드들이
+	// 화면에서 flat하게 나열돼 "이게 다 같은 출처인지" 한눈에 안 들어왔다는 피드백으로
+	// 트리 구조로 바꿨다. Subscriptions.apis 자체는 여전히 flat 배열이라(File.ts 참고)
+	// 데이터 모델은 안 바뀐다 — 순수하게 렌더링만 그룹 단위로 재구성한다.
+	private renderSubscriptionGroups(containerEl: HTMLElement): void {
+		const groups = new Map<string, ApiDraft[]>();
+		for (const draft of this.apiDrafts) {
+			const list = groups.get(draft.apiName) ?? [];
+			list.push(draft);
+			groups.set(draft.apiName, list);
+		}
+		if (groups.size === 0) {
+			return;
+		}
+
+		// 그룹이 여럿일 때만 접기/펼치기가 의미 있다 — 하나뿐이면 항상 펼쳐진 것과 같다.
+		if (groups.size > 1) {
+			new Setting(containerEl)
+				.addButton((button) =>
+					button.setButtonText('전체 펼치기').onClick(() => {
+						this.collapsedGroups.clear();
+						this.render();
+					}),
+				)
+				.addButton((button) =>
+					button.setButtonText('전체 접기').onClick(() => {
+						this.collapsedGroups = new Set(groups.keys());
+						this.render();
+					}),
+				);
+		}
+
+		// File.supportedApiNames() 순서를 기준으로 정렬 — 렌더마다 Map 순회 순서가 흔들리지
+		// 않게 고정한다(apiDrafts.push 순서에 기대면 삭제/재추가로 순서가 뒤섞일 수 있다).
+		const orderedNames = File.supportedApiNames().filter((name) => groups.has(name));
+		for (const apiName of orderedNames) {
+			const drafts = groups.get(apiName);
+			if (drafts) {
+				this.renderSubscriptionGroup(containerEl, apiName, drafts);
+			}
+		}
+	}
+
+	private renderSubscriptionGroup(containerEl: HTMLElement, apiName: string, drafts: ApiDraft[]): void {
+		const collapsed = this.collapsedGroups.has(apiName);
+		const unsavedCount = drafts.filter((draft) => !draft.saved).length;
+
+		const heading = new Setting(containerEl).setName(`${collapsed ? '▸' : '▾'} ${apiName}`).setHeading();
+		heading.nameEl.createSpan({
+			text:
+				unsavedCount > 0
+					? ` · 구독 ${drafts.length}개 · 저장 안 됨 ${unsavedCount}개`
+					: ` · 구독 ${drafts.length}개`,
+			attr: {
+				style: 'font-size:0.8em; font-weight:normal; color: var(--text-muted); margin-left:6px;',
+			},
+		});
+		// 헤더 행 전체를 클릭하면 접기/펼치기 — 이 헤더엔 다른 버튼이 없어 클릭 영역이
+		// 겹칠 일이 없다(구독 삭제 등은 아래 카드 쪽에 있다).
+		heading.settingEl.addEventListener('click', () => {
+			if (collapsed) {
+				this.collapsedGroups.delete(apiName);
+			} else {
+				this.collapsedGroups.add(apiName);
+			}
+			this.render();
+		});
+		heading.settingEl.setCssProps({ cursor: 'pointer' });
+
+		if (collapsed) {
+			return;
+		}
+
+		const childContainer = containerEl.createDiv({
+			attr: {
+				style:
+					'margin-left:16px; border-left:2px solid var(--background-modifier-border); padding-left:12px;',
+			},
+		});
+		for (const draft of drafts) {
+			this.renderApiDraft(childContainer, draft);
+		}
+	}
+
 	private renderApiDraft(containerEl: HTMLElement, api: ApiDraft): void {
+		// 카드 제목은 이제 조건 요약이다 — apiName은 그룹 헤더가 이미 보여주므로 여기서
+		// 또 반복하면 중복이다.
+		const summary =
+			api.conditions.length > 0
+				? api.conditions
+						.map((c) => `${CONDITION_TYPE_LABEL[c.searchType] ?? c.searchType}:${c.query}`)
+						.join(' · ')
+				: '(조건 없음)';
 		const heading = new Setting(containerEl)
-			.setName(api.apiName)
+			.setName(summary)
 			.setHeading()
 			.addButton((button) =>
 				button.setButtonText('API 삭제').onClick(() => {
@@ -539,6 +667,12 @@ export class ApiManagementModal extends Modal {
 				);
 		}
 
+		// 이미 상한(3개)을 채웠으면 더 추가할 수 없으니 버튼 자체를 안 그린다 — 눌러도
+		// Notice로 막히기만 하는 죽은 버튼을 남겨두지 않는다.
+		if (api.conditions.length >= MAX_CONDITIONS_PER_API) {
+			return;
+		}
+
 		new Setting(containerEl)
 			.setName('조건 추가')
 			.setDesc(`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). 여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요.`)
@@ -562,11 +696,8 @@ export class ApiManagementModal extends Modal {
 					if (api.newConditionQuery.trim().length === 0) {
 						return;
 					}
-					// 004의 결합 규칙 — 한 구독의 조건은 최대 3개, 전부 AND.
-					if (api.conditions.length >= MAX_CONDITIONS_PER_API) {
-						new Notice(`조건은 API당 최대 ${MAX_CONDITIONS_PER_API}개까지 등록할 수 있습니다.`);
-						return;
-					}
+					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상
+					// 여유가 있다.
 					api.conditions.push({
 						searchType: api.newConditionType,
 						query: api.newConditionQuery.trim(),
