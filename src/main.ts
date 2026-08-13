@@ -165,9 +165,10 @@ export default class PaperGraph3D extends Plugin {
 		collectRecentTask.func = () => this.collectController.runRecentAuto();
 		this.taskManager.setTask(collectRecentTask);
 
-		const collectRepairTask = new Task();
-		collectRepairTask.taskName = 'collect:repair';
-		collectRepairTask.func = () => this.collectflow.repair();
+		const collectRepairTask: Task = {
+			taskName: 'collect:repair',
+			func: () => this.collectflow.repair(),
+		};
 		this.taskManager.setTask(collectRepairTask);
 
 		this.eventListener.setEventListener('ui:collect-recent', 'collect:recent');

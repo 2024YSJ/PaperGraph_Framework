@@ -121,9 +121,11 @@ Class TaskManager {
 }
 
 
-Class Task {
+interface Task {
 	+ string taskName			// task 이름
 	+ func 						// 사용자가 등록한 함수.
+	// (2026-08-09 확정) class가 아니라 interface — Middleware와 같은 확장 패턴.
+	// 개발자가 class로 implements해서 taskName/func 외 필드를 얹은 Task를 만들 수 있다.
 }
 
 
