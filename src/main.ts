@@ -7,6 +7,7 @@ import { Visualization } from './visualize/Visualization';
 import {
 	CitationColorMiddleware,
 	CitationEdgeMiddleware,
+	EdgeToggleMiddleware,
 	OpenNoteOnClickMiddleware,
 } from './visualize/VisualMiddlewares';
 import { EventListener } from './common/EventListener';
@@ -132,6 +133,8 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.setMiddleware(new OpenNoteOnClickMiddleware(this.app));
 		// 논문 간 인용 관계를 엣지로 그리는 시각화 미들웨어 등록.
 		this.visualflow.setMiddleware(new CitationEdgeMiddleware());
+		// 엣지를 껐다 켜는 스위치 UI 시각화 미들웨어 등록.
+		this.visualflow.setMiddleware(new EdgeToggleMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
 		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
 		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
