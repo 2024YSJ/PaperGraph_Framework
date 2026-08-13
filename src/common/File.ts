@@ -1,9 +1,10 @@
 import { TFile, Vault } from 'obsidian';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
-import { Paper } from '../collect/Paper';
+import { ExtraData, Paper } from '../collect/Paper';
 import { API, ArxivAPI } from '../collect/API';
 import { SearchQuery } from '../collect/SearchQuery';
+import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
 
 // .json 저장 래퍼. schemaVersion은 향후 대비 상수(현재 분기/마이그레이션엔 안 씀).
 // 설계 근거: docs/devLog/002.md.
@@ -65,6 +66,21 @@ export class File {
 
 	static writeSecret(secret: Secret): Promise<void> {
 		return File.writeConfig('Secret.json', secret.toJSON(), (text) => File.obfuscate(text));
+	}
+
+	// 자동 수집 스케줄 설정. Secret처럼 민감한 값이 아니라 평문으로 저장한다(난독화 없음).
+	// 저장된 값 중 일부 필드가 없어도(구버전 파일, 수동 편집 등) 죽지 않도록 기본값과
+	// 병합한다 — 새 필드를 추가해도 기존 Schedule.json이 그대로 읽힌다.
+	static readScheduleSettings(): Promise<ScheduleSettings> {
+		return File.readConfig(
+			'Schedule.json',
+			(raw) => ({ ...DEFAULT_SCHEDULE_SETTINGS, ...(raw as Partial<ScheduleSettings>) }),
+			() => ({ ...DEFAULT_SCHEDULE_SETTINGS }),
+		);
+	}
+
+	static writeScheduleSettings(settings: ScheduleSettings): Promise<void> {
+		return File.writeConfig('Schedule.json', settings);
 	}
 
 	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json
@@ -328,8 +344,21 @@ export class File {
 			paper.embeddingSucceeded = true;
 		}
 
-		// 재스캔(4일 보정 창)이 같은 논문을 다시 저장 대상으로 올려도, 위 두 단계(출처
-		// 병합·임베딩 보존)를 거친 뒤 실제 값이 기존과 완전히 같으면 디스크에 다시 쓰지
+		// 백스톱: 미들웨어가 채운 extra(요약·클러스터 라벨 등)를 지킨다. API에서 갓 받아온
+		// Paper의 extra는 비어 있어서, 그대로 저장하면 전에 붙여둔 요약이 통째로 지워진다.
+		// 수집 경로는 CollectAndSave.prefillFromStore가 저장본의 extra를 미리 얹어 이 상황을
+		// 만들지 않지만, 저장하는 곳은 그 경로만이 아니다(보정·설정탭 테스트 버튼, 앞으로
+		// 생길 호출자). 위 임베딩 백스톱과 같은 이유로 마지막 길목인 여기서 한 번 더 막는다.
+		//
+		// 키 단위로 합치되 이번에 들어온 값이 이기므로, 미들웨어가 요약을 새로 계산해 덮는
+		// 것은 정상 동작한다. 다만 이 규칙 때문에 키를 지우는 것은 불가능하다 — 지워야 한다면
+		// 미들웨어가 저장본을 읽어 직접 다시 써야 한다.
+		// (extra가 없던 시절 파일은 existing.paper.extra가 undefined인데, Object.assign이
+		// 그냥 건너뛰므로 들어온 값만 남아 지금과 같다.)
+		paper.extra = Object.assign(new ExtraData(), existing?.paper.extra, paper.extra);
+
+		// 재스캔(4일 보정 창)이 같은 논문을 다시 저장 대상으로 올려도, 위 세 단계(출처
+		// 병합·임베딩 보존·extra 보존)를 거친 뒤 실제 값이 기존과 완전히 같으면 디스크에 다시 쓰지
 		// 않는다. 무조건 쓰면 (1) 내용이 똑같은데 파일 감시자/동기화가 매번 깨어나고,
 		// (2) updatedAt이 매번 지금 시각으로 갱신돼 "이 논문이 실제로 마지막으로 바뀐
 		// 시점"이라는 정보 자체가 사라진다. 인용수 보강이나 새 구독의 출처 추가처럼 값이
@@ -404,8 +433,47 @@ export class File {
 			File.arraysEqual(a.references, b.references) &&
 			File.arraysEqual(a.embedding, b.embedding) &&
 			File.arraysEqual(a.collectedApis, b.collectedApis) &&
-			File.searchQueriesEqual(a.collectedQueries, b.collectedQueries)
+			File.searchQueriesEqual(a.collectedQueries, b.collectedQueries) &&
+			File.extraEqual(a.extra, b.extra)
 		);
+	}
+
+	// extra는 미들웨어가 필드를 늘려가는 자리라 위처럼 필드를 열거할 수 없다. 그래서 키를
+	// 정렬해 맞춘 뒤 값끼리 비교한다 — 필드가 추가된 순서가 달라도 내용이 같으면 같은
+	// 것이므로 객체를 통째로 JSON.stringify하지는 않는다(이유는 papersEqual 주석과 같다).
+	// 이 비교가 빠지면 미들웨어가 채운 요약·클러스터 라벨이 "변경 없음"으로 판정돼
+	// 저장되지 않고 사라진다.
+	//
+	// 값 타입을 가리지 않는다 — 미들웨어가 문자열(요약), 숫자(클러스터 번호), 배열, 중첩
+	// 객체 무엇을 넣든 JSON 표현으로 비교한다(encodeExtra).
+	//
+	// 인자가 없을 수 있다: extra가 생기기 전에 저장된 파일에는 이 키가 아예 없어서,
+	// JSON.parse로 되살린 저장본(papersEqual의 b)은 extra가 undefined다. 빈 객체로 보면
+	// "저장본엔 아무것도 없었다"와 뜻이 같아 그대로 맞아떨어진다.
+	private static extraEqual(a: ExtraData | undefined, b: ExtraData | undefined): boolean {
+		const left = File.encodeExtra(a);
+		const right = File.encodeExtra(b);
+		return left.length === right.length && left.every((item, i) => item === right[i]);
+	}
+
+	// extra를 "저장하면 파일에 실제로 남을 모습"으로 바꾼다 — 키를 정렬한 `"키":값` 목록.
+	// 정렬하는 이유는 extraEqual 주석 참고(필드가 추가된 순서에 흔들리지 않게).
+	//
+	// 값이 undefined이거나 함수면 JSON.stringify가 그 키를 통째로 빼므로 여기서도 뺀다.
+	// 남겨두면 저장본과 영원히 달라져 매 저장마다 파일을 다시 쓰게 된다 — 미들웨어가
+	// `extra.clusterId = map.get(id)`처럼 썼다가 못 찾으면 바로 이 상황이다.
+	//
+	// 키도 JSON.stringify로 감싸 인코딩이 겹치지 않게 한다(키에 ':'가 들어가도 안전).
+	private static encodeExtra(extra: ExtraData | undefined): string[] {
+		const source = (extra ?? {}) as Record<string, unknown>;
+		const encoded: string[] = [];
+		for (const key of Object.keys(source).sort()) {
+			const value = JSON.stringify(source[key]);
+			if (value !== undefined) {
+				encoded.push(`${JSON.stringify(key)}:${value}`);
+			}
+		}
+		return encoded;
 	}
 
 	private static arraysEqual<T>(a: T[], b: T[]): boolean {
@@ -417,6 +485,71 @@ export class File {
 			a.length === b.length &&
 			a.every((q, i) => q.searchType === b[i]?.searchType && q.query === b[i]?.query)
 		);
+	}
+
+	// (apiName, querys) 조합의 신원 키. filterSubscriptions/removeSubscription이 이
+	// 키로 "같은 구독인가"를 판정한다(둘 다 여러 후보를 Set으로 한 번에 걸러야 해서 문자열
+	// 키가 편하다) — resolveSubscriptionCursor/hasDuplicateSubscription은 후보가 한둘뿐이라
+	// 그냥 searchQueriesEqual로 직접 비교한다. 두 비교 방식 모두 "순서까지 같아야 같은
+	// 구독"이라는 같은 정의를 따른다는 점만 어긋나지 않게 유지하면 된다.
+	private static subscriptionKey(apiName: string, querys: SearchQuery[]): string {
+		return JSON.stringify([apiName, querys.map((q) => [q.searchType, q.query])]);
+	}
+
+	// 등록된 구독(apis) 중 targets에 지정된 (apiName, querys)와 일치하는 것만 남긴다.
+	// Backfill/Recent 실행 시 "이번엔 이 구독들만" 좁히는 타겟팅 기능이 쓴다 — 실제 구독
+	// 인스턴스가 아니라 신원(문자열 키)만 넘겨받으므로, 호출자는 File.createApi 없이도
+	// 어떤 구독을 원하는지 표현할 수 있다.
+	static filterSubscriptions(
+		apis: API[],
+		targets: { apiName: string; querys: SearchQuery[] }[],
+	): API[] {
+		const keys = new Set(targets.map((t) => File.subscriptionKey(t.apiName, t.querys)));
+		return apis.filter((api) => keys.has(File.subscriptionKey(api.apiName, api.querys)));
+	}
+
+	// 등록된 구독(apis) 중 target과 일치하는 것 하나만 제거한 나머지를 돌려준다.
+	// ApiManagementModal의 「API 삭제」가 쓴다 — 그 카드 하나만 지워야 하는데, 기존
+	// persistSubscriptions()로 처리하면 조건 1개 이상인 다른 모든 draft(그중엔 아직
+	// 「저장」을 안 누른 미저장 편집도 있을 수 있다)까지 통째로 커밋해버리는 문제가 있었다.
+	static removeSubscription(
+		apis: API[],
+		target: { apiName: string; querys: SearchQuery[] },
+	): API[] {
+		const key = File.subscriptionKey(target.apiName, target.querys);
+		return apis.filter((api) => File.subscriptionKey(api.apiName, api.querys) !== key);
+	}
+
+	// 저장된 구독 중 (apiName, querys)가 정확히 일치하는 항목의 커서를 찾는다. 없으면 0.
+	//
+	// "조건을 고치는 순간 새 구독으로 본다"는 규칙의 구현 지점이다 — 구독의 신원은
+	// UUID 같은 별도 필드가 아니라 (apiName, querys) 그 자체이므로, 저장 시점에 이전
+	// 저장본과 내용이 완전히 같은 것만 같은 구독으로 인정해 커서를 이어받는다. 조건을
+	// 하나라도 바꾸면 매칭이 실패해 0(새 구독)에서 시작하는데, recent 수집은 커서 유무와
+	// 무관하게 recentRescanWindowMs 폭의 롤링 윈도우만 훑으므로(API.ts 참고) 이 손실의
+	// 실제 비용은 없다 — 그 대가로 구독 편집 중 동시성 문제(예전 커서 스냅샷 되돌림)가
+	// 구조적으로 사라진다.
+	static resolveSubscriptionCursor(existingApis: API[], apiName: string, querys: SearchQuery[]): number {
+		const match = existingApis.find(
+			(a) => a.apiName === apiName && File.searchQueriesEqual(a.querys, querys),
+		);
+		return match ? match.updateTime : 0;
+	}
+
+	// 저장하려는 구독 목록 안에 (apiName, querys)가 정확히 같은 항목이 둘 이상 있는가.
+	// 있으면 File.updateApiCursors의 `.find()`가 첫 매치만 골라 커서가 둘 중 하나로만
+	// 갱신되는 모호함이 생긴다 — 저장 시점에 막아 애초에 그 상태가 만들어지지 않게 한다.
+	static hasDuplicateSubscription(apis: { apiName: string; querys: SearchQuery[] }[]): boolean {
+		for (let i = 0; i < apis.length; i += 1) {
+			for (let j = i + 1; j < apis.length; j += 1) {
+				const a = apis[i];
+				const b = apis[j];
+				if (a && b && a.apiName === b.apiName && File.searchQueriesEqual(a.querys, b.querys)) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	// ── config 공통: encode/decode는 옵션(기본=평문 통과). Secret만 난독화 변환을 넘긴다.

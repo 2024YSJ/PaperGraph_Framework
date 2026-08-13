@@ -8,15 +8,14 @@ export class TaskManager {
 		this.tasks.push(task);
 	}
 
-	// 실행 계열: taskName은 등록 시점에 유일한 식별자로 쓰인다(find). 같은 이벤트에
-	// 여러 task를 거는 팬아웃은 EventListener.events 쪽 책임이라 여기서는 다루지 않는다.
-	// 미등록 taskName은 throw(File.createApi의 미등록 apiName과 같은 규칙). 실행 에러도
-	// 삼키지 않고 그대로 전파한다 — 호출자(커맨드/UI)가 실제 실패를 봐야 한다.
+	// taskName에 등록된 func를 찾아 그대로 호출한다. func가 Promise를 반환하면 그 결과를
+	// 기다렸다가 돌려준다 — 동기 함수를 반환해도(EventListener.checking을 fire-and-forget
+	// 없이 await하는 호출부 입장에서) 항상 Promise 하나로 취급할 수 있다.
 	async runTask(taskName: string, ...args: unknown[]): Promise<unknown> {
 		const task = this.tasks.find((t) => t.taskName === taskName);
 		if (!task) {
-			throw new Error(`No task registered with name: ${taskName}`);
+			throw new Error(`등록되지 않은 작업입니다: ${taskName}`);
 		}
-		return task.func(...args);
+		return await task.func(...args);
 	}
 }
