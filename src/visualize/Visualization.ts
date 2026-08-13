@@ -82,6 +82,9 @@ export class Visualization {
 		const forceGraph = new ForceGraph3D(container, { controlType: 'orbit' });
 		forceGraph
 			.graphData({ nodes: graph.nodes, links: graph.links })
+			// 좌표를 fx/fy/fz로 고정하므로 force 시뮬레이션은 불필요 — 0틱으로 꺼서
+			// 대량 노드에서 매 프레임 n-body 계산이 도는 것을 막는다(렌더 속도 핵심).
+			.cooldownTicks(0)
 			.enableNodeDrag(false) // 노드를 잡아 끌지 못하게(좌표 고정 유지)
 			.nodeRelSize(NODE_REL_SIZE)
 			.nodeVal((n) => (n as GraphNode).size ?? 1)

@@ -107,6 +107,9 @@ export class EdgeToggleMiddleware implements Middleware {
 				forceGraph.linkVisibility(() => this.visible); // 표시 갱신
 			});
 		});
+	}
+}
+
 // 클러스터별 색. 색맹 친화 팔레트에서 고른 값들로, 인접한 번호끼리 잘 구분된다.
 // 덩어리가 이보다 많으면 앞에서부터 다시 쓴다 — 번호가 크기순이라 큰 덩어리부터
 // 서로 다른 색을 갖는다.
@@ -165,12 +168,37 @@ export class ClusterColorMiddleware implements Middleware {
 		this.previousColors = new Map();
 		// render가 3d-force-graph를 만든 뒤 인스턴스를 받아 둔다. 버튼으로 껐다 켤 때 다시
 		// 그리지 않고 색만 바꾸기 위한 통로다(다시 그리면 PCA부터 새로 돈다).
+		// 같은 시점에 스위치 UI도 컨테이너에 붙인다(render 후라 replaceChildren에 안 지워진다).
 		graph.renderHooks.push((forceGraph) => {
 			this.forceGraph = forceGraph;
+			this.addSwitch(graph.container);
 		});
 		if (this.on) {
 			this.paint();
 		}
+	}
+
+	// 그래프 좌상단에 켜고 끄는 스위치를 얹는다. 스위치는 자기 자신(toggle)을 부르고,
+	// 나뉜 덩어리 수를 옆에 표시한다.
+	private addSwitch(container: HTMLElement | undefined): void {
+		if (!container) {
+			return;
+		}
+		const wrap = container.createDiv({ cls: 'papergraph3d-cluster-toggle' });
+		wrap.createSpan({ text: '클러스터 색' });
+		const label = wrap.createEl('label', { cls: 'papergraph3d-switch' });
+		const input = label.createEl('input', { attr: { type: 'checkbox' } });
+		input.checked = this.on;
+		label.createSpan({ cls: 'slider' });
+		const info = wrap.createSpan({ cls: 'papergraph3d-cluster-info' });
+		const showResult = (): void => {
+			info.setText(this.on && this.result ? `${this.result.clusterCount}개 덩어리` : '');
+		};
+		showResult();
+		input.addEventListener('change', () => {
+			this.toggle();
+			showResult();
+		});
 	}
 
 	// 버튼이 부른다. 켜면 (캐시가 없으면 계산한 뒤) 덩어리 색으로, 끄면 원래 색으로 되돌린다.

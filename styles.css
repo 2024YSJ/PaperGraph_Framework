@@ -38,6 +38,26 @@
 	opacity: 0.9;
 }
 
+/* 클러스터 색 토글 스위치(ClusterColorMiddleware) — 그래프 좌상단 오버레이. */
+.papergraph3d-cluster-toggle {
+	position: absolute;
+	top: 10px;
+	left: 10px;
+	z-index: 10;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 6px 10px;
+	font-size: 12px;
+	border-radius: 6px;
+	background: var(--background-secondary);
+	opacity: 0.9;
+}
+
+.papergraph3d-cluster-info {
+	opacity: 0.7;
+}
+
 /* 토글 스위치 모양 (체크박스를 숨기고 슬라이더로 표현). */
 .papergraph3d-switch {
 	position: relative;
