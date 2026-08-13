@@ -42,6 +42,9 @@ export class VisualizationView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		// 3d-force-graph/WebGL 컨텍스트를 정리한다 — 안 하면 재오픈·플러그인 리로드마다
+		// 컨텍스트가 쌓여 한도를 넘겨 시각화가 안 뜬다.
+		this.plugin.visualflow.visual.dispose();
 		this.contentEl.removeClass('papergraph3d-view');
 		this.contentEl.empty();
 	}

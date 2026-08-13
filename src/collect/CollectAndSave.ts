@@ -5,7 +5,7 @@ import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { API, type CollectOptions, type SkippedEntryRecord } from './API';
 import { delay, describeFailure, runQuietly } from './ApiSupport';
-import { Paper } from './Paper';
+import { ExtraData, Paper } from './Paper';
 import type { SearchQuery } from './SearchQuery';
 
 // run()의 실제 수집 범위는 원래 Subscriptions(API별 SearchQuery)에서 읽어와야 하지만,
@@ -1194,6 +1194,13 @@ export class CollectAndSave {
 				paper.embeddingSource = stored.embeddingSource;
 				paper.embeddingSucceeded = true;
 			}
+			// 미들웨어가 붙여둔 값(요약·클러스터 라벨 등)도 같이 되살린다. API에서 갓 받아온
+			// Paper의 extra는 비어 있어서, 이게 없으면 재스캔에 걸린 논문마다 미들웨어가
+			// "아직 요약이 없다"고 보고 매번 다시 만든다 — 위 인용수/임베딩을 되살리는 이유와
+			// 같다. 위 둘과 달리 조건이 없는 것은, extra에는 "쓸모 있는 값인가"를 뜻하는
+			// 플래그가 없기 때문이다(미들웨어마다 채워졌다는 기준이 다르다). 저장본에 아무것도
+			// 없으면 빈 ExtraData가 되어 지금과 같다.
+			paper.extra = Object.assign(new ExtraData(), stored.extra);
 		}
 	}
 
