@@ -8,8 +8,14 @@ export class TaskManager {
 		this.tasks.push(task);
 	}
 
-	// 실행 계열: 아직 미구현. Task.func 호출/에러 처리 등은 담당자가 채운다.
+	// taskName에 등록된 func를 찾아 그대로 호출한다. func가 Promise를 반환하면 그 결과를
+	// 기다렸다가 돌려준다 — 동기 함수를 반환해도(EventListener.checking을 fire-and-forget
+	// 없이 await하는 호출부 입장에서) 항상 Promise 하나로 취급할 수 있다.
 	async runTask(taskName: string, ...args: unknown[]): Promise<unknown> {
-		throw new Error(`Not implemented: TaskManager.runTask(${taskName})`);
+		const task = this.tasks.find((t) => t.taskName === taskName);
+		if (!task) {
+			throw new Error(`등록되지 않은 작업입니다: ${taskName}`);
+		}
+		return await task.func(...args);
 	}
 }

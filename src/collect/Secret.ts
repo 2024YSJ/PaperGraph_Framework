@@ -17,9 +17,19 @@ export class Secret {
 		this.apiKeys[provider] = key;
 	}
 
+	// provider의 API 키를 삭제한다. 등록돼 있지 않아도 안전하게 무시한다.
+	removeKey(provider: string): void {
+		delete this.apiKeys[provider];
+	}
+
 	// provider 키가 등록돼 있는지 확인한다.
 	hasKey(provider: string): boolean {
 		return provider in this.apiKeys;
+	}
+
+	// 등록된 모든 provider 식별자. 키 관리 UI가 목록을 그릴 때 쓴다.
+	providers(): string[] {
+		return Object.keys(this.apiKeys);
 	}
 
 	// File이 Secret.json으로 저장할 때 쓰는 평문 맵. 복사본을 넘겨 내부 상태 보호.
