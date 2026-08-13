@@ -1,9 +1,11 @@
 // 시각화(visual) 미들웨어 모음. VisualizationFlow.run이 init 후 render 전에 type === 'visual'
 // 미들웨어들의 run(GraphData)을 순서대로 부른다. 새 visual 미들웨어는 이 파일에 추가한다.
 import { App, TFile } from 'obsidian';
+import type { ForceGraph3DInstance } from '3d-force-graph';
 import { Middleware, MiddlewareType } from '../common/Middleware';
 import { File } from '../common/File';
 import { GraphData, GraphNode } from './GraphData';
+import { Clustering, ClusterResult } from './Clustering';
 
 const COLOR_CITED = '#4f9dff'; // 파랑 — 피인용수가 있는 논문
 const COLOR_UNCITED = '#ff9800'; // 주황 — 피인용수가 없는 논문
@@ -105,5 +107,117 @@ export class EdgeToggleMiddleware implements Middleware {
 				forceGraph.linkVisibility(() => this.visible); // 표시 갱신
 			});
 		});
+// 클러스터별 색. 색맹 친화 팔레트에서 고른 값들로, 인접한 번호끼리 잘 구분된다.
+// 덩어리가 이보다 많으면 앞에서부터 다시 쓴다 — 번호가 크기순이라 큰 덩어리부터
+// 서로 다른 색을 갖는다.
+const CLUSTER_COLORS = [
+	'#e6194b',
+	'#3cb44b',
+	'#ffe119',
+	'#4363d8',
+	'#f58231',
+	'#911eb4',
+	'#46f0f0',
+	'#f032e6',
+	'#bcf60c',
+	'#008080',
+];
+const COLOR_UNCLUSTERED = '#8a8a8a'; // 회색 — 어느 덩어리에도 안 속한 논문
+
+// 시각화 미들웨어: 논문을 임베딩으로 묶어 덩어리마다 다른 색을 칠한다.
+//
+// 기본은 꺼짐이다. 켜져 있지 않으면 계산조차 하지 않으므로 시각화를 여는 속도에 영향이 없다.
+// 켜고 끄는 것은 버튼 쪽에서 toggle()로 한다 — 이 미들웨어는 버튼을 만들지 않는다.
+//
+// 덩어리 번호는 paper.extra.clusterId에 들어간다(Clustering). 이 미들웨어는 그 값을 색으로
+// 옮기기만 하므로, 다른 미들웨어도 같은 값을 읽어 쓸 수 있다. 값은 메모리에만 남는다 —
+// 시각화 흐름에는 저장 단계가 없고, 계산이 결정적이라 다시 열면 같은 색이 나온다.
+//
+// 노드 색을 칠하는 다른 미들웨어(CitationColorMiddleware)보다 뒤에 등록해야 한다. 앞에 두면
+// 켜놓아도 뒤에 오는 미들웨어가 색을 도로 덮어쓴다.
+//
+// ⚠️ 껐다 켜려면 그래프와 3d-force-graph 인스턴스를 계속 들고 있어야 한다(Middleware에는
+// 뷰가 닫힐 때 알려주는 자리가 없다). 그래서 뷰를 닫아도 직전 그래프 하나가 메모리에 남는다.
+// 다음에 뷰를 열면 새 것으로 교체되므로 쌓이지는 않는다.
+export class ClusterColorMiddleware implements Middleware {
+	type: MiddlewareType = 'visual';
+
+	private readonly clustering = new Clustering();
+	private graph: GraphData | undefined;
+	// 켜기 전의 색(다른 미들웨어가 칠해둔 것)을 노드 id별로 기억했다가 끌 때 되돌린다.
+	private previousColors = new Map<string, string | undefined>();
+	private forceGraph: ForceGraph3DInstance | undefined;
+	private on = false;
+	private result: ClusterResult | undefined;
+
+	// 버튼이 읽는 상태 — 지금 켜져 있는가, 어떻게 나뉘었는가(덩어리 수·보류된 논문 수).
+	get enabled(): boolean {
+		return this.on;
+	}
+
+	get lastResult(): ClusterResult | undefined {
+		return this.result;
+	}
+
+	run(context: unknown): void {
+		const graph = context as GraphData;
+		this.graph = graph;
+		this.previousColors = new Map();
+		// render가 3d-force-graph를 만든 뒤 인스턴스를 받아 둔다. 버튼으로 껐다 켤 때 다시
+		// 그리지 않고 색만 바꾸기 위한 통로다(다시 그리면 PCA부터 새로 돈다).
+		graph.renderHooks.push((forceGraph) => {
+			this.forceGraph = forceGraph;
+		});
+		if (this.on) {
+			this.paint();
+		}
+	}
+
+	// 버튼이 부른다. 켜면 (캐시가 없으면 계산한 뒤) 덩어리 색으로, 끄면 원래 색으로 되돌린다.
+	toggle(): ClusterResult | undefined {
+		this.on = !this.on;
+		if (this.on) {
+			this.paint();
+		} else {
+			this.restore();
+		}
+		return this.result;
+	}
+
+	// 논문을 묶어(캐시가 있으면 재사용) 노드 색을 바꾼다.
+	private paint(): void {
+		const graph = this.graph;
+		if (!graph) {
+			return;
+		}
+		this.result = this.clustering.run(graph.nodes.map((node) => node.paper));
+		for (const node of graph.nodes) {
+			if (!this.previousColors.has(node.id)) {
+				this.previousColors.set(node.id, node.color);
+			}
+			const cluster = node.paper.extra?.clusterId;
+			node.color =
+				cluster === undefined ? COLOR_UNCLUSTERED : CLUSTER_COLORS[cluster % CLUSTER_COLORS.length];
+		}
+		this.refresh();
+	}
+
+	// 켜기 전 색으로 되돌린다.
+	private restore(): void {
+		for (const node of this.graph?.nodes ?? []) {
+			node.color = this.previousColors.get(node.id);
+		}
+		this.refresh();
+	}
+
+	// 이미 그려진 그래프에 색 변경을 반영한다. 3d-force-graph는 접근자를 다시 넣어야 노드 색을
+	// 다시 읽으므로, 지금 쓰고 있는 접근자를 꺼내 그대로 돌려준다(인자 없이 부르면 게터다).
+	// 접근자를 새로 지어내면 render가 정한 기본색을 여기서 한 번 더 적어야 해서, 나중에 한쪽만
+	// 바뀌면 조용히 어긋난다.
+	//
+	// 아직 그리기 전이면(render 전에 toggle) 할 일이 없다 — render가 node.color를 그대로 읽는다.
+	private refresh(): void {
+		const forceGraph = this.forceGraph;
+		forceGraph?.nodeColor(forceGraph.nodeColor());
 	}
 }

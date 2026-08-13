@@ -7,7 +7,6 @@ import { Visualization } from './visualize/Visualization';
 import {
 	CitationColorMiddleware,
 	CitationEdgeMiddleware,
-	EdgeToggleMiddleware,
 	OpenNoteOnClickMiddleware,
 } from './visualize/VisualMiddlewares';
 import { EventListener } from './common/EventListener';
@@ -23,6 +22,9 @@ export default class PaperGraph3D extends Plugin {
 	visualflow!: VisualizationFlow;
 	eventListener!: EventListener;
 	taskManager!: TaskManager;
+	// 클러스터 색칠 미들웨어. 기본은 꺼짐이고, UI가 clusterColor.toggle()로 켜고 끈다
+	// (지금 상태는 .enabled, 나뉜 결과는 .lastResult로 읽는다).
+	clusterColor!: ClusterColorMiddleware;
 
 	async onload() {
 		this.init();
@@ -89,8 +91,6 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.setMiddleware(new OpenNoteOnClickMiddleware(this.app));
 		// 논문 간 인용 관계를 엣지로 그리는 시각화 미들웨어 등록.
 		this.visualflow.setMiddleware(new CitationEdgeMiddleware());
-		// 엣지를 껐다 켜는 스위치 UI 시각화 미들웨어 등록.
-		this.visualflow.setMiddleware(new EdgeToggleMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
 		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
 		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.

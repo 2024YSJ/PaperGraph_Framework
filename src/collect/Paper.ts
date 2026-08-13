@@ -31,4 +31,21 @@ export class Paper {
 	embeddingSource!: string;
 	// 임베딩 성공/실패를 T/F로 표기 (기존 embeddingFailure 값/null 조합의 대체).
 	embeddingSucceeded!: boolean;
+
+	// 미들웨어가 덧붙이는 값들 (요약, 클러스터 라벨 등). 위 필드들과 달리 채워지지 않을
+	// 수 있어서, 미들웨어가 안 돌아도 항상 빈 객체는 있도록 여기서 바로 만들어 둔다
+	// (= 쓰는 쪽에서 undefined 검사를 안 해도 된다).
+	extra: ExtraData = new ExtraData();
+}
+
+// 미들웨어가 만들어내는 값을 담는 자리. 요약이나 클러스터 라벨처럼 수집·임베딩이
+// 보장하지 않는 값은 Paper의 필수 필드로 둘 수 없어서 여기에 모은다.
+// 미들웨어를 새로 만들 때 그 미들웨어가 채울 필드를 여기에 optional로 추가한다.
+// (예: summary?: string) — 필드가 늘어도 Paper의 필수 필드와 File의 저장/비교
+// 로직은 그대로다.
+export class ExtraData {
+	// 클러스터 번호 (0부터, 큰 덩어리가 0). 밀도가 낮아 어느 덩어리에도 안 들어간 논문은
+	// 값이 없다 — "아직 안 나눴다"와 "나눠봤지만 어디에도 안 속한다"가 둘 다 없음으로
+	// 표현되지만, 시각화는 둘 다 기본색으로 그리므로 구분할 필요가 없다.
+	clusterId?: number;
 }

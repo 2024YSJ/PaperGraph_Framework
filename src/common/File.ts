@@ -1,7 +1,7 @@
 import { TFile, Vault } from 'obsidian';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
-import { Paper } from '../collect/Paper';
+import { ExtraData, Paper } from '../collect/Paper';
 import { API, ArxivAPI } from '../collect/API';
 import { SearchQuery } from '../collect/SearchQuery';
 
@@ -328,8 +328,21 @@ export class File {
 			paper.embeddingSucceeded = true;
 		}
 
-		// 재스캔(4일 보정 창)이 같은 논문을 다시 저장 대상으로 올려도, 위 두 단계(출처
-		// 병합·임베딩 보존)를 거친 뒤 실제 값이 기존과 완전히 같으면 디스크에 다시 쓰지
+		// 백스톱: 미들웨어가 채운 extra(요약·클러스터 라벨 등)를 지킨다. API에서 갓 받아온
+		// Paper의 extra는 비어 있어서, 그대로 저장하면 전에 붙여둔 요약이 통째로 지워진다.
+		// 수집 경로는 CollectAndSave.prefillFromStore가 저장본의 extra를 미리 얹어 이 상황을
+		// 만들지 않지만, 저장하는 곳은 그 경로만이 아니다(보정·설정탭 테스트 버튼, 앞으로
+		// 생길 호출자). 위 임베딩 백스톱과 같은 이유로 마지막 길목인 여기서 한 번 더 막는다.
+		//
+		// 키 단위로 합치되 이번에 들어온 값이 이기므로, 미들웨어가 요약을 새로 계산해 덮는
+		// 것은 정상 동작한다. 다만 이 규칙 때문에 키를 지우는 것은 불가능하다 — 지워야 한다면
+		// 미들웨어가 저장본을 읽어 직접 다시 써야 한다.
+		// (extra가 없던 시절 파일은 existing.paper.extra가 undefined인데, Object.assign이
+		// 그냥 건너뛰므로 들어온 값만 남아 지금과 같다.)
+		paper.extra = Object.assign(new ExtraData(), existing?.paper.extra, paper.extra);
+
+		// 재스캔(4일 보정 창)이 같은 논문을 다시 저장 대상으로 올려도, 위 세 단계(출처
+		// 병합·임베딩 보존·extra 보존)를 거친 뒤 실제 값이 기존과 완전히 같으면 디스크에 다시 쓰지
 		// 않는다. 무조건 쓰면 (1) 내용이 똑같은데 파일 감시자/동기화가 매번 깨어나고,
 		// (2) updatedAt이 매번 지금 시각으로 갱신돼 "이 논문이 실제로 마지막으로 바뀐
 		// 시점"이라는 정보 자체가 사라진다. 인용수 보강이나 새 구독의 출처 추가처럼 값이
@@ -404,8 +417,47 @@ export class File {
 			File.arraysEqual(a.references, b.references) &&
 			File.arraysEqual(a.embedding, b.embedding) &&
 			File.arraysEqual(a.collectedApis, b.collectedApis) &&
-			File.searchQueriesEqual(a.collectedQueries, b.collectedQueries)
+			File.searchQueriesEqual(a.collectedQueries, b.collectedQueries) &&
+			File.extraEqual(a.extra, b.extra)
 		);
+	}
+
+	// extra는 미들웨어가 필드를 늘려가는 자리라 위처럼 필드를 열거할 수 없다. 그래서 키를
+	// 정렬해 맞춘 뒤 값끼리 비교한다 — 필드가 추가된 순서가 달라도 내용이 같으면 같은
+	// 것이므로 객체를 통째로 JSON.stringify하지는 않는다(이유는 papersEqual 주석과 같다).
+	// 이 비교가 빠지면 미들웨어가 채운 요약·클러스터 라벨이 "변경 없음"으로 판정돼
+	// 저장되지 않고 사라진다.
+	//
+	// 값 타입을 가리지 않는다 — 미들웨어가 문자열(요약), 숫자(클러스터 번호), 배열, 중첩
+	// 객체 무엇을 넣든 JSON 표현으로 비교한다(encodeExtra).
+	//
+	// 인자가 없을 수 있다: extra가 생기기 전에 저장된 파일에는 이 키가 아예 없어서,
+	// JSON.parse로 되살린 저장본(papersEqual의 b)은 extra가 undefined다. 빈 객체로 보면
+	// "저장본엔 아무것도 없었다"와 뜻이 같아 그대로 맞아떨어진다.
+	private static extraEqual(a: ExtraData | undefined, b: ExtraData | undefined): boolean {
+		const left = File.encodeExtra(a);
+		const right = File.encodeExtra(b);
+		return left.length === right.length && left.every((item, i) => item === right[i]);
+	}
+
+	// extra를 "저장하면 파일에 실제로 남을 모습"으로 바꾼다 — 키를 정렬한 `"키":값` 목록.
+	// 정렬하는 이유는 extraEqual 주석 참고(필드가 추가된 순서에 흔들리지 않게).
+	//
+	// 값이 undefined이거나 함수면 JSON.stringify가 그 키를 통째로 빼므로 여기서도 뺀다.
+	// 남겨두면 저장본과 영원히 달라져 매 저장마다 파일을 다시 쓰게 된다 — 미들웨어가
+	// `extra.clusterId = map.get(id)`처럼 썼다가 못 찾으면 바로 이 상황이다.
+	//
+	// 키도 JSON.stringify로 감싸 인코딩이 겹치지 않게 한다(키에 ':'가 들어가도 안전).
+	private static encodeExtra(extra: ExtraData | undefined): string[] {
+		const source = (extra ?? {}) as Record<string, unknown>;
+		const encoded: string[] = [];
+		for (const key of Object.keys(source).sort()) {
+			const value = JSON.stringify(source[key]);
+			if (value !== undefined) {
+				encoded.push(`${JSON.stringify(key)}:${value}`);
+			}
+		}
+		return encoded;
 	}
 
 	private static arraysEqual<T>(a: T[], b: T[]): boolean {
