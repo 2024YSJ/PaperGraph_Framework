@@ -156,38 +156,42 @@ export default class PaperGraph3D extends Plugin {
 		// 새로 만들어져 생성자로는 서로를 받을 수 없다.
 		this.eventListener.bindTaskManager(this.taskManager);
 
-		const collectRecentTask = new Task();
-		collectRecentTask.taskName = 'collect:recent';
 		// collectflow.run()을 진행률 콜백 없이 부르면 대기열 박스에 구독별 진행(순번 포함)이
 		// 하나도 안 뜬다 — CollectController.runRecentAuto()를 거쳐 수동 실행과 같은 자리
 		// (activeFlow)에 진행 상태가 쌓이게 한다. Notice는 안 뜬다(runRecentAuto가 silent로
 		// 돈다 — 자동 수집/명령어 팔레트는 원래 조용히 도는 게 설계 의도였다). 왜 별도 sink로
 		// 우회하지 않고 CollectController를 거치는 쪽을 택했는지는 devLog(010) 참고.
-		collectRecentTask.func = () => this.collectController.runRecentAuto();
+		const collectRecentTask: Task = {
+			taskName: 'collect:recent',
+			func: () => this.collectController.runRecentAuto(),
+		};
 		this.taskManager.setTask(collectRecentTask);
 
 		// 신규 구독 등록 직후 그 구독 하나만 자동으로 1회 수집하기 위한 별도 작업.
 		// 'collect:recent'(전체 대상, 무인자)와 계약이 다르므로 이름을 따로 둔다 — 인자를
 		// 받아 분기하면 runTask(taskName, ...args)가 unknown[]이라 타입 안전성이 없어진다.
-		const collectRecentOneTask = new Task();
-		collectRecentOneTask.taskName = 'collect:recent-one';
-		collectRecentOneTask.func = (...args: unknown[]) => {
-			const target = args[0] as { apiName: string; querys: SearchQuery[] };
-			return this.collectController.runRecentOneAuto(target);
+		const collectRecentOneTask: Task = {
+			taskName: 'collect:recent-one',
+			func: (...args: unknown[]) => {
+				const target = args[0] as { apiName: string; querys: SearchQuery[] };
+				return this.collectController.runRecentOneAuto(target);
+			},
 		};
 		this.taskManager.setTask(collectRecentOneTask);
 
-		const collectRepairTask = new Task();
-		collectRepairTask.taskName = 'collect:repair';
-		collectRepairTask.func = () => this.collectflow.repair();
+		const collectRepairTask: Task = {
+			taskName: 'collect:repair',
+			func: () => this.collectflow.repair(),
+		};
 		this.taskManager.setTask(collectRepairTask);
 
 		// 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + arXiv 개정판 감지) — 설정 탭
 		// 「새로고침」 버튼 전용. repair와 달리 실패한 것만이 아니라 전부 다시 확인하므로
 		// 별도 작업/이벤트로 둔다.
-		const collectRefreshTask = new Task();
-		collectRefreshTask.taskName = 'collect:refresh';
-		collectRefreshTask.func = () => this.collectController.refreshAllAuto();
+		const collectRefreshTask: Task = {
+			taskName: 'collect:refresh',
+			func: () => this.collectController.refreshAllAuto(),
+		};
 		this.taskManager.setTask(collectRefreshTask);
 
 		this.eventListener.setEventListener('ui:collect-recent', 'collect:recent');
