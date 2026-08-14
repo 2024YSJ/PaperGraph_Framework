@@ -164,6 +164,8 @@ export class ClusterColorMiddleware implements Middleware {
 	private result: ClusterResult | undefined;
 	// 사용자가 정한 덩어리 수. 0이면 구독 개수에서 자동으로 정한다(Clustering.chooseK).
 	private requestedCount = 0;
+	// 결과·경고를 띄우는 자리. addSwitch가 만들고 showResult/showWarning이 갱신한다.
+	private info: HTMLElement | undefined;
 
 	// 버튼이 읽는 상태 — 지금 켜져 있는가, 어떻게 나뉘었는가(덩어리 수·보류된 논문 수).
 	get enabled(): boolean {
@@ -205,20 +207,19 @@ export class ClusterColorMiddleware implements Middleware {
 		if (!container) {
 			return;
 		}
+		// 허용 범위는 논문 수에 따라 달라진다 — 적은 논문을 잘게 쪼개면 덩어리당 몇 편 안 남는다.
+		const maxCount = Clustering.maxK(this.graph?.nodes.length ?? 0);
+		const range = `${Clustering.minK}~${maxCount}`;
+
 		const wrap = container.createDiv({ cls: 'papergraph3d-cluster-toggle' });
 		wrap.createSpan({ text: '클러스터 색' });
 		const label = wrap.createEl('label', { cls: 'papergraph3d-switch' });
-		const input = label.createEl('input', { attr: { type: 'checkbox' } });
-		input.checked = this.on;
+		const power = label.createEl('input', { attr: { type: 'checkbox' } });
+		power.checked = this.on;
 		label.createSpan({ cls: 'slider' });
 
-		// 덩어리 수 입력칸. 범위는 논문 수에 따라 달라진다(적은 논문을 잘게 쪼개면 덩어리당
-		// 몇 편 안 남는다). 넘겨도 Clustering이 잘라내지만, 여기서 미리 알려주는 편이 낫다.
-		//
-		// 안내 문구를 칸 안(placeholder)이 아니라 옆에 따로 둔다 — 칸이 좁아 "몇 개로 나눌까요"
-		// 같은 문장이 안 들어가고, placeholder는 값을 넣는 순간 사라져서 범위를 다시 확인할
-		// 수 없기 때문이다.
-		const maxCount = Clustering.maxK(this.graph?.nodes.length ?? 0);
+		// 안내를 칸 안(placeholder)이 아니라 이름표와 범위로 나눠 둔다 — 칸이 좁아 문장이
+		// 안 들어가고, placeholder는 값을 넣는 순간 사라져 범위를 다시 확인할 수 없다.
 		wrap.createSpan({ cls: 'papergraph3d-cluster-label', text: '덩어리 수' });
 		const count = wrap.createEl('input', {
 			cls: 'papergraph3d-cluster-count',
@@ -227,50 +228,62 @@ export class ClusterColorMiddleware implements Middleware {
 				min: String(Clustering.minK),
 				max: String(maxCount),
 				placeholder: '자동',
-				title: `몇 덩어리로 나눌지 정합니다. ${Clustering.minK}~${maxCount} 사이로 넣으세요. 비워두면 구독 개수만큼 자동으로 나눕니다.`,
+				title: `몇 덩어리로 나눌지 정합니다. ${range} 사이로 넣으세요. 비워두면 구독 개수만큼 자동으로 나눕니다.`,
 			},
 		});
-		wrap.createSpan({
-			cls: 'papergraph3d-cluster-hint',
-			text: `${Clustering.minK}~${maxCount}`,
-		});
 		count.value = this.requestedCount > 0 ? String(this.requestedCount) : '';
+		wrap.createSpan({ cls: 'papergraph3d-cluster-hint', text: range });
 
-		const info = wrap.createSpan({ cls: 'papergraph3d-cluster-info' });
-		const showResult = (): void => {
-			info.removeClass('papergraph3d-cluster-warn');
-			info.setText(this.on && this.result ? `${this.result.clusterCount}개 덩어리` : '');
-		};
-		showResult();
+		this.info = wrap.createSpan({ cls: 'papergraph3d-cluster-info' });
+		this.showResult();
 
-		input.addEventListener('change', () => {
+		power.addEventListener('change', () => {
 			this.toggle();
-			showResult();
+			this.showResult();
 		});
-
 		count.addEventListener('change', () => {
-			const typed = count.value.trim();
-			if (typed === '') {
-				this.requestedCount = 0; // 비우면 구독 개수로 되돌아간다
-			} else {
-				// 범위를 벗어나면 조용히 고치지 않고 알려준다. 말없이 다른 값으로 바꾸면
-				// 사용자는 자기가 넣은 수가 왜 무시됐는지 알 수 없다.
-				const value = Number(typed);
-				if (!Number.isInteger(value) || value < Clustering.minK || value > maxCount) {
-					info.setText(`${Clustering.minK}~${maxCount} 사이의 수를 입력해 주세요`);
-					info.addClass('papergraph3d-cluster-warn');
-					return; // 입력한 값은 칸에 그대로 둔다 — 고쳐 쓰기 편하도록
-				}
-				this.requestedCount = value;
+			const parsed = ClusterColorMiddleware.parseCount(count.value, maxCount);
+			if (parsed === null) {
+				// 범위를 벗어나면 조용히 고치지 않고 알린다. 말없이 다른 값으로 바꾸면 사용자는
+				// 자기가 넣은 수가 왜 무시됐는지 알 수 없다. 입력한 값은 칸에 그대로 두어
+				// 고쳐 쓰기 편하게 한다.
+				this.showWarning(`${range} 사이의 수를 입력해 주세요`);
+				return;
 			}
+			this.requestedCount = parsed;
 			// 켜져 있을 때만 다시 칠한다(꺼져 있으면 켜는 순간 새 값으로 계산된다). paint는
 			// previousColors를 이미 채워둔 노드는 건너뛰므로, 클러스터 색을 "원래 색"으로
 			// 잘못 기억하지 않는다.
 			if (this.on) {
 				this.paint();
 			}
-			showResult();
+			this.showResult();
 		});
+	}
+
+	// 입력칸의 글자를 덩어리 수로 읽는다. 비었으면 0(구독 개수로 자동), 범위 안의 정수면
+	// 그 값, 그 밖이면 null(= 쓰지 않고 안내한다).
+	private static parseCount(text: string, maxCount: number): number | null {
+		const trimmed = text.trim();
+		if (trimmed === '') {
+			return 0;
+		}
+		const value = Number(trimmed);
+		if (!Number.isInteger(value) || value < Clustering.minK || value > maxCount) {
+			return null;
+		}
+		return value;
+	}
+
+	// 지금 몇 덩어리로 나뉘었는지 보여준다. 꺼져 있거나 아직 계산 전이면 비운다.
+	private showResult(): void {
+		this.info?.removeClass('papergraph3d-cluster-warn');
+		this.info?.setText(this.on && this.result ? `${this.result.clusterCount}개 덩어리` : '');
+	}
+
+	private showWarning(text: string): void {
+		this.info?.setText(text);
+		this.info?.addClass('papergraph3d-cluster-warn');
 	}
 
 	// 버튼이 부른다. 켜면 (캐시가 없으면 계산한 뒤) 덩어리 색으로, 끄면 원래 색으로 되돌린다.
