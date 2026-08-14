@@ -178,6 +178,11 @@ export class ClusterColorMiddleware implements Middleware {
 		const graph = context as GraphData;
 		this.graph = graph;
 		this.previousColors = new Map();
+		// 덩어리 수는 뷰를 새로 열 때마다 비운다. 허용 범위가 논문 수에 따라 달라지므로,
+		// 예전에 넣어둔 숫자는 지금 코퍼스에 맞는 값이라는 보장이 없다(논문 100편일 때 넣은
+		// 5가 8000편이 된 뒤에도 남아 있으면 그건 의도가 아니라 흔적이다). 스위치 상태(on)는
+		// 그대로 둔다 — "클러스터로 보고 싶다"는 의사는 논문 수와 무관하다.
+		this.requestedCount = 0;
 		// render가 3d-force-graph를 만든 뒤 인스턴스를 받아 둔다. 버튼으로 껐다 켤 때 다시
 		// 그리지 않고 색만 바꾸기 위한 통로다(다시 그리면 PCA부터 새로 돈다).
 		// 같은 시점에 스위치 UI도 컨테이너에 붙인다(render 후라 replaceChildren에 안 지워진다).
@@ -209,7 +214,12 @@ export class ClusterColorMiddleware implements Middleware {
 
 		// 덩어리 수 입력칸. 범위는 논문 수에 따라 달라진다(적은 논문을 잘게 쪼개면 덩어리당
 		// 몇 편 안 남는다). 넘겨도 Clustering이 잘라내지만, 여기서 미리 알려주는 편이 낫다.
+		//
+		// 안내 문구를 칸 안(placeholder)이 아니라 옆에 따로 둔다 — 칸이 좁아 "몇 개로 나눌까요"
+		// 같은 문장이 안 들어가고, placeholder는 값을 넣는 순간 사라져서 범위를 다시 확인할
+		// 수 없기 때문이다.
 		const maxCount = Clustering.maxK(this.graph?.nodes.length ?? 0);
+		wrap.createSpan({ cls: 'papergraph3d-cluster-label', text: '덩어리 수' });
 		const count = wrap.createEl('input', {
 			cls: 'papergraph3d-cluster-count',
 			attr: {
@@ -217,22 +227,19 @@ export class ClusterColorMiddleware implements Middleware {
 				min: String(Clustering.minK),
 				max: String(maxCount),
 				placeholder: '자동',
-				title: `덩어리 수 (${Clustering.minK}~${maxCount}, 비우면 구독 개수)`,
+				title: `몇 덩어리로 나눌지 정합니다. ${Clustering.minK}~${maxCount} 사이로 넣으세요. 비워두면 구독 개수만큼 자동으로 나눕니다.`,
 			},
+		});
+		wrap.createSpan({
+			cls: 'papergraph3d-cluster-hint',
+			text: `${Clustering.minK}~${maxCount}`,
 		});
 		count.value = this.requestedCount > 0 ? String(this.requestedCount) : '';
 
 		const info = wrap.createSpan({ cls: 'papergraph3d-cluster-info' });
 		const showResult = (): void => {
-			if (!this.on || !this.result) {
-				info.setText('');
-				return;
-			}
-			// 요청한 값이 잘렸으면 그 사실을 알려준다 — 안 그러면 왜 숫자가 다른지 알 수 없다.
-			const { clusterCount, requestedCount } = this.result;
-			const clamped = requestedCount > 0 && requestedCount !== clusterCount;
-			info.setText(clamped ? `${clusterCount}개 덩어리 (${requestedCount}에서 조정)` : `${clusterCount}개 덩어리`);
-			count.value = this.requestedCount > 0 ? String(clusterCount) : '';
+			info.removeClass('papergraph3d-cluster-warn');
+			info.setText(this.on && this.result ? `${this.result.clusterCount}개 덩어리` : '');
 		};
 		showResult();
 
@@ -240,9 +247,22 @@ export class ClusterColorMiddleware implements Middleware {
 			this.toggle();
 			showResult();
 		});
+
 		count.addEventListener('change', () => {
-			const value = Number(count.value);
-			this.requestedCount = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+			const typed = count.value.trim();
+			if (typed === '') {
+				this.requestedCount = 0; // 비우면 구독 개수로 되돌아간다
+			} else {
+				// 범위를 벗어나면 조용히 고치지 않고 알려준다. 말없이 다른 값으로 바꾸면
+				// 사용자는 자기가 넣은 수가 왜 무시됐는지 알 수 없다.
+				const value = Number(typed);
+				if (!Number.isInteger(value) || value < Clustering.minK || value > maxCount) {
+					info.setText(`${Clustering.minK}~${maxCount} 사이의 수를 입력해 주세요`);
+					info.addClass('papergraph3d-cluster-warn');
+					return; // 입력한 값은 칸에 그대로 둔다 — 고쳐 쓰기 편하도록
+				}
+				this.requestedCount = value;
+			}
 			// 켜져 있을 때만 다시 칠한다(꺼져 있으면 켜는 순간 새 값으로 계산된다). paint는
 			// previousColors를 이미 채워둔 노드는 건너뛰므로, 클러스터 색을 "원래 색"으로
 			// 잘못 기억하지 않는다.
