@@ -1,9 +1,8 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { File } from '../common/File';
 import { Log } from '../common/Log';
-import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
 import { ApiManagementModal } from './ApiManagementModal';
+import { ScheduleModal } from './ScheduleModal';
 import { formatSubscriptionProgress } from './CollectMiddlewares';
 
 export class SettingTab extends PluginSettingTab {
@@ -13,12 +12,6 @@ export class SettingTab extends PluginSettingTab {
 	// 항상 이 참조를 통해서 한다(없으면 아무 일도 안 함).
 	private queueStatusEl: HTMLElement | undefined;
 	private queueSubscribed = false;
-
-	// Schedule.json은 비동기로만 읽을 수 있는데 display()는 동기다 — 로드 전까지는
-	// 기본값을 보여주고, 로드가 끝나면 다시 그린다(ApiManagementModal.loadSubscriptions와
-	// 같은 패턴).
-	private scheduleSettings: ScheduleSettings = { ...DEFAULT_SCHEDULE_SETTINGS };
-	private scheduleSettingsLoaded = false;
 
 	constructor(app: App, plugin: PaperGraph3D) {
 		super(app, plugin);
@@ -71,51 +64,6 @@ export class SettingTab extends PluginSettingTab {
 		}
 	}
 
-	// Schedule.json -> scheduleSettings. display()가 열릴 때마다 다시 읽는다 — 스케줄러가
-	// 백그라운드에서 lastRunAt을 계속 갱신하므로(Scheduler.tick 참고), 설정 탭을 오래 띄워
-	// 두거나 다시 열었을 때 그 값을 놓치면 안 된다. reloading 플래그로 재귀만 막는다 —
-	// loadScheduleSettings 끝의 this.display()가 다시 이 메서드를 부르는 걸 방지한다.
-	private reloadingScheduleSettings = false;
-
-	private async loadScheduleSettings(): Promise<void> {
-		if (this.reloadingScheduleSettings) {
-			return;
-		}
-		this.reloadingScheduleSettings = true;
-		try {
-			this.scheduleSettings = await File.readScheduleSettings();
-		} catch (e) {
-			new Notice(`자동 수집 설정을 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
-		}
-		this.scheduleSettingsLoaded = true;
-		this.reloadingScheduleSettings = false;
-		this.display();
-	}
-
-	// scheduleSettings의 일부 필드만 바꿔 즉시 저장한다 — 별도 「저장」 버튼 없이 다른
-	// 토글/입력값과 같은 방식(바꾸면 바로 반영)으로 통일했다.
-	//
-	// 저장 직전에 디스크를 다시 읽어 그 위에 patch만 얹는다 — this.scheduleSettings(화면에
-	// 캐시된 스냅샷)를 그대로 베이스로 쓰면, 그 사이 Scheduler.tick()이 갱신해둔 lastRunAt을
-	// 옛 값으로 덮어써버린다(자동 수집을 켜자마자 이 화면을 그대로 열어두고 다른 필드를
-	// 바꾸면 재현된다) — File.mutateSubscriptions와 같은 이유의 read-modify-write다.
-	private async updateScheduleSettings(patch: Partial<ScheduleSettings>): Promise<void> {
-		try {
-			const current = await File.readScheduleSettings();
-			this.scheduleSettings = { ...current, ...patch };
-			await File.writeScheduleSettings(this.scheduleSettings);
-		} catch (e) {
-			new Notice(`자동 수집 설정 저장 실패: ${e instanceof Error ? e.message : String(e)}`);
-		}
-	}
-
-	// 탭을 닫을 때 로드 플래그를 내려서, 다음에 다시 열면(display()) Schedule.json을
-	// 새로 읽는다 — 탭이 닫혀 있는 동안에도 Scheduler.tick()이 계속 lastRunAt을 갱신하므로,
-	// 켜져 있던 스냅샷을 그대로 재사용하면 오래될수록 어긋난다.
-	hide(): void {
-		this.scheduleSettingsLoaded = false;
-	}
-
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
@@ -124,19 +72,15 @@ export class SettingTab extends PluginSettingTab {
 
 		this.ensureQueueSubscription();
 
-		if (!this.scheduleSettingsLoaded) {
-			void this.loadScheduleSettings();
-		}
-
 		// ── 수집 ──────────────────────────────────────────────────────
-		// 실행 로직(최근/Backfill 선택 메뉴, 진행률 Notice, 진단 미들웨어)은
+		// 실행 로직(최근/과거 논문 수집 선택 메뉴, 진행률 Notice, 진단 미들웨어)은
 		// CollectController가 갖고 있다 — 리본 아이콘에서도 같은 진행률을 봐야 하므로
 		// 설정 탭 하나에 묶어둘 수 없다(main.ts init 참고).
 		new Setting(containerEl)
 			.setName('수집')
 			.setDesc(
 				'구독에 등록된 조건으로 수집을 실행하고 결과를 저장합니다. ' +
-					'최근 논문은 마지막 수집 지점부터 이어서, Backfill은 지정한 과거 구간을 수집합니다. ' +
+					'최근 논문은 마지막 수집 지점부터 이어서, 과거 논문 수집은 지정한 과거 구간을 수집합니다. ' +
 					'임베딩·인용수 조회에 실패한 논문은 수집 직후 자동으로 재시도되므로 별도 버튼이 없습니다.',
 			)
 			.setHeading();
@@ -178,102 +122,24 @@ export class SettingTab extends PluginSettingTab {
 		});
 
 		// ── 자동 수집 (6번) ──────────────────────────────────────────
-		// 실제 스케줄링(주기·시간대 판단)은 Scheduler.tick()이 5분마다 Schedule.json을
-		// 다시 읽어 수행한다(main.ts.onload 참고) — 여기는 그 설정을 편집하는 화면일
-		// 뿐이고, 값을 바꾸면 즉시 저장돼 다음 tick부터 반영된다(재시작 불필요).
+		// 실제 스케줄링 설정 UI는 API/구독 관리와 같은 이유로 별도 창(ScheduleModal)으로
+		// 뺐다 — 리본 아이콘에서 설정 탭을 거치지 않고 바로 켜고/끄고/시각을 바꿀 수
+		// 있어야 한다는 요청. 여기는 그 창을 여는 진입점만 남긴다.
 		new Setting(containerEl)
 			.setName('자동 수집')
-			.setDesc(
-				'설정한 주기마다 백그라운드에서 "최근 논문 수집"을 자동으로 실행합니다. ' +
-					'시간대를 지정하면 그 구간에만 실행됩니다(예: 잠든 새벽 시간을 피하고 싶을 때).',
-			)
+			.setDesc('매일 지정한 시각에 백그라운드에서 "최근 논문 수집"을 자동으로 실행합니다.')
 			.setHeading();
 
 		new Setting(containerEl)
-			.setName('자동 수집 사용')
-			.addToggle((toggle) =>
-				toggle.setValue(this.scheduleSettings.enabled).onChange((value) => {
-					void this.updateScheduleSettings({ enabled: value }).then(() => {
-						if (value) {
-							// 켜는 순간 주기·시간대를 기다리지 않고 즉시 1회 실행 — 그 이후부터
-							// 이 실행 시점을 기준으로 정상 주기가 적용된다(Scheduler.runNow 참고).
-							void this.plugin.scheduler.runNow();
-						}
-						// 켜져 있는 동안은 주기·시간대를 못 바꾸게 잠그므로(아래 필드들의
-						// setDisabled), on/off가 바뀔 때마다 다시 그려 잠금 상태를 맞춘다.
-						this.display();
-					});
-				}),
+			.setName('관리')
+			.addButton((button) =>
+				button
+					.setButtonText('열기')
+					.setCta()
+					.onClick(() => {
+						new ScheduleModal(this.app, this.plugin).open();
+					}),
 			);
-
-		// 켜져 있는 동안 주기·시간대를 바꾸면 "지금 도는 스케줄이 이 값 기준인지 새
-		// 값 기준인지" 애매해진다 — 껐다 값을 바꾸고 다시 켜도록 강제해 그 모호함을
-		// 없앤다(다시 켜면 즉시 1회 실행되므로 확인도 바로 된다).
-		const locked = this.scheduleSettings.enabled;
-		new Setting(containerEl)
-			.setName('주기 (시간)')
-			.setDesc(
-				locked
-					? '자동 수집을 끄면 주기를 바꿀 수 있습니다.'
-					: '마지막 자동 수집 이후 이만큼 시간이 지나면 다시 실행합니다.',
-			)
-			.addText((text) => {
-				text.inputEl.type = 'number';
-				text.inputEl.min = '1';
-				text.setDisabled(locked);
-				text
-					.setValue(String(this.scheduleSettings.intervalHours))
-					.onChange((value) => {
-						const hours = Number(value);
-						if (!Number.isFinite(hours) || hours <= 0) {
-							return;
-						}
-						void this.updateScheduleSettings({ intervalHours: hours });
-					});
-			});
-
-		new Setting(containerEl)
-			.setName('허용 시간대 (0~23시)')
-			.setDesc(
-				locked
-					? '자동 수집을 끄면 시간대를 바꿀 수 있습니다.'
-					: '이 구간에 들어온 tick에서만 자동 수집을 실행합니다. 시작=끝이면 제한 없이 항상 ' +
-						'실행됩니다. 시작이 끝보다 크면 자정을 넘는 구간(예: 22시~6시)으로 봅니다.',
-			)
-			.addText((text) => {
-				text.inputEl.type = 'number';
-				text.inputEl.min = '0';
-				text.inputEl.max = '23';
-				text.setDisabled(locked);
-				text.setValue(String(this.scheduleSettings.windowStartHour)).onChange((value) => {
-					// Number('')는 0이라 빈 칸으로 지우면 그대로 통과해 "0시"로 조용히
-					// 저장돼버린다 — 아직 입력 중(지우는 중)인 빈 칸은 명시적으로 무시한다.
-					if (value.trim().length === 0) {
-						return;
-					}
-					const hour = Number(value);
-					if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
-						return;
-					}
-					void this.updateScheduleSettings({ windowStartHour: hour });
-				});
-			})
-			.addText((text) => {
-				text.inputEl.type = 'number';
-				text.inputEl.min = '0';
-				text.inputEl.max = '23';
-				text.setDisabled(locked);
-				text.setValue(String(this.scheduleSettings.windowEndHour)).onChange((value) => {
-					if (value.trim().length === 0) {
-						return;
-					}
-					const hour = Number(value);
-					if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
-						return;
-					}
-					void this.updateScheduleSettings({ windowEndHour: hour });
-				});
-			});
 
 		// ── API / 구독 관리 ──────────────────────────────────────────
 		// API 키 등록과 구독(수집 조건) 관리는 별도 창(ApiManagementModal)으로 분리했다 —
