@@ -51,22 +51,14 @@ export default class PaperGraph3D extends Plugin {
 
 		this.addSettingTab(new SettingTab(this.app, this));
 
-		// 6번: 자동 수집 스케줄링 — 5분마다 설정(Schedule.json)을 다시 읽어 "지금이
-		// 실행할 때인가"를 판단한다(Scheduler.tick). 매번 다시 읽으므로 설정 탭에서 주기를
-		// 바꿔도 재시작 없이 다음 tick부터 반영된다. registerInterval로 등록해야 플러그인이
-		// 언로드될 때 Obsidian이 알아서 타이머를 치운다 — 직접 clearInterval을 관리하면
-		// onunload에서 빼먹었을 때 언로드 후에도 백그라운드에서 수집이 계속 걸린다.
-		this.registerInterval(
-			window.setInterval(() => {
-				void this.scheduler.tick().catch((error) => {
-					Log.error('scheduler', '자동 수집 확인 실패', error);
-				});
-			}, 5 * 60 * 1000),
-		);
-		// 로드 직후에도 한 번 확인한다 — 마지막 자동 실행 이후 플러그인이 오래 꺼져
-		// 있었다면 다음 tick(최대 5분 뒤)까지 기다리지 않고 바로 따라잡는다.
-		void this.scheduler.tick().catch((error) => {
-			Log.error('scheduler', '자동 수집 확인 실패', error);
+		// 6번: 자동 수집 스케줄링 — 폴링 없이 "다음 목표 시각까지 남은 시간"을 한 번
+		// 계산해 정확히 그 시점에 실행되는 타이머를 건다(Scheduler.scheduleNext). 로드
+		// 시점에 오늘 목표 시각을 이미 지났는데 아직 실행 안 됐으면(그 시각에 앱이 꺼져
+		// 있었다는 뜻) 캐치업으로 즉시 1회 실행한다(Scheduler.start 참고). 타이머 자체는
+		// Scheduler가 스스로(재귀 재예약) 관리하므로 registerInterval에 등록하지 않고,
+		// onunload에서 명시적으로 stop()한다.
+		void this.scheduler.start().catch((error) => {
+			Log.error('scheduler', '자동 수집 스케줄러 시작 실패', error);
 		});
 
 		this.addCommand({
@@ -81,9 +73,10 @@ export default class PaperGraph3D extends Plugin {
 			},
 		});
 
-		// Backfill 커맨드는 두지 않는다 — 어느 구간을 메울지(from/to)가 필수인 작업이라
-		// 인자를 못 받는 커맨드 팔레트에서는 항상 실패한다. 설정 탭의 Backfill 버튼이
-		// 날짜 입력을 받아 run('backfill', {from, to})로 실행하는 것이 유일한 경로다.
+		// 과거 논문 수집 커맨드는 두지 않는다 — 어느 구간을 메울지(from/to)가 필수인 작업이라
+		// 인자를 못 받는 커맨드 팔레트에서는 항상 실패한다. 수집 메뉴(리본 아이콘/설정 탭)의
+		// 과거 논문 수집 항목이 날짜 입력을 받아 run('backfill', {from, to})로 실행하는 것이
+		// 유일한 경로다.
 
 		this.addCommand({
 			id: 'collect-repair',
@@ -103,6 +96,16 @@ export default class PaperGraph3D extends Plugin {
 
 		this.addRibbonIcon('download', '수집', (evt) => {
 			this.collectController.openCollectMenu(evt, this.app);
+		});
+
+		// 새로고침(전체 코퍼스 강제 재조회)은 지금까지 설정 탭 버튼으로만 접근할 수
+		// 있었다 — 수집/구독 관리처럼 자주 쓰는 진입점이라 왼쪽 리본에도 바로가기를
+		// 추가한다. 실행 로직은 설정 탭 버튼과 동일하게 'ui:collect-refresh' 이벤트를
+		// 그대로 재사용한다(SettingTab.ts 참고).
+		this.addRibbonIcon('refresh-cw', '새로고침', () => {
+			void this.eventListener.checking('ui:collect-refresh').catch((e) => {
+				new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
+			});
 		});
 
 		this.addCommand({
@@ -156,13 +159,15 @@ export default class PaperGraph3D extends Plugin {
 		// 새로 만들어져 생성자로는 서로를 받을 수 없다.
 		this.eventListener.bindTaskManager(this.taskManager);
 
-		// collectflow.run()을 진행률 콜백 없이 부르면 대기열 박스에 구독별 진행(순번 포함)이
-		// 하나도 안 뜬다 — CollectController.runRecentAuto()를 거쳐 수동 실행과 같은 자리
-		// (activeFlow)에 진행 상태가 쌓이게 한다. Notice는 안 뜬다(runRecentAuto가 silent로
-		// 돈다 — 자동 수집/명령어 팔레트는 원래 조용히 도는 게 설계 의도였다). 왜 별도 sink로
-		// 우회하지 않고 CollectController를 거치는 쪽을 택했는지는 devLog(010) 참고.
+		// Task는 인터페이스라(src/common/Task.ts) `new Task()`로 만들 수 없다 — 객체
+		// 리터럴로 taskName/func을 채워 넘긴다.
 		const collectRecentTask: Task = {
 			taskName: 'collect:recent',
+			// collectflow.run()을 진행률 콜백 없이 부르면 대기열 박스에 구독별 진행(순번 포함)이
+			// 하나도 안 뜬다 — CollectController.runRecentAuto()를 거쳐 수동 실행과 같은 자리
+			// (activeFlow)에 진행 상태가 쌓이게 한다. Notice는 안 뜬다(runRecentAuto가 silent로
+			// 돈다 — 자동 수집/명령어 팔레트는 원래 조용히 도는 게 설계 의도였다). 왜 별도 sink로
+			// 우회하지 않고 CollectController를 거치는 쪽을 택했는지는 devLog(010) 참고.
 			func: () => this.collectController.runRecentAuto(),
 		};
 		this.taskManager.setTask(collectRecentTask);
@@ -185,9 +190,9 @@ export default class PaperGraph3D extends Plugin {
 		};
 		this.taskManager.setTask(collectRepairTask);
 
-		// 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + arXiv 개정판 감지) — 설정 탭
-		// 「새로고침」 버튼 전용. repair와 달리 실패한 것만이 아니라 전부 다시 확인하므로
-		// 별도 작업/이벤트로 둔다.
+		// 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + arXiv 개정판 감지) — 설정 탭/리본
+		// 「새로고침」 전용. repair와 달리 실패한 것만이 아니라 전부 다시 확인하므로 별도
+		// 작업/이벤트로 둔다.
 		const collectRefreshTask: Task = {
 			taskName: 'collect:refresh',
 			func: () => this.collectController.refreshAllAuto(),
@@ -201,7 +206,10 @@ export default class PaperGraph3D extends Plugin {
 		// 6번: 스케줄러도 같은 'collect:recent' 작업을 탄다 — 자동이든 수동이든 "최근 논문
 		// 수집"은 하나의 작업이고, 스케줄러는 그걸 언제 부를지만 결정한다.
 		this.eventListener.setEventListener('scheduler:collect-recent', 'collect:recent');
-		this.scheduler = new Scheduler(this.eventListener);
+		// registerTimer 콜백으로 Plugin.registerInterval을 넘긴다 — Scheduler는 Obsidian을
+		// 직접 import하지 않지만, 이 콜백을 통해 "타이머는 Plugin이 언로드 시 자동으로
+		// 치운다"는 보장을 그대로 받는다(Scheduler.ts 상단 주석 참고).
+		this.scheduler = new Scheduler(this.eventListener, (id) => this.registerInterval(id));
 	}
 
 	async activateVisualizationView(): Promise<void> {
@@ -222,6 +230,10 @@ export default class PaperGraph3D extends Plugin {
 	// 구독으로 넘어가는 것은 여기서 멈춘다 — 안 그러면 언로드 후에도 백그라운드에서
 	// 수집이 계속 돈다.
 	onunload() {
+		// 재귀 재예약(Scheduler.scheduleNext)이라 registerInterval로는 못 정리한다 —
+		// 명시적으로 멈추지 않으면 다음 목표 시각에 언로드된 플러그인이 여전히 타이머를
+		// 울릴 수 있다.
+		this.scheduler?.stop();
 		this.collectflow?.dispose();
 		// ⚠️ 임시 진단 코드 — 삭제 예정. flush 타이머가 안 치워지면 언로드 후에도 타이머가
 		// 남아 다음 로드 때 두 개의 타이머가 같은 파일을 두고 경쟁하게 된다.

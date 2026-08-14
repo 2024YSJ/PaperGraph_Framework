@@ -28,7 +28,7 @@ interface ApiDraft {
 	newConditionType: ConditionType;
 	newConditionQuery: string;
 	// 지금 화면의 이 카드가 디스크(Subscriptions.json)와 실제로 일치하는가. loadSubscriptions가
-	// 만든 카드는 true로 시작하고, 「API 추가」로 만든 새 카드나 조건을 고친 카드는 false로
+	// 만든 카드는 true로 시작하고, 「구독 추가」로 만든 새 카드나 조건을 고친 카드는 false로
 	// 바뀐다 — 「저장」을 눌러 실제로 반영되기 전까지는 "진짜 구독"과 "등록하려는 중인
 	// 구독"이 화면에서 구분되지 않아 헷갈린다는 피드백으로 추가했다.
 	saved: boolean;
@@ -210,7 +210,7 @@ export class ApiManagementModal extends Modal {
 
 		if (this.subscriptionsLoaded && this.apiDrafts.length === 0) {
 			new Setting(contentEl).setDesc(
-				'등록된 구독이 없습니다. 아래에서 API를 추가해 수집할 조건을 설정하세요.',
+				'등록된 구독이 없습니다. 아래에서 구독을 추가해 수집할 조건을 설정하세요.',
 			);
 		}
 
@@ -219,33 +219,23 @@ export class ApiManagementModal extends Modal {
 		// 반복돼 지금 어느 카드를 마무리해야 하는지 헷갈린다는 피드백으로 막았다. 먼저
 		// 그 카드를 저장하거나 지워야 다음 카드를 추가할 수 있다.
 		const hasUnsavedDraft = this.apiDrafts.some((draft) => !draft.saved);
+		// 지원 출처는 지금 arXiv 하나뿐이다 — 고를 게 하나뿐인 선택 UI(드롭다운)는 매 번
+		// 같은 값을 다시 고르게 할 뿐이라 없앴다. 지원 목록은 여전히 File의 API 레지스트리가
+		// 진실이므로, 그 첫 번째(유일한) 값을 그대로 쓴다. 나중에 수집 출처가 늘어나면 그때
+		// 다시 선택 UI를 붙이면 된다.
+		if (this.apiNameDraft.length === 0) {
+			this.apiNameDraft = File.supportedApiNames()[0] ?? '';
+		}
 		new Setting(contentEl)
-			.setName('API 추가')
+			.setName('구독 추가')
 			.setDesc(
 				hasUnsavedDraft
 					? '저장하지 않은 구독이 있습니다. 먼저 그 구독을 저장하거나 삭제해야 새 구독을 추가할 수 있습니다.'
-					: '구독 조건을 묶을 API를 목록에서 고릅니다. 새 API 지원은 코드에 등록하면 목록에 나타납니다.',
+					: '수집할 조건을 담을 새 구독을 추가합니다.',
 			)
-			.addDropdown((dropdown) => {
-				// 지원 목록은 File의 API 레지스트리가 진실이다 — 이름을 손으로 치게 하면
-				// 'arXiv' 같은 오타가 저장을 통과하고 다음 수집(createApi)에서야 터진다.
-				const names = File.supportedApiNames();
-				for (const name of names) {
-					dropdown.addOption(name, name);
-				}
-				// 첫 렌더는 loadSubscriptions()가 끝나기 전이라 draft가 비어 있을 수 있다.
-				// 그대로 두면 드롭다운은 첫 옵션을 보여주는데 내부 값만 ''이라, 사용자가
-				// 'arxiv'를 보면서 추가를 눌러도 아래 길이 검사에 걸려 아무 일도 안 일어난다.
-				if (this.apiNameDraft.length === 0) {
-					this.apiNameDraft = names[0] ?? '';
-				}
-				dropdown.setValue(this.apiNameDraft).onChange((value) => {
-					this.apiNameDraft = value;
-				});
-			})
 			.addButton((button) =>
 				button
-					.setButtonText('추가')
+					.setButtonText('구독 추가')
 					.setCta()
 					.setDisabled(hasUnsavedDraft)
 					.onClick(() => {
@@ -542,7 +532,7 @@ export class ApiManagementModal extends Modal {
 	}
 
 	// apiDrafts를 apiName(수집 출처)별로 묶어 접을 수 있는 그룹으로 그린다. 같은 apiName에
-	// 여러 구독(조건 묶음)을 등록할 수 있는데(위 "API 추가" 주석 참고), 예전에는 그 카드들이
+	// 여러 구독(조건 묶음)을 등록할 수 있는데(위 "구독 추가" 주석 참고), 예전에는 그 카드들이
 	// 화면에서 flat하게 나열돼 "이게 다 같은 출처인지" 한눈에 안 들어왔다는 피드백으로
 	// 트리 구조로 바꿨다. Subscriptions.apis 자체는 여전히 flat 배열이라(File.ts 참고)
 	// 데이터 모델은 안 바뀐다 — 순수하게 렌더링만 그룹 단위로 재구성한다.

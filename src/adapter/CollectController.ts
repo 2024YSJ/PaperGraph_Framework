@@ -14,7 +14,7 @@ import {
 	type SubscriptionProgressEntry,
 } from './CollectMiddlewares';
 
-// timestamp -> <input type="date">가 받는 "YYYY-MM-DD". Backfill 범위 입력의 기본값 계산용.
+// timestamp -> <input type="date">가 받는 "YYYY-MM-DD". 과거 논문 수집 범위 입력의 기본값 계산용.
 function isoDateInput(ms: number): string {
 	return new Date(ms).toISOString().slice(0, 10);
 }
@@ -90,7 +90,7 @@ interface ProgressFlow {
 // 필드는 밖으로 내보내지 않는다.
 export type CollectSubscriptionProgress = SubscriptionProgressEntry;
 
-// 수집 실행(최근/Backfill/보정)과 진행률 표시를 한 곳에 모은 컨트롤러.
+// 수집 실행(최근/과거 논문 수집/보정)과 진행률 표시를 한 곳에 모은 컨트롤러.
 //
 // 이전에는 이 로직이 SettingTab에 묶여 있었는데, 설정 탭을 안 거치고 리본 아이콘에서
 // 바로 수집을 실행할 수 있게 하면서 옮겼다 — 진행률 Notice·진단 미들웨어는 "지금 실행
@@ -157,7 +157,7 @@ export class CollectController implements CollectProgressSink {
 		}
 	}
 
-	// 클릭 위치에 "최근 논문 수집"/"Backfill" 선택 메뉴를 띄운다. 설정 탭의 「수집」
+	// 클릭 위치에 "최근 논문 수집"/"과거 논문 수집" 선택 메뉴를 띄운다. 설정 탭의 「수집」
 	// 버튼과 리본 아이콘이 이 메서드 하나를 공유한다.
 	openCollectMenu(evt: MouseEvent, app: App): void {
 		const menu = new Menu();
@@ -169,7 +169,7 @@ export class CollectController implements CollectProgressSink {
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle('Backfill — 과거 구간 수집')
+				.setTitle('과거 논문 수집')
 				.setIcon('calendar-range')
 				.onClick(() => this.openBackfillModal(app)),
 		);
@@ -201,14 +201,14 @@ export class CollectController implements CollectProgressSink {
 	openBackfillModal(app: App): void {
 		new SubscriptionTargetModal(
 			app,
-			'Backfill — 과거 구간 수집 · 구독 선택',
+			'과거 논문 수집 · 구독 선택',
 			true,
 			(targets, range) => {
 				// needsDateRange=true일 때만 열리는 창이라 range는 항상 온다 — 타입 좁히기용 가드.
 				if (!range) {
 					return;
 				}
-				const label = describeTargets('Backfill', targets);
+				const label = describeTargets('과거 논문 수집', targets);
 				void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
 					this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
 						this.plugin.collectflow.run(

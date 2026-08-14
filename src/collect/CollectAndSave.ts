@@ -323,7 +323,7 @@ export class CollectAndSave {
 		onApiStart?: (api: API, index: number, total: number) => void,
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
-		const label = mode === 'recent' ? '최근 논문 수집' : 'Backfill';
+		const label = mode === 'recent' ? '최근 논문 수집' : '과거 논문 수집';
 		return this.enqueue(
 			{ kind: mode, label },
 			() => this.runNow(mode, testOptions, onTotal, onApiStart, onApiDone),
@@ -999,12 +999,12 @@ export class CollectAndSave {
 		const now = Date.now();
 
 		if (mode === 'backfill') {
-			// backfill은 "어느 구간을 메울지"가 본질이라 범위 없이는 의미가 없다.
+			// backfill(과거 논문 수집)은 "어느 구간을 메울지"가 본질이라 범위 없이는 의미가 없다.
 			const from = testOptions?.from;
 			const to = testOptions?.to;
 			if (from === undefined || to === undefined || !Number.isFinite(from) || !Number.isFinite(to)) {
 				throw new Error(
-					'PaperGraph3D: Backfill에는 수집할 구간(from/to)이 필요합니다. 설정 탭의 Backfill 버튼에서 범위를 지정해 실행하세요.',
+					'PaperGraph3D: 과거 논문 수집에는 수집할 구간(from/to)이 필요합니다. 수집 메뉴의 과거 논문 수집 항목에서 범위를 지정해 실행하세요.',
 				);
 			}
 			return { from, to, advancesCursor: false };
