@@ -38,6 +38,23 @@ export class Paper {
 	extra: ExtraData = new ExtraData();
 }
 
+// "이 논문의 임베딩을 다시 계산해야 하는가"를 판단하기 위한 비교용 키.
+//
+// 새로고침(CollectAndSave.refreshAllBody)이 API 재조회 전후로 이 값을 떠서 비교한다. 이게
+// 없으면 재조회 경로가 `paper.title !== prev.title || paper.abstract !== prev.abstract`
+// 처럼 필드 이름을 직접 알아야 하는데, 그러면 임베딩 입력이 바뀔 때(예: 저자를 입력에
+// 포함) 재임베딩 판정이 조용히 어긋난다 — 필드가 늘었는데 비교는 옛 두 개만 하므로
+// "안 바뀐 것"으로 오판한다.
+//
+// ⚠️ Embedding.buildModelInput이 실제로 모델에 넣는 필드와 항상 같은 집합이어야 한다.
+// 두 함수를 하나로 합치지는 않는다 — 저쪽은 "모델 학습 포맷"(SPECTER2의 [SEP])이라
+// 모델을 교체하면 바뀌고, 이쪽은 "무엇이 달라지면 다시 계산해야 하는가"라는 도메인
+// 판단이다. 포맷이 아니라 필드 집합만 맞으면 되므로 구분자는 일부러 다르게 둔다 —
+// 제목 끝과 초록 앞이 우연히 이어붙어 서로 다른 논문이 같은 키를 갖는 일만 막으면 된다.
+export function embeddingSourceOf(paper: Paper): string {
+	return `${paper.title}\u0000${paper.abstract}`;
+}
+
 // 미들웨어가 만들어내는 값을 담는 자리. 요약이나 클러스터 라벨처럼 수집·임베딩이
 // 보장하지 않는 값은 Paper의 필수 필드로 둘 수 없어서 여기에 모은다.
 // 미들웨어를 새로 만들 때 그 미들웨어가 채울 필드를 여기에 optional로 추가한다.

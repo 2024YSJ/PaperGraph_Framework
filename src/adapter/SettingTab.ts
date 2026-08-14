@@ -98,7 +98,7 @@ export class SettingTab extends PluginSettingTab {
 
 		// citationsKnown이 이미 true인 논문은 수집 경로가 다시 조회하지 않는다(재시도 정책상
 		// 필요 없어서). 이 버튼은 그 스킵 규칙을 무시하고 저장된 전체 코퍼스의 인용수·제목·
-		// 초록을 강제로 다시 조회한다(지원하는 출처만, 출처 중립 — API.RefreshContent 참고).
+		// 초록을 강제로 다시 조회한다(지원하는 출처만, 출처 중립 — API.Refresh 참고).
 		// 내용이 실제로 달라진 논문만 임베딩도 함께 다시 계산한다.
 		new Setting(containerEl)
 			.setName('새로고침')

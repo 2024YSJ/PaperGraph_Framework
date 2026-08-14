@@ -5,7 +5,7 @@ import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { API, type CollectOptions, type SkippedEntryRecord } from './API';
 import { delay, describeFailure, runQuietly } from './ApiSupport';
-import { ExtraData, Paper } from './Paper';
+import { embeddingSourceOf, ExtraData, Paper } from './Paper';
 import type { SearchQuery } from './SearchQuery';
 
 // run()의 실제 수집 범위는 원래 Subscriptions(API별 SearchQuery)에서 읽어와야 하지만,
@@ -109,8 +109,14 @@ export interface CitationRepairStats {
 // 서킷브레이커 대응에 그 두 필드를 읽고 쓴다.
 export interface RefreshStats extends EmbedBreakerStats {
 	citationsRefreshed: number;
-	// 제목/초록이 실제로 달라져(콘텐츠 재조회 전후 비교) 재임베딩까지 이어진 논문 수.
+	// 제목/초록이 실제로 달라져(재조회 전후 embeddingSourceOf 비교) 재임베딩까지 이어진
+	// 논문 수.
 	reembedded: number;
+	// Refresh()가 예외를 던진 출처들 — collect()의 subscriptionFailures와 같은 이유(구독/
+	// 출처 격리 실패를 사용자에게 알리는 자리). API.Refresh는 "절대 안 던진다"는 계약이
+	// 없어(EnrichCitations와 달리) 구현체가 실수로 던질 수 있다 — 그 경우에도 다른 출처의
+	// 새로고침은 계속 진행되고, 여기에 무엇이 실패했는지만 남는다.
+	failedApis: { apiName: string; error: string }[];
 }
 
 // 7번(부분 재조회) 실행 하나의 집계 (retrySkippedEntries()가 남긴다). recovered는
@@ -364,15 +370,15 @@ export class CollectAndSave {
 		);
 	}
 
-
 	// 전체 코퍼스 강제 새로고침 — citationsKnown과 무관하게 모든 논문의 인용수를 다시
-	// 조회하고, 콘텐츠(제목/초록/저자) 재조회를 지원하는 출처(API.RefreshContent를 구현한
-	// 것들)는 최신값으로 동기화한다. 실제로 내용이 달라진 논문만 재임베딩까지 이어진다
-	// (refreshAllBody가 호출 전후 스냅샷으로 판단). 어떤 출처가 콘텐츠 재조회를 지원하는지는
-	// 여기서 알 필요가 없다 — refreshAllBody가 API별로 RefreshContent 존재 여부만 보고
-	// 위임한다. repair 계열과 달리 "실패한 것만"이 아니라 "전부 다시" 확인하는 게 목적이라
-	// 별도 job kind('refresh')로 둔다 — 사용자가 명시적으로 누르는 수동 동작(설정 탭
-	// 「새로고침」 버튼)이다.
+	// 조회하고, 콘텐츠(제목/초록/저자) 재조회를 지원하는 출처(API.Refresh를 구현한 것들)는
+	// 최신값으로 동기화한다. 실제로 내용이 달라진 논문만 재임베딩까지 이어진다
+	// (refreshAllBody가 호출 전후 embeddingSourceOf 스냅샷으로 판단). 어떤 출처가 재조회를
+	// 지원하는지는 여기서 알 필요가 없다 — refreshAllBody가 API별로 Refresh 존재 여부만
+	// 보고 위임한다. repair 계열과 같은 이유로 미들웨어를 돌리지 않는다(저장된 값의 필드
+	// 몇 개를 고치는 작업이라 다이어그램의 수집 흐름 범위 밖 — repairEmbeddingsBody 참고).
+	// repair 계열과 달리 "실패한 것만"이 아니라 "전부 다시" 확인하는 게 목적이라 별도 job
+	// kind('refresh')로 둔다 — 사용자가 명시적으로 누르는 수동 동작(설정 탭/리본 「새로고침」)이다.
 	//
 	// onProgress는 API/구독 단위가 아니라 전체 코퍼스 논문 수 기준 flat done/total이다 —
 	// 인용수/콘텐츠 재확인은 "구독별로 다른 진행"을 보여줄 이유가 없다(run()의 구독별
@@ -701,6 +707,12 @@ export class CollectAndSave {
 			stats.attempted += targets.length;
 			await File.createApi(apiName, [], secret).EnrichCitations(targets);
 			for (const paper of targets) {
+				if (this.disposed) {
+					// 논문 단위 안전 경계 — repairEmbeddingsBody와 같은 원칙. EnrichCitations
+					// 호출 자체는 이미 끝났으므로(위), 여기서 멈추는 건 "이미 받아온 결과를
+					// 얼마나 저장했는가"의 문제일 뿐이다.
+					break;
+				}
 				if (paper.citationsKnown) {
 					stats.citationsFixed += 1;
 					try {
@@ -718,14 +730,15 @@ export class CollectAndSave {
 	}
 
 	// 새로고침 몸통 — repairCitationsBody와 같은 API별 순회 구조지만 citationsKnown 필터가
-	// 없다(강제 재조회가 목적). RefreshContent를 구현한 API(예: ArxivAPI)는 콘텐츠까지
-	// 동기화한다 — optional 메서드라 구현하지 않은 API는 자연히 건너뛴다. 여기서는 어떤
-	// API가 이걸 지원하는지 전혀 몰라도 된다(출처 중립).
+	// 없다(강제 재조회가 목적). 새로고침 로직이 아는 API 표면은 apiName과 Refresh 뿐이다 —
+	// 인용수 강제 재조회와 콘텐츠 동기화의 조합은 각 API 구현체(예: ArxivAPI.Refresh) 내부
+	// 결정이라 여기서 알지 않는다. Refresh는 optional이라 구현하지 않은 API는 자연히
+	// 건너뛴다(출처 중립).
 	//
-	// "실제로 바뀌었는지"는 RefreshContent 호출 전후 title/abstract 스냅샷을 비교해
-	// 이 메서드가 직접 판단한다 — API 구현체는 "최신값을 가져와 반영한다"까지만 책임지고,
-	// 그 값으로 재임베딩할지는 도메인(CollectAndSave)의 결정이라는 관심사 분리
-	// (EnrichCitations가 인용수만 채우고 그걸 어디에 쓸지는 호출부가 정하는 것과 같은 구도).
+	// "실제로 바뀌었는지"는 Refresh 호출 전후 embeddingSourceOf 스냅샷을 비교해 이 메서드가
+	// 직접 판단한다 — API 구현체는 "최신값을 가져와 반영한다"까지만 책임지고, 그 값으로
+	// 재임베딩할지는 도메인(CollectAndSave)의 결정이라는 관심사 분리(EnrichCitations가
+	// 인용수만 채우고 그걸 어디에 쓸지는 호출부가 정하는 것과 같은 구도).
 	//
 	// 진행률은 API별이 아니라 코퍼스 전체 논문 수 기준 flat done/total이다 — old
 	// PaperGraph3D 프로젝트의 bulkRefresh.ts와 같은 단순한 형태.
@@ -738,6 +751,7 @@ export class CollectAndSave {
 			reembedded: 0,
 			embedWaits: 0,
 			embedGaveUp: false,
+			failedApis: [],
 		};
 		if (this.disposed) {
 			return stats;
@@ -756,20 +770,46 @@ export class CollectAndSave {
 				continue;
 			}
 			const api = File.createApi(apiName, [], secret);
-			await api.EnrichCitations(targets, { force: true });
+			if (!api.Refresh) {
+				// 이 출처는 재조회를 지원하지 않는다 — 갱신할 방법이 없으므로 건너뛴다.
+				continue;
+			}
 
-			// RefreshContent 호출 전 스냅샷 — 호출 후 이 값과 달라진 논문만 재임베딩한다.
+			// Refresh 호출 전 스냅샷 — 호출 후 이 값과 달라진 논문만 재임베딩한다.
 			const before = new Map(
-				targets.map((paper) => [paper.sourceId, { title: paper.title, abstract: paper.abstract }]),
+				targets.map((paper) => [paper.sourceId, embeddingSourceOf(paper)]),
 			);
-			if (api.RefreshContent) {
-				await api.RefreshContent(targets);
+			try {
+				// ⚠️ API.Refresh는 EnrichCitations와 달리 "절대 안 던진다"는 계약이 없다
+				// (인터페이스 주석 참고) — 구현체가 실수로 던질 수 있다는 전제로 collect()와
+				// 같은 출처 격리를 여기서도 명시적으로 건다. 이게 없으면 한 출처의 Refresh
+				// 실패가 refreshAllBody 전체를 그 자리에서 죽여, 아직 순회하지 않은 나머지
+				// 출처는 이번 새로고침에서 아예 시도조차 못 하게 된다.
+				await api.Refresh(targets);
+			} catch (error) {
+				const { code, label, hint } = describeFailure(error);
+				const hintText = hint ? ` — ${hint}` : '';
+				Log.error(
+					'collect',
+					`새로고침 실패 [${code}] — [${apiName}] — ${label}${hintText} — 다음 출처로 진행`,
+					error,
+					{ apiName },
+				);
+				stats.failedApis.push({ apiName, error: label });
+				// 이 출처의 논문들은 이번 새로고침에서 갱신되지 않았다 — done/total에도
+				// 반영하지 않는다(citationsRefreshed를 늘리면 "다시 확인했다"는 뜻이 되어
+				// 사실과 어긋난다).
+				continue;
 			}
 
 			for (const paper of targets) {
-				const prev = before.get(paper.sourceId);
-				const contentChanged =
-					prev !== undefined && (paper.title !== prev.title || paper.abstract !== prev.abstract);
+				if (this.disposed) {
+					// 논문 단위 안전 경계 — repairEmbeddingsBody와 같은 원칙(어느 논문에서
+					// 멈추든 나머지는 "아직 새로고침 안 된 상태"로 남을 뿐이다). 이 출처의
+					// 나머지 논문과, 아직 순회하지 않은 다음 출처는 건너뛴다.
+					break;
+				}
+				const contentChanged = before.get(paper.sourceId) !== embeddingSourceOf(paper);
 				if (contentChanged) {
 					// embedOrReuse는 embeddingSucceeded가 이미 true면 재계산을 스킵한다 — 이
 					// 리셋 한 줄이 곧 "재임베딩 강제 트리거"다. 서킷브레이커 대응(쿨다운
@@ -796,9 +836,9 @@ export class CollectAndSave {
 		return stats;
 	}
 
-	// 새로고침 전용 진입점 — 대상을 좁히지 않는다(코퍼스 전체). 사용자가 설정 탭 「새로고침」
-	// 버튼을 누를 때만 실행되는 수동 경로다(repairCitationsNow처럼 수집 후 자동으로 도는
-	// 경로가 아니다).
+	// 새로고침 전용 진입점 — 대상을 좁히지 않는다(코퍼스 전체). 사용자가 설정 탭/리본
+	// 「새로고침」을 누를 때만 실행되는 수동 경로다(repairCitationsNow처럼 수집 후 자동으로
+	// 도는 경로가 아니다).
 	private async refreshAllNow(onProgress?: (done: number, total: number) => void): Promise<void> {
 		const papers = await this.loadRepairTargets();
 		const stats = await this.refreshAllBody(papers, onProgress);
@@ -893,11 +933,16 @@ export class CollectAndSave {
 		const secret = await File.readSecret();
 		const stillMissingRecords: SkippedEntryRecord[] = [];
 		const embedStats: EmbedBreakerStats = { embedWaits: 0, embedGaveUp: false };
-		for (const group of groups.values()) {
+		const groupList = Array.from(groups.values());
+		for (const [index, group] of groupList.entries()) {
 			if (this.disposed) {
-				// 아직 처리 안 한 그룹은 레코드를 그대로 남긴다 — 다음 재수집 시도가 이어받는다.
-				stillMissingRecords.push(...group.records);
-				continue;
+				// 그룹 단위 안전 경계 — 다른 보정 몸통들과 같은 원칙(disposed면 break로 즉시
+				// 빠져나간다). 아직 처리 안 한 이 그룹과 나머지 그룹은 레코드를 그대로 남겨
+				// 다음 재수집 시도가 이어받게 한다.
+				for (const remaining of groupList.slice(index)) {
+					stillMissingRecords.push(...remaining.records);
+				}
+				break;
 			}
 			const api = File.createApi(group.apiName, [], secret);
 			if (!api.RetryMissingEntries) {
@@ -922,6 +967,18 @@ export class CollectAndSave {
 			);
 
 			for (const paper of recovered) {
+				if (this.disposed) {
+					// 논문 단위 안전 경계 — repairEmbeddingsBody와 같은 원칙. 이미
+					// RetryMissingEntries로 복구는 됐지만 아직 저장 전인 논문은, 처리하지
+					// 않고 넘기면 recovered로도 stillMissing으로도 안 잡혀 SkippedEntries.json
+					// 기록에서 조용히 사라진다 — 다음 재수집이 다시 잡을 수 있도록 여기서도
+					// stillMissing으로 남긴다.
+					const orphaned = recordByLocalId.get(paper.sourceId.split(':')[1] ?? '');
+					if (orphaned) {
+						stillMissingRecords.push(orphaned);
+					}
+					continue;
+				}
 				await this.prefillFromStore([paper]);
 				await runQuietly(() => api.EnrichCitations([paper]), 'retrySkippedEntries.EnrichCitations');
 				await this.embedOrReuse(paper, embedStats);

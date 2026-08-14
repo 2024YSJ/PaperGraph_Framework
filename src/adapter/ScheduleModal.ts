@@ -106,30 +106,39 @@ export class ScheduleModal extends Modal {
 		// 없앤다(다시 켜면 즉시 1회 실행되므로 확인도 바로 된다).
 		const locked = this.scheduleSettings.enabled;
 		new Setting(contentEl)
-			.setName('실행 시각 (0~23시)')
+			.setName('실행 시각')
 			.setDesc(
 				locked
 					? '자동 수집을 끄면 실행 시각을 바꿀 수 있습니다.'
 					: '매일 이 시각에 자동 수집을 실행합니다. 그 시각에 옵시디언이 꺼져 있었다면 ' +
-						'다음에 열었을 때 즉시 캐치업 실행됩니다.',
+						'다음에 열었을 때 즉시 캐치업 실행됩니다 — 캐치업은 "지금이 이 시:분을 ' +
+						'지났는가"로 판단하므로, 평소 옵시디언을 여는 시:분에 맞춰두면 열 때마다 ' +
+						'정확히 한 번 실행됩니다.',
 			)
 			.addText((text) => {
-				text.inputEl.type = 'number';
-				text.inputEl.min = '0';
-				text.inputEl.max = '23';
+				// type="time"의 네이티브 값 포맷은 항상 "HH:MM"(24시간제) — 별도 파서 없이
+				// 분 단위까지 그대로 오간다.
+				text.inputEl.type = 'time';
 				text.setDisabled(locked);
-				text.setValue(String(this.scheduleSettings.targetHour)).onChange((value) => {
-					// Number('')는 0이라 빈 칸으로 지우면 그대로 통과해 "0시"로 조용히
-					// 저장돼버린다 — 아직 입력 중(지우는 중)인 빈 칸은 명시적으로 무시한다.
-					if (value.trim().length === 0) {
-						return;
-					}
-					const hour = Number(value);
-					if (!Number.isInteger(hour) || hour < 0 || hour > 23) {
-						return;
-					}
-					void this.updateScheduleSettings({ targetHour: hour });
-				});
+				text.setValue(ScheduleModal.formatTime(this.scheduleSettings.targetHour, this.scheduleSettings.targetMinute))
+					.onChange((value) => {
+						// 입력 중(지우는 중) 빈 값이나 아직 "HH:MM"을 다 못 채운 값은 무시한다 —
+						// time input은 완성되기 전까지 빈 문자열을 낸다.
+						const match = /^(\d{2}):(\d{2})$/.exec(value);
+						if (!match) {
+							return;
+						}
+						const hour = Number(match[1]);
+						const minute = Number(match[2]);
+						if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+							return;
+						}
+						void this.updateScheduleSettings({ targetHour: hour, targetMinute: minute });
+					});
 			});
+	}
+
+	private static formatTime(hour: number, minute: number): string {
+		return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
 	}
 }
