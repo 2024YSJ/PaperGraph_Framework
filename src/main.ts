@@ -92,7 +92,9 @@ export default class PaperGraph3D extends Plugin {
 		// vault의 개인 노트를 임베딩해 논문 노드와 같은 그래프에 얹는 시각화 미들웨어 등록.
 		// 다른 시각화 미들웨어의 등록 여부/순서에 의존하지 않으므로 순서는 상관없다.
 		this.visualflow.setMiddleware(
-			new PersonalNoteMiddleware(this.app, this.collectflow.embedding),
+			new PersonalNoteMiddleware(this.app, this.collectflow.embedding, () =>
+				this.visualflow.run(),
+			),
 		);
 		File.init(this.app.vault, this.manifest.dir ?? '');
 		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면

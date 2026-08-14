@@ -21,3 +21,52 @@
 	position: absolute;
 	inset: 0;
 }
+
+/* 개인 노트 컨트롤 패널(PersonalNoteMiddleware) — 그래프 캔버스 위 오버레이.
+   .papergraph3d-graph가 이미 position:absolute라 이 안에서 top/right로 앵커된다. */
+.papergraph3d-note-panel {
+	position: absolute;
+	top: 8px;
+	right: 8px;
+	z-index: 10;
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	max-width: 220px;
+	padding: 8px 10px;
+	border-radius: 6px;
+	background: rgba(30, 30, 30, 0.85);
+	color: #eee;
+	font-size: 12px;
+}
+
+.papergraph3d-note-toggle-row {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	cursor: pointer;
+}
+
+.papergraph3d-note-path-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.papergraph3d-note-path-row {
+	display: flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.papergraph3d-note-path-input {
+	flex: 1 1 auto;
+	min-width: 0;
+	box-sizing: border-box;
+}
+
+.papergraph3d-note-path-remove {
+	flex: 0 0 auto;
+	line-height: 1;
+	cursor: pointer;
+}
