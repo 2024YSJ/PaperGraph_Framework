@@ -20,6 +20,7 @@ import { File } from './common/File';
 import { Log } from './common/Log';
 import { SettingTab } from './adapter/SettingTab';
 import { ApiManagementModal } from './adapter/ApiManagementModal';
+import { ScheduleModal } from './adapter/ScheduleModal';
 import { CollectController } from './adapter/CollectController';
 import { VisualizationView, VIEW_TYPE_PAPERGRAPH3D } from './adapter/VisualizationView';
 
@@ -118,6 +119,20 @@ export default class PaperGraph3D extends Plugin {
 
 		this.addRibbonIcon('rss', '구독 관리', () => {
 			new ApiManagementModal(this.app, this).open();
+		});
+
+		// 자동 수집 설정(켜기/끄기·실행 시각)도 구독 관리와 같은 이유로 설정 탭을
+		// 거치지 않고 바로 열 수 있게 한다 — ScheduleModal.ts 참고.
+		this.addCommand({
+			id: 'open-schedule-manager',
+			name: '자동 수집 관리 열기',
+			callback: () => {
+				new ScheduleModal(this.app, this).open();
+			},
+		});
+
+		this.addRibbonIcon('clock', '자동 수집 관리', () => {
+			new ScheduleModal(this.app, this).open();
 		});
 	}
 
