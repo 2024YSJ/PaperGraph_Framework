@@ -3,7 +3,8 @@ import { ExtraData, Paper } from '../collect/Paper';
 // 클러스터링 한 번의 결과 요약. 논문별 번호는 paper.extra.clusterId에 들어간다
 // (미들웨어가 만든 값은 extra에 모은다 — Paper.ts의 ExtraData 참고).
 export interface ClusterResult {
-	clusterCount: number; // 나눈 덩어리 수 (자동으로 정한 k)
+	clusterCount: number; // 실제로 나눈 덩어리 수
+	requestedCount: number; // 요청받은 수 (0이면 구독 개수에서 자동). clusterCount와 다르면 잘린 것
 	clustered: number; // 어느 덩어리엔가 속한 논문 수
 	ambiguous: number; // 덩어리 사이에 껴서 판정을 보류한 논문 수(= 색을 칠하지 않는다)
 	skipped: number; // 임베딩이 없어 계산에서 빠진 논문 수
@@ -58,6 +59,14 @@ export class Clustering {
 	// 구분이 안 될 만큼 뭉개진다(표본 크기 주석 참고).
 	private static readonly MAX_ITERATIONS = 60;
 
+	// 덩어리 수의 상한. 사용자가 직접 넣든 구독 개수에서 오든 여기서 잘린다.
+	//
+	// 실제 볼트 8334편으로 잰 값 — k가 커질수록 느려지고 덩어리가 잘아진다:
+	//   k=9  1.1초, 덩어리당 651편   k=20  4.8초, 285편   k=50  7.1초, 107편(최소 28편)
+	// 20에서 이미 5초에 가깝고, 색이 10가지뿐이라 그 위로는 색이 두 바퀴 넘게 돌아 화면에서
+	// 구분이 안 된다. 구독을 100개 등록해도 여기서 막힌다.
+	private static readonly MAX_K = 20;
+
 	// 판정을 보류하는 기준. 자기 덩어리 중심까지의 거리가 두 번째로 가까운 중심까지의
 	// 거리와 이 비율 안쪽이면 "사이에 낀 논문"으로 보고 번호를 주지 않는다.
 	//
@@ -90,9 +99,10 @@ export class Clustering {
 
 	// 논문들을 묶고 각 논문의 extra.clusterId를 채운다. 보류된 논문과 임베딩이 없는 논문은
 	// 값을 비운다 — 지난 계산의 번호가 남아 엉뚱한 색으로 그려지지 않게 한다.
-	run(papers: Paper[]): ClusterResult {
+	// requestedCount가 0이면 구독 개수에서 자동으로 정한다(chooseK).
+	run(papers: Paper[], requestedCount = 0): ClusterResult {
 		const valid = Clustering.selectValid(papers);
-		const key = Clustering.cacheKey(valid);
+		const key = Clustering.cacheKey(valid, requestedCount);
 		if (key === this.cachedKey && this.cachedResult) {
 			Clustering.applyLabels(papers, this.cachedLabels);
 			return this.cachedResult;
@@ -103,13 +113,14 @@ export class Clustering {
 		if (valid.length >= Clustering.MIN_PAPERS) {
 			const dim = valid[0]?.embedding.length ?? 0;
 			const vectors = Clustering.pack(valid, dim);
-			const k = Clustering.chooseK(valid);
+			const k = Clustering.chooseK(valid, requestedCount);
 			const centroids = Clustering.kmeans(vectors, valid.length, dim, k, Clustering.MAX_ITERATIONS);
 			clusterCount = Clustering.assign(vectors, valid, dim, k, centroids, labels, this.previousLabels);
 		}
 
 		const result: ClusterResult = {
 			clusterCount,
+			requestedCount,
 			clustered: labels.size,
 			ambiguous: valid.length - labels.size,
 			skipped: papers.length - valid.length,
@@ -134,10 +145,13 @@ export class Clustering {
 		return usable.filter((paper) => paper.embedding.length === dim);
 	}
 
-	// 캐시를 그대로 쓸 수 있는지 판단하는 열쇠. 정렬돼 있으므로 논문이 추가·삭제되면
-	// 편수와 양 끝 sourceId 중 하나는 반드시 달라진다.
-	private static cacheKey(valid: Paper[]): string {
-		return `${valid.length}|${valid[0]?.sourceId ?? ''}|${valid[valid.length - 1]?.sourceId ?? ''}`;
+	// 캐시를 그대로 쓸 수 있는지 판단하는 열쇠. 정렬돼 있으므로 논문이 추가·삭제되면 편수와
+	// 양 끝 sourceId 중 하나는 반드시 달라진다. 요청한 덩어리 수도 넣어야 한다 — 빼면
+	// 사용자가 숫자를 바꿔도 캐시가 그대로 맞아떨어져 화면이 안 바뀐다.
+	private static cacheKey(valid: Paper[], requestedCount: number): string {
+		const first = valid[0]?.sourceId ?? '';
+		const last = valid[valid.length - 1]?.sourceId ?? '';
+		return `${valid.length}|${first}|${last}|${requestedCount}`;
 	}
 
 	// 계산 결과를 논문에 싣는다. 목록에 없는 논문은 비워, 지난번엔 묶였다가 이번엔 빠진
@@ -170,26 +184,41 @@ export class Clustering {
 	//
 	// 대신 이미 알고 있는 값을 쓴다: 논문을 몇 개의 구독으로 모았는가. 추측이 아니라 기록이라
 	// 흔들리지 않고, 탐색이 사라져 훨씬 빠르다.
-	private static chooseK(papers: Paper[]): number {
-		// 서로 다른 구독이 몇 개인지 센다. 논문마다 "어떤 구독으로 수집됐는가"가 남아 있고,
+	private static chooseK(papers: Paper[], requested: number): number {
+		const limit = Clustering.maxK(papers.length);
+		if (requested > 0) {
+			// 사용자가 정한 값. 범위 밖이면 자른다 — 1이면 전부 한 색이라 나눈 의미가 없고,
+			// 너무 크면 느려지는 데다 색이 돌아 쓰여 화면에서 구분되지 않는다.
+			return Math.min(Math.max(requested, Clustering.MIN_K), limit);
+		}
+
+		// 안 정했으면 구독 개수를 쓴다. 논문마다 "어떤 구독으로 수집됐는가"가 남아 있고,
 		// 조건을 여러 개 AND로 묶은 구독도 한 줄('combined')로 합쳐져 저장되므로, 서로 다른
-		// 문자열 개수가 곧 구독 개수다. Subscriptions.json을 읽지 않는 이유는 그 파일이
-		// "지금 구독 중인 것"만 담기 때문이다 — 구독을 지워도 그 논문은 화면에 남아 있으므로,
-		// 실제로 그려지는 논문이 어디서 왔는지를 세는 쪽이 맞다(실측: 파일에는 3개만 남아
-		// 있었지만 논문에는 7개가 기록돼 있었고, 7이 옳은 값이었다).
+		// 문자열 개수가 곧 구독 개수다(SearchQuery.combineQueries). Subscriptions.json을 읽지
+		// 않는 이유는 그 파일이 "지금 구독 중인 것"만 담기 때문이다 — 구독을 지워도 그 논문은
+		// 화면에 남아 있으므로, 실제로 그려지는 논문이 어디서 왔는지를 세는 쪽이 맞다(실측:
+		// 파일에는 3개만 남아 있었지만 논문에는 7개가 기록돼 있었고, 7이 옳은 값이었다).
 		const subscriptions = new Set<string>();
 		for (const paper of papers) {
 			for (const query of paper.collectedQueries ?? []) {
 				subscriptions.add(query.query);
 			}
 		}
-
-		// 표본 한 덩어리에 최소 인원은 있어야 하므로 그만큼에서 자른다.
-		const limit = Math.max(
-			Clustering.MIN_K,
-			Math.floor(Clustering.sampleSize(papers.length) / Clustering.MIN_SAMPLES_PER_CLUSTER),
-		);
 		return Math.min(Math.max(subscriptions.size, Clustering.MIN_K), limit);
+	}
+
+	// 이 논문 수에서 허용하는 덩어리 수의 상한. 고정값으로 두면 논문이 적은 사람에게 너무
+	// 커진다(100편을 20덩어리로 나누면 덩어리당 5편이다). UI가 입력칸의 최대값으로 쓴다.
+	static maxK(paperCount: number): number {
+		return Math.max(
+			Clustering.MIN_K,
+			Math.min(Clustering.MAX_K, Math.floor(paperCount / Clustering.MIN_SAMPLES_PER_CLUSTER)),
+		);
+	}
+
+	// UI가 입력칸에 그대로 쓸 수 있는 하한.
+	static get minK(): number {
+		return Clustering.MIN_K;
 	}
 
 	// 표본을 뽑는다. sourceId 해시가 작은 것부터 필요한 수만큼 — 무작위가 아니라 결정적이고,

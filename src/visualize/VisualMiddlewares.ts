@@ -110,13 +110,12 @@ export class EdgeToggleMiddleware implements Middleware {
 	}
 }
 
-// 클러스터별 색. 색맹 친화 팔레트에서 고른 값들로, 인접한 번호끼리 잘 구분된다.
-// 덩어리가 이보다 많으면 앞에서부터 다시 쓴다 — 번호가 크기순이라 큰 덩어리부터
-// 서로 다른 색을 갖는다.
+// 클러스터별 색. 서로 잘 구분되도록 고른 값들로, 앞쪽일수록 차이가 크다 — 번호가 크기순이라
+// 큰 덩어리부터 뚜렷한 색을 갖는다. 개수는 Clustering.MAX_K(20)와 맞춰, 상한까지 나눠도
+// 색이 겹치지 않게 했다(그보다 많아지면 앞에서부터 다시 쓴다).
 const CLUSTER_COLORS = [
 	'#e6194b',
 	'#3cb44b',
-	'#ffe119',
 	'#4363d8',
 	'#f58231',
 	'#911eb4',
@@ -124,6 +123,17 @@ const CLUSTER_COLORS = [
 	'#f032e6',
 	'#bcf60c',
 	'#008080',
+	'#9a6324',
+	'#800000',
+	'#aaffc3',
+	'#808000',
+	'#ffd8b1',
+	'#000075',
+	'#a9a9a9',
+	'#fabed4',
+	'#dcbeff',
+	'#fffac8',
+	'#ffe119',
 ];
 const COLOR_UNCLUSTERED = '#8a8a8a'; // 회색 — 어느 덩어리에도 안 속한 논문
 
@@ -152,6 +162,8 @@ export class ClusterColorMiddleware implements Middleware {
 	private forceGraph: ForceGraph3DInstance | undefined;
 	private on = false;
 	private result: ClusterResult | undefined;
+	// 사용자가 정한 덩어리 수. 0이면 구독 개수에서 자동으로 정한다(Clustering.chooseK).
+	private requestedCount = 0;
 
 	// 버튼이 읽는 상태 — 지금 켜져 있는가, 어떻게 나뉘었는가(덩어리 수·보류된 논문 수).
 	get enabled(): boolean {
@@ -178,8 +190,12 @@ export class ClusterColorMiddleware implements Middleware {
 		}
 	}
 
-	// 그래프 좌상단에 켜고 끄는 스위치를 얹는다. 스위치는 자기 자신(toggle)을 부르고,
-	// 나뉜 덩어리 수를 옆에 표시한다.
+	// 그래프 위에 이 미들웨어만의 조작부를 얹는다 — 켜고 끄는 스위치와, 몇 덩어리로 나눌지
+	// 직접 넣는 칸. 다른 미들웨어(EdgeToggleMiddleware)와 같은 방식으로 자기 UI를 소유한다.
+	//
+	// 덩어리 수는 데이터만으로 정해지지 않는다 — 실루엣·CH지수·BIC를 실제 볼트로 재봤더니
+	// 각각 2, 2, 14+를 가리켰다(Clustering 주석 참고). "몇 덩어리로 볼 것인가"는 크게 볼지
+	// 잘게 볼지의 선택에 가까워서, 비워두면 구독 개수로 정하되 사용자가 덮어쓸 수 있게 한다.
 	private addSwitch(container: HTMLElement | undefined): void {
 		if (!container) {
 			return;
@@ -190,13 +206,49 @@ export class ClusterColorMiddleware implements Middleware {
 		const input = label.createEl('input', { attr: { type: 'checkbox' } });
 		input.checked = this.on;
 		label.createSpan({ cls: 'slider' });
+
+		// 덩어리 수 입력칸. 범위는 논문 수에 따라 달라진다(적은 논문을 잘게 쪼개면 덩어리당
+		// 몇 편 안 남는다). 넘겨도 Clustering이 잘라내지만, 여기서 미리 알려주는 편이 낫다.
+		const maxCount = Clustering.maxK(this.graph?.nodes.length ?? 0);
+		const count = wrap.createEl('input', {
+			cls: 'papergraph3d-cluster-count',
+			attr: {
+				type: 'number',
+				min: String(Clustering.minK),
+				max: String(maxCount),
+				placeholder: '자동',
+				title: `덩어리 수 (${Clustering.minK}~${maxCount}, 비우면 구독 개수)`,
+			},
+		});
+		count.value = this.requestedCount > 0 ? String(this.requestedCount) : '';
+
 		const info = wrap.createSpan({ cls: 'papergraph3d-cluster-info' });
 		const showResult = (): void => {
-			info.setText(this.on && this.result ? `${this.result.clusterCount}개 덩어리` : '');
+			if (!this.on || !this.result) {
+				info.setText('');
+				return;
+			}
+			// 요청한 값이 잘렸으면 그 사실을 알려준다 — 안 그러면 왜 숫자가 다른지 알 수 없다.
+			const { clusterCount, requestedCount } = this.result;
+			const clamped = requestedCount > 0 && requestedCount !== clusterCount;
+			info.setText(clamped ? `${clusterCount}개 덩어리 (${requestedCount}에서 조정)` : `${clusterCount}개 덩어리`);
+			count.value = this.requestedCount > 0 ? String(clusterCount) : '';
 		};
 		showResult();
+
 		input.addEventListener('change', () => {
 			this.toggle();
+			showResult();
+		});
+		count.addEventListener('change', () => {
+			const value = Number(count.value);
+			this.requestedCount = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+			// 켜져 있을 때만 다시 칠한다(꺼져 있으면 켜는 순간 새 값으로 계산된다). paint는
+			// previousColors를 이미 채워둔 노드는 건너뛰므로, 클러스터 색을 "원래 색"으로
+			// 잘못 기억하지 않는다.
+			if (this.on) {
+				this.paint();
+			}
 			showResult();
 		});
 	}
@@ -218,7 +270,7 @@ export class ClusterColorMiddleware implements Middleware {
 		if (!graph) {
 			return;
 		}
-		this.result = this.clustering.run(graph.nodes.map((node) => node.paper));
+		this.result = this.clustering.run(graph.nodes.map((node) => node.paper), this.requestedCount);
 		for (const node of graph.nodes) {
 			if (!this.previousColors.has(node.id)) {
 				this.previousColors.set(node.id, node.color);
