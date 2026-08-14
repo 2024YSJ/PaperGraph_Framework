@@ -271,11 +271,11 @@ export class CollectController implements CollectProgressSink {
 	}
 
 	// 전체 코퍼스 강제 새로고침(인용수 재조회 + 콘텐츠 동기화 + 조건부 재임베딩) — 설정 탭
-	// 「새로고침」 버튼이 부른다. runWithProgress(구독별 ProgressFlow.subscriptions 배열
-	// 전제)를 재사용하지 않는다 — refreshAll의 진행은 API/구독 단위가 아니라 코퍼스 전체
-	// 논문 수 기준 flat done/total이라 그 배열 구조와 안 맞는다. 대신 Notice 하나를 직접
-	// 갱신하는 가벼운 전용 처리를 쓴다 — Backfill/최근수집이 쓰는 "N/총M편" 어휘를 그대로
-	// 맞춘다.
+	// 「새로고침」 버튼과 리본 아이콘이 부른다. runWithProgress(구독별 ProgressFlow.subscriptions
+	// 배열 전제)를 재사용하지 않는다 — refreshAll의 진행은 API/구독 단위가 아니라 코퍼스
+	// 전체 논문 수 기준 flat done/total이라 그 배열 구조와 안 맞는다. 대신 Notice 하나를
+	// 직접 갱신하는 가벼운 전용 처리를 쓴다 — Backfill/최근수집이 쓰는 "N/총M편" 어휘를
+	// 그대로 맞춘다.
 	async refreshAllAuto(): Promise<string | void> {
 		const label = '새로고침';
 		const notice = new Notice(`${label} — 준비 중...`, 0);
@@ -284,7 +284,16 @@ export class CollectController implements CollectProgressSink {
 				notice.setMessage(`${label} — 처리 중 (${done}/${total}편)`);
 			});
 			const stats = this.plugin.collectflow.lastRefreshStats;
-			const detail = stats ? `${stats.citationsRefreshed}편 확인, ${stats.reembedded}편 재임베딩` : undefined;
+			// 출처 하나가 실패해도 나머지는 계속 새로고침되므로(CollectAndSave.refreshAllBody의
+			// 출처 격리), 그 사실을 완료 문구에서 조용히 감추지 않는다 — collect()의
+			// failedSubscriptions를 buildPartialFailureSuffix가 알리는 것과 같은 이유.
+			const failedText =
+				stats && stats.failedApis.length > 0
+					? ` — ${stats.failedApis.map((f) => f.apiName).join(', ')} 실패`
+					: '';
+			const detail = stats
+				? `${stats.citationsRefreshed}편 확인, ${stats.reembedded}편 재임베딩${failedText}`
+				: undefined;
 			new Notice(`${label} — 완료했습니다.${detail ? ` (${detail})` : ''}`);
 			Log.info('ui', `${label} 완료`, { detail });
 			return detail;

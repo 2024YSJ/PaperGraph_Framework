@@ -79,9 +79,10 @@ export class Scheduler {
 			if (!settings.enabled) {
 				return;
 			}
-			const delay = Scheduler.msUntilNextTargetHour(settings.targetHour);
+			const delay = Scheduler.msUntilNextTarget(settings.targetHour, settings.targetMinute);
 			Log.info('scheduler', '다음 자동 수집 예약', {
 				targetHour: settings.targetHour,
+				targetMinute: settings.targetMinute,
 				nextRunAt: new Date(Date.now() + delay).toISOString(),
 			});
 			this.timeoutId = window.setTimeout(() => {
@@ -117,12 +118,19 @@ export class Scheduler {
 		);
 	}
 
-	// "오늘 목표 시각을 이미 지났는데 아직 오늘 실행한 적이 없는가". 델타(now - lastRunAt
+	// "오늘 목표 시:분을 이미 지났는데 아직 오늘 실행한 적이 없는가". 델타(now - lastRunAt
 	// >= 24h)로 판단하지 않는다 — 그러면 실행 시각이 매일 조금씩 밀릴 수 있다. 반드시
 	// 로컬 날짜(연/월/일)가 같은지로 비교해야 "매일 같은 시각"이 유지된다.
-	private static missedToday(settings: { targetHour: number; lastRunAt: number }): boolean {
+	//
+	// 시:분을 함께 비교하는 이유: 정시 타이머(scheduleNext)는 옵시디언이 그 순간까지 계속
+	// 켜져 있어야만 울리므로, 실제로는 이 캐치업 경로가 더 자주 쓰인다. 시만 보면 목표
+	// 시각의 정각~59분 사이 아무 때나 열어도 즉시 캐치업이 돌아버려, "7시 30분에 연다"처럼
+	// 특정 시:분을 노리고 잡은 목표가 의미가 없어진다.
+	private static missedToday(settings: { targetHour: number; targetMinute: number; lastRunAt: number }): boolean {
 		const now = new Date();
-		if (now.getHours() < settings.targetHour) {
+		const nowMinutes = now.getHours() * 60 + now.getMinutes();
+		const targetMinutes = settings.targetHour * 60 + settings.targetMinute;
+		if (nowMinutes < targetMinutes) {
 			return false;
 		}
 		return !Scheduler.isSameLocalDay(new Date(settings.lastRunAt), now);
@@ -136,11 +144,11 @@ export class Scheduler {
 		);
 	}
 
-	// 지금부터 "다음 targetHour 정각"까지 남은 ms. 오늘 그 시각을 이미 지났으면 내일
+	// 지금부터 "다음 목표 시:분 정각"까지 남은 ms. 오늘 그 시각을 이미 지났으면 내일
 	// 그 시각을 목표로 잡는다.
-	private static msUntilNextTargetHour(targetHour: number): number {
+	private static msUntilNextTarget(targetHour: number, targetMinute: number): number {
 		const now = new Date();
-		const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), targetHour, 0, 0, 0);
+		const next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), targetHour, targetMinute, 0, 0);
 		if (next.getTime() <= now.getTime()) {
 			next.setDate(next.getDate() + 1);
 		}

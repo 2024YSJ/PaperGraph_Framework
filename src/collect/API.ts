@@ -79,17 +79,29 @@ export interface API {
 
 	// [3] 정책의 재시도 경로. 기본은 citationsKnown=false인 논문만 골라 보강을 다시 시도하고,
 	// 나머지는 건드리지 않는다. 수집 경로는 내부에서 자동으로 호출하므로 외부에서 부를
-	// 일은 "저장돼 있던 논문을 다시 읽어와 재시도하는" 보정 패스(CollectAndSave.repair)나
-	// options.force로 이미 아는 값도 강제로 다시 묻는 새로고침(CollectAndSave.refreshAll)이다.
+	// 일은 "저장돼 있던 논문을 다시 읽어와 재시도하는" 보정 패스(CollectAndSave.repair)다.
+	// options.force로 이미 아는 값까지 강제로 다시 묻는 쪽은 각 구현체의 Refresh()인데,
+	// 그건 이 인터페이스의 계약이 아니라 구현체 내부의 결정이다(ArxivAPI.Refresh 참고).
 	// 실패해도 throw하지 않는다 — 플래그가 false로 남아 다음 기회에 또 시도된다.
 	EnrichCitations(papers: Paper[], options?: { force?: boolean }): Promise<void>;
 
-	// 콘텐츠(제목/초록/저자) 강제 재조회 — 이 출처가 지원하면, 최신 값으로 항상 덮어쓴다
-	// (비교 없이 무조건 — "달라졌는지"는 호출자인 CollectAndSave.refreshAll이 호출 전후
-	// 스냅샷을 떠서 판단한다. 이 메서드는 "최신값을 가져와 반영한다"까지만 책임진다).
-	// 모든 출처가 콘텐츠 재조회를 지원하는 건 아니므로 선택 구현이다 — 구현하지 않은 API는
-	// CollectAndSave.refreshAll이 이 메서드 존재 여부만 보고 자연히 건너뛴다.
-	RefreshContent?(papers: Paper[]): Promise<void>;
+	// 새로고침(CollectAndSave.refreshAll())의 유일한 진입점 — "이 논문들의 최신 상태를
+	// 반영하라". 넘어온 Paper를 제자리에서 갱신한다.
+	//
+	// ⚠️ 무엇이 "최신 상태"인지는 전적으로 구현체의 사정이다. arXiv 구현체는 인용수 강제
+	// 재조회와 제목/초록/저자 재조회를 함께 하지만, 그 조합은 arXiv의 결정이지 계약이
+	// 아니다 — 호출자는 갱신 결과를 Paper에서 다시 읽을 뿐, 어떤 필드가 왜 바뀌었는지
+	// 알지 않는다. 예전에는 새로고침 몸통이 EnrichCitations(force)와 콘텐츠 재조회를
+	// 직접 순서대로 불렀는데, 그러면 출처를 갈아끼울 때마다 "인용수"·"제목/초록" 같은
+	// 도메인 지식이 박힌 그 몸통을 함께 고쳐야 했다. 계약을 이 한 줄로 좁히면 새로고침
+	// 로직이 아는 API 표면은 apiName과 이 메서드뿐이 된다.
+	//
+	// 실제로 값이 달라졌는지, 그래서 재임베딩할지는 도메인(CollectAndSave.refreshAllBody)이
+	// 호출 전후 스냅샷(Paper.embeddingSourceOf)으로 판단한다 — 이 메서드는 "최신값을
+	// 가져와 반영한다"까지만 책임진다(EnrichCitations가 인용수만 채우고 그걸 어디에 쓸지는
+	// 호출부가 정하는 것과 같은 구도). 모든 출처가 재조회를 지원하는 건 아니므로 선택
+	// 구현이다 — 구현하지 않은 API의 논문은 새로고침 대상에서 자연히 빠진다.
+	Refresh?(papers: Paper[]): Promise<void>;
 
 	// [2] 정책으로 스킵된 항목 중 "id는 있는데 제목/초록만 없었던" 부류만 재조회한다
 	// (SkippedEntryRecord.reason === 'missing-fields'). id 자체가 없는 부류는 애초에
@@ -1046,14 +1058,25 @@ export class ArxivAPI implements API {
 		return Array.from(ids);
 	}
 
-	// ── 콘텐츠(제목/초록/저자) 새로고침 ─────────────────────────────────
+	// ── 새로고침 ────────────────────────────────────────────────────────
 
-	// "새로고침"(CollectAndSave.refreshAll) 전용 — id_list로 재조회해 arXiv이 지금 돌려주는
-	// 제목/초록/저자를 비교 없이 그대로 덮어쓴다("정말 달라졌는지"는 호출자인
-	// CollectAndSave.refreshAll이 호출 전후 스냅샷으로 판단해 재임베딩 여부를 정한다 —
-	// 이 메서드는 최신값을 가져와 반영하는 것까지만 책임진다). id_list에 없는(철회/삭제된)
-	// 논문은 건드리지 않는다.
-	public async RefreshContent(papers: Paper[]): Promise<void> {
+	// API.Refresh 구현 — arXiv에서 "최신 상태"란 인용수와 콘텐츠(제목/초록/저자) 둘 다다.
+	// 그 둘을 어떤 순서로 어떻게 가져오는지는 이 구현체의 사정이고, 호출자
+	// (CollectAndSave.refreshAllBody)는 알지 않는다.
+	//
+	// 인용수를 force로 다시 묻는 이유: 새로고침은 repair 계열과 달리 "실패한 것만"이
+	// 아니라 "이미 아는 값도 전부 다시" 확인하는 게 목적이다(citationsKnown=true인
+	// 논문도 인용수는 시간이 지나면 변한다).
+	public async Refresh(papers: Paper[]): Promise<void> {
+		await this.EnrichCitations(papers, { force: true });
+		await this.refreshContent(papers);
+	}
+
+	// id_list로 재조회해 arXiv이 지금 돌려주는 제목/초록/저자를 비교 없이 그대로 덮어쓴다
+	// ("정말 달라졌는지"는 CollectAndSave.refreshAllBody가 호출 전후 스냅샷으로 판단해
+	// 재임베딩 여부를 정한다 — 여기는 최신값을 가져와 반영하는 것까지만 책임진다). id_list에
+	// 없는(철회/삭제된) 논문은 건드리지 않는다.
+	private async refreshContent(papers: Paper[]): Promise<void> {
 		const idToPapers = new Map<string, Paper[]>();
 		for (const paper of papers) {
 			const localId = ArxivAPI.toLocalId(paper.sourceId);
@@ -1082,13 +1105,13 @@ export class ArxivAPI implements API {
 						paper.authors = info.authors;
 					}
 				}
-			}, 'RefreshContent.fetchIdListPage');
+			}, 'Refresh.fetchIdListPage');
 		}
 	}
 
 	// 7번(부분 재조회) — SkippedEntryRecord 중 'missing-fields'만 여기 온다(id는 파싱됐지만
 	// 제목/초록이 비어 있던 항목). id_list로 다시 물어 이번엔 필드가 채워져 있으면 정식
-	// Paper로 승격한다. RefreshContent와 달리 이미 있는 Paper를 갱신하는 게 아니라 아직
+	// Paper로 승격한다. refreshContent와 달리 이미 있는 Paper를 갱신하는 게 아니라 아직
 	// Paper가 아니었던 항목을 처음 완성하는 것이라, parseEntry를 그대로 재사용해 나머지
 	// 필드(citationCount 등 기본값)까지 정상 경로와 동일하게 채운다.
 	//
