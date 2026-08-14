@@ -101,3 +101,31 @@
 .papergraph3d-switch input:checked + .slider::before {
 	transform: translateX(16px);
 }
+
+/* 덩어리 수 입력칸 (ClusterColorMiddleware). 비우면 구독 개수로 자동. */
+.papergraph3d-cluster-count {
+	width: 52px;
+	padding: 2px 4px;
+	font-size: 12px;
+	text-align: center;
+	border-radius: 4px;
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+	color: var(--text-normal);
+}
+
+/* 덩어리 수 입력칸의 이름표와 허용 범위 안내. */
+.papergraph3d-cluster-label {
+	opacity: 0.85;
+}
+
+.papergraph3d-cluster-hint {
+	font-size: 11px;
+	opacity: 0.6;
+	white-space: nowrap;
+}
+
+/* 범위를 벗어난 입력 안내. */
+.papergraph3d-cluster-info.papergraph3d-cluster-warn {
+	color: var(--text-error);
+}
