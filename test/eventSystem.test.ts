@@ -44,7 +44,7 @@ describe('TaskManager', () => {
 		const taskManager = new TaskManager();
 		await assert.rejects(
 			() => taskManager.runTask('missing'),
-			/No task registered with name: missing/,
+			/등록되지 않은 작업입니다: missing/,
 		);
 	});
 
@@ -59,23 +59,23 @@ describe('TaskManager', () => {
 });
 
 describe('EventListener', () => {
-	it('setTaskManager 이전에 checking()을 부르면 throw한다', async () => {
+	it('bindTaskManager 이전에 checking()을 부르면 throw한다', async () => {
 		const eventListener = new EventListener();
 		eventListener.setEventListener('ui:x', 'task:x');
 
 		await assert.rejects(
 			() => eventListener.checking('ui:x'),
-			/setTaskManager/,
+			/TaskManager가 아직 연결되지 않았습니다/,
 		);
 	});
 
 	it('매칭되는 이벤트가 없으면 throw한다', async () => {
 		const eventListener = new EventListener();
-		eventListener.setTaskManager(new TaskManager());
+		eventListener.bindTaskManager(new TaskManager());
 
 		await assert.rejects(
 			() => eventListener.checking('ui:unknown'),
-			/No task registered for event: ui:unknown/,
+			/등록되지 않은 이벤트입니다: ui:unknown/,
 		);
 	});
 
@@ -88,7 +88,7 @@ describe('EventListener', () => {
 		}));
 
 		const eventListener = new EventListener();
-		eventListener.setTaskManager(taskManager);
+		eventListener.bindTaskManager(taskManager);
 		eventListener.setEventListener('ui:collect-recent', 'collect:recent');
 
 		const results = await eventListener.checking('ui:collect-recent', 'a', 'b');
@@ -112,7 +112,7 @@ describe('EventListener', () => {
 		}));
 
 		const eventListener = new EventListener();
-		eventListener.setTaskManager(taskManager);
+		eventListener.bindTaskManager(taskManager);
 		eventListener.setEventListener('ui:multi', 'first');
 		eventListener.setEventListener('ui:multi', 'second');
 
@@ -125,12 +125,12 @@ describe('EventListener', () => {
 
 	it('이벤트는 매칭되지만 TaskManager에 등록되지 않은 taskName이면 그 에러가 그대로 전파된다', async () => {
 		const eventListener = new EventListener();
-		eventListener.setTaskManager(new TaskManager());
+		eventListener.bindTaskManager(new TaskManager());
 		eventListener.setEventListener('ui:dangling', 'task:not-registered');
 
 		await assert.rejects(
 			() => eventListener.checking('ui:dangling'),
-			/No task registered with name: task:not-registered/,
+			/등록되지 않은 작업입니다: task:not-registered/,
 		);
 	});
 });
