@@ -12,6 +12,7 @@ import {
 	EdgeToggleMiddleware,
 	OpenNoteOnClickMiddleware,
 } from './visualize/VisualMiddlewares';
+import { PersonalNoteMiddleware } from './visualize/PersonalNoteMiddleware';
 import { EventListener } from './common/EventListener';
 import { TaskManager } from './common/TaskManager';
 import { Task } from './common/Task';
@@ -153,6 +154,13 @@ export default class PaperGraph3D extends Plugin {
 		this.visualflow.setMiddleware(new OpenNoteOnClickMiddleware(this.app));
 		// 논문 간 인용 관계를 엣지로 그리는 시각화 미들웨어 등록.
 		this.visualflow.setMiddleware(new CitationEdgeMiddleware());
+		// vault의 개인 노트를 임베딩해 논문 노드와 같은 그래프에 얹는 시각화 미들웨어 등록.
+		// 다른 시각화 미들웨어의 등록 여부/순서에 의존하지 않으므로 순서는 상관없다.
+		this.visualflow.setMiddleware(
+			new PersonalNoteMiddleware(this.app, this.collectflow.embedding, () =>
+				this.visualflow.run(),
+			),
+		);
 		// 엣지를 껐다 켜는 스위치 UI 시각화 미들웨어 등록.
 		this.visualflow.setMiddleware(new EdgeToggleMiddleware());
 		// 클러스터 색칠 미들웨어. 기본 꺼짐이고 자체 스위치 UI로 켠다. CitationColor 뒤에
