@@ -107,7 +107,7 @@ export class PersonalNoteMiddleware implements Middleware {
 			// "새로 임베딩해야 하는 노트"에만 영향을 준다.
 			const modelInstalled = await this.embedding.isModelInstalled();
 			if (!modelInstalled) {
-				new Notice(
+				PersonalNoteMiddleware.notify(
 					'개인 노트 임베딩 모델이 설치되지 않았습니다 — 설정 → PaperGraph3D에서 설치해주세요. ' +
 						'(캐시된 노트는 그대로 표시되고, 아직 임베딩 안 된 노트만 건너뜁니다.)',
 				);
@@ -119,21 +119,33 @@ export class PersonalNoteMiddleware implements Middleware {
 			// 즉시 막혀버릴 수 있다.
 			this.embedding.resetCircuitBreaker();
 
+			// 진행 표시 — render()가 container를 비우기 전까지만 떠 있는 임시 UI다(아래
+			// mountProgressIndicator 주석 참고). 컨트롤 패널(mountControlPanel)과 자리가
+			// 겹치도록 일부러 같은 우하단 코너에 둔다 — 진행 표시가 끝나면 그 자리에
+			// 컨트롤 패널이 이어받는 것처럼 보이게.
+			const progress = this.mountProgressIndicator(graph, noteFiles.length);
+
 			// ⚠️ 반드시 순차 실행 — Embedding.embed()는 세션/서킷브레이커 상태를 락 없이
-			// 공유해 동시 호출이 안전하지 않다(Embedding.embed 주석 참고).
-			for (const file of noteFiles) {
-				try {
-					const node = await this.buildNoteNode(file, graph, modelInstalled);
-					if (node) {
-						graph.nodes.push(node);
-						this.noteFilesBySourceId.set(node.id, file);
+			// 공유해 동시 호출이 안전하지 않다(Embedding.embed 주석 참고). 부수 효과로,
+			// await 사이마다 브라우저가 그릴 기회를 얻어 진행 표시가 실시간으로 갱신된다.
+			try {
+				for (const [index, file] of noteFiles.entries()) {
+					progress?.update(index + 1);
+					try {
+						const node = await this.buildNoteNode(file, graph, modelInstalled);
+						if (node) {
+							graph.nodes.push(node);
+							this.noteFilesBySourceId.set(node.id, file);
+						}
+					} catch (error) {
+						Log.warn('visualize', '개인 노트 노드 생성 실패 — 건너뜀', {
+							path: file.path,
+							error: error instanceof Error ? error.message : String(error),
+						});
 					}
-				} catch (error) {
-					Log.warn('visualize', '개인 노트 노드 생성 실패 — 건너뜀', {
-						path: file.path,
-						error: error instanceof Error ? error.message : String(error),
-					});
 				}
+			} finally {
+				progress?.remove();
 			}
 		}
 
@@ -439,6 +451,40 @@ export class PersonalNoteMiddleware implements Middleware {
 		return node.paper.sourceId.startsWith(NOTE_SOURCE_PREFIX);
 	}
 
+	// 이 미들웨어의 알림은 Obsidian 기본 위치(우하단) 대신 그래프 뷰 우상단에 뜨도록
+	// noticeEl에 전용 클래스를 붙인다(styles.css의 .papergraph3d-note-notice가
+	// position:fixed로 뷰포트 우상단에 앵커해 공용 notice-container의 배치를 벗어난다).
+	// noticeEl은 Notice API에서 deprecated 표시돼 있지만(1.8.7+는 messageEl/containerEl
+	// 권장), manifest.json의 minAppVersion(1.7.2)과의 호환을 위해 이걸 쓴다.
+	private static notify(message: string, duration?: number): Notice {
+		const notice = new Notice(message, duration);
+		notice.noticeEl.addClass('papergraph3d-note-notice');
+		return notice;
+	}
+
+	// run()이 노트를 순차로 embed하는 동안 진행 상황을 보여주는 임시 표시. mountControlPanel과
+	// 달리 renderHooks가 아니라 run() 도중 직접 container에 붙인다 — 그래야 embed 루프가
+	// 도는 실시간으로(=render()가 container를 비우기 전에) 보인다. render()가 결국
+	// container.replaceChildren()을 부르면서 자연히 사라지고, 그 직후 같은 자리에
+	// mountControlPanel의 패널이 뜬다. graph.container가 없으면(뷰가 아직 컨테이너를
+	// 세팅 안 함) 조용히 표시를 생략한다.
+	private mountProgressIndicator(
+		graph: GraphData,
+		total: number,
+	): { update: (current: number) => void; remove: () => void } | undefined {
+		const container = graph.container;
+		if (!container || total === 0) {
+			return undefined;
+		}
+		const el = container.createDiv({ cls: 'papergraph3d-note-progress' });
+		return {
+			update: (current: number) => {
+				el.setText(`개인 노트 임베딩 중: ${current} / ${total}`);
+			},
+			remove: () => el.remove(),
+		};
+	}
+
 	// ── 그래프 내 컨트롤 패널 (SettingTab 등 다른 클래스에 의존하지 않는 자체 UI) ─────
 
 	// GraphData.renderHooks를 통해 render()가 ForceGraph3D 인스턴스를 만든 "이후"에만
@@ -477,7 +523,7 @@ export class PersonalNoteMiddleware implements Middleware {
 			notesVisible = checkbox.checked;
 			applyVisibility();
 			void this.writeConfig({ ...config, notesVisible }).catch((error: unknown) => {
-				new Notice(
+				PersonalNoteMiddleware.notify(
 					`개인 노트 표시 설정 저장 실패: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			});
@@ -526,10 +572,10 @@ export class PersonalNoteMiddleware implements Middleware {
 				.then(() => {
 					// rerun()이 끝나면 이 미들웨어의 run()이 이미 새로 돌아 noteFilesBySourceId가
 					// 방금 적용된 경로 기준으로 다시 채워져 있다 — 별도 카운팅 없이 그대로 읽는다.
-					new Notice(`개인 노트 노드 ${this.noteFilesBySourceId.size}개 추가됨`);
+					PersonalNoteMiddleware.notify(`개인 노트 노드 ${this.noteFilesBySourceId.size}개 추가됨`);
 				})
 				.catch((error: unknown) => {
-					new Notice(
+					PersonalNoteMiddleware.notify(
 						`개인 노트 폴더 적용 실패: ${error instanceof Error ? error.message : String(error)}`,
 					);
 				})

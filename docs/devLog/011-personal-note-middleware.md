@@ -95,3 +95,55 @@ embeddingSource, createdAt, updatedAt}`). 노트의 `mtime`이 캐시와 같으�
 ## 커밋
 
 - (작성 예정)
+
+## 8월 15일 작업 기록 — 컨트롤 패널 고정 배치·임베딩 진행 표시·알림 위치
+
+`mountControlPanel`이 만드는 우하단 오버레이 패널과, 이 미들웨어가 띄우는 알림들을
+다듬었다. 새 클래스나 파일은 추가하지 않고 기존 `PersonalNoteMiddleware.ts`/
+`styles.css` 안에서 완결된다.
+
+### 컨트롤 패널 — 크기 고정 + 우하단 앵커
+
+`.papergraph3d-note-panel`을 `top`(고정 폭 없는 `max-width`) 앵커에서 `bottom`/`right`
+앵커·고정 `width: 220px`로 바꿨다. 경로를 여러 개 추가해도 패널 자체 크기(폭)는 변하지
+않고, 세로로만 늘어나되 `max-height: 60%` + `overflow-y: auto`로 시각화 창을 벗어나지
+않게 막는다.
+
+### 임베딩 진행 표시 — `mountProgressIndicator`
+
+노트가 많거나 모델 추론이 느릴 때 "지금 뭐가 진행되고 있는지" 안 보이는 문제가 있었다.
+`run()`의 embed 루프 시작 전에 `mountProgressIndicator(graph, noteFiles.length)`를 호출해
+`전체 N개 중 M개 진행 중` 텍스트를 `graph.container`에 직접 붙이고, 파일마다 갱신한다.
+
+`mountControlPanel`과 달리 `renderHooks`를 거치지 않고 `run()` 도중 바로 `container`에
+붙이는 이유: `Visualization.init()`이 미들웨어 실행 **전**에 이미 `graph.container`를
+채워 두므로 이 시점에도 컨테이너가 존재하고(007/008 흐름: 논문 로드 → PCA → init →
+미들웨어 → render), `Embedding.embed()`가 세션/서킷브레이커 상태 때문에 반드시 순차
+실행이라 각 `await` 사이 브라우저가 그릴 기회를 얻어 진행 표시가 실시간으로 갱신된다.
+반대로 `renderHooks`는 `Visualization.render()`가 3d-force-graph 인스턴스를 만든
+**이후**에만 실행되므로, 루프 도중에는 아직 호출되지 않는다.
+
+표시는 루프가 끝나면 스스로 `remove()`한다 — 어차피 뒤이어 `render()`가
+`container.replaceChildren()`으로 컨테이너를 통째로 비우고 그 자리에 컨트롤 패널을
+새로 그리므로, 자연히 진행 표시 → 컨트롤 패널 순서로 같은 우하단 자리를 이어받는 것처럼
+보인다. `.papergraph3d-note-progress`는 `.papergraph3d-note-panel`과 같은 좌표(`bottom:
+8px; right: 8px`)를 쓴다.
+
+### 알림(Notice) 우상단 이동
+
+Obsidian 기본 `Notice`는 앱 공용 `notice-container`(우하단 스택)에 쌓인다. 이 미들웨어의
+알림 4곳(모델 미설치 안내, 표시 설정 저장 실패, 노드 N개 추가됨, 폴더 적용 실패) 전부
+`PersonalNoteMiddleware.notify()`를 거치도록 바꿨다 — `new Notice(...)` 뒤 `noticeEl`에
+`.papergraph3d-note-notice` 클래스를 붙이고, 그 클래스에 `position: fixed !important`로
+`top`/`right`를 지정해 공용 컨테이너의 flex 배치를 벗어나 뷰포트 우상단에 독립적으로
+앵커한다(부모가 fixed 배치를 위한 별도 containing block을 만들지 않는 한, fixed 자식은
+부모의 레이아웃과 무관하게 뷰포트 기준으로 위치한다).
+
+`noticeEl`은 Notice API에서 `@deprecated`(1.8.7+는 `messageEl`/`containerEl` 권장) 표시가
+있지만, `manifest.json`의 `minAppVersion`이 1.7.2라 더 넓은 호환을 위해 의도적으로 이걸
+썼다(eslint `no-deprecated` 경고 1건은 확인 후 허용).
+
+### 미검증
+
+빌드/린트만 확인했고, 실제 Obsidian 안에서 패널 고정폭·진행 표시 실시간 갱신·알림 위치
+육안 확인은 별도로 필요.
