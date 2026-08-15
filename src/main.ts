@@ -1,6 +1,7 @@
 import { Notice, Plugin } from 'obsidian';
 import type { SearchQuery } from './collect/SearchQuery';
 import { CollectAndSave } from './collect/CollectAndSave';
+import { shouldRunLoadRepair } from './collect/ScheduleSettings';
 import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
 import { PCA } from './visualize/PCA';
@@ -42,7 +43,26 @@ export default class PaperGraph3D extends Plugin {
 		// 방법이 없다)을 못 잡는다. 그 방치분은 로드 1회에만 전수 스캔으로 훑어 되살린다 —
 		// 수집마다가 아니라 로드마다이므로 빈도가 훨씬 낮다. 모델 미설치 등으로 실패해도
 		// 플러그인 시작 자체를 막지 않는다(fire-and-forget).
-		void this.collectflow.repair().catch((error) => {
+		//
+		// 재시작 간 쿨다운(shouldRunLoadRepair): 이 보정은 인용수 재조회(S2 API)까지
+		// 포함한다. Obsidian을 자주 껐다 켜면(테스트 중 등) 쿨다운 없이는 매번 즉시 S2를
+		// 두드려, 이미 rate limit(429)에 걸린 상태를 재시작마다 계속 악화시킨다(2026-08
+		// 재현 확인). CollectAndSave는 로드마다 새로 만들어져 인메모리 쿨다운이 재시작을
+		// 못 버티므로, Schedule.json에 실행 시각을 먼저 기록해(Scheduler.runNow와 같은
+		// 순서 — 중간에 죽어도 다음 재시작이 무한 재시도하지 않도록) 디스크에 남긴다.
+		// 설정 탭의 수동 「보정」 버튼(ui:collect-repair 이벤트 경로)은 이 쿨다운을 안
+		// 탄다 — 사용자가 명시적으로 다시 해보라는 요청은 존중한다.
+		void (async () => {
+			const settings = await File.readScheduleSettings();
+			if (!shouldRunLoadRepair(settings.lastLoadRepairAt, Date.now())) {
+				Log.info('collect', '로드 시 자동 보정 건너뜀 — 쿨다운 중', {
+					lastLoadRepairAt: settings.lastLoadRepairAt,
+				});
+				return;
+			}
+			await File.writeScheduleSettings({ ...settings, lastLoadRepairAt: Date.now() });
+			await this.collectflow.repair();
+		})().catch((error) => {
 			Log.error('collect', '로드 시 자동 보정 실패', error);
 		});
 
