@@ -25,6 +25,20 @@ export class TFolder {
 	constructor(public path: string) {}
 }
 
+// App/Modal/Setting은 런타임 동작이 필요 없다 — SubscriptionTargetModal 같은 UI 클래스가
+// `extends Modal`/`import { App, Setting }`로 참조하기만 해도 모듈 평가가 죽지 않도록
+// 이름만 존재하는 빈 클래스로 둔다. 순수 함수(parseLocalDateInput 등)를 테스트에서
+// import하기 위한 최소한의 자리이며, 이 클래스들을 실제로 인스턴스화하는 테스트는 없다.
+export class App {}
+
+export class Modal {
+	constructor(_app: App) {}
+}
+
+export class Setting {
+	constructor(_containerEl: unknown) {}
+}
+
 // Notice는 UI 알림이라 테스트에서 할 일이 없지만, Embedding.ts가 import하므로 번들이
 // 깨지지 않도록 대역이 필요하다. 띄운 메시지는 검사할 수 있게 모아둔다.
 const NOTICES: string[] = [];

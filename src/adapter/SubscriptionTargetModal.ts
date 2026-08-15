@@ -19,7 +19,7 @@ interface SubscriptionOption extends SubscriptionTarget {
 // 자정으로 해석되는데, 이 앱은 항상 사용자의 로컬 기기에서만 도는 단일 사용자 플러그인
 // 이라 그 해석이 사용자가 <input type=date>에서 실제로 고른 날짜와 어긋난다(로컬이
 // UTC+9면 하루 밀림). 연/월/일을 분리해 로컬 컴포넌트로 직접 구성해 이 어긋남을 없앤다.
-function parseLocalDateInput(value: string): number | undefined {
+export function parseLocalDateInput(value: string): number | undefined {
 	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
 	if (!match) {
 		return undefined;
@@ -42,6 +42,13 @@ export class SubscriptionTargetModal extends Modal {
 	private loaded = false;
 	private from: string;
 	private to: string;
+	// "실행" 클릭 시점에 onChange가 캐시해 둔 this.from/this.to 대신 이 참조로 DOM에서
+	// 값을 직접 읽는다 — <input type="date">가 세그먼트 편집 중 일시적으로 빈 문자열을
+	// 보고하는 시점과 onChange 전파 타이밍이 맞물리면, 사용자가 날짜를 올바르게 고친
+	// 직후에도 this.from/this.to가 직전(무효했던) 값에 머물러 있을 수 있다 — 캐시된
+	// 문자열을 신뢰하지 않고 클릭 순간의 실제 DOM 값을 읽으면 이 문제 전체를 우회한다.
+	private fromInputEl?: HTMLInputElement;
+	private toInputEl?: HTMLInputElement;
 	// apiName(출처)별로 묶어 보여줄 때, 어느 그룹이 접혀 있는지 — ApiManagementModal의
 	// 같은 필드와 같은 이유(render()가 매번 새로 그려도 유지돼야 함)로 인스턴스 필드다.
 	private collapsedGroups = new Set<string>();
@@ -150,12 +157,14 @@ export class SubscriptionTargetModal extends Modal {
 					this.from = value;
 				});
 				text.inputEl.type = 'date';
+				this.fromInputEl = text.inputEl;
 			});
 			new Setting(contentEl).setName('종료일 (당일 포함)').addText((text) => {
 				text.setValue(this.to).onChange((value) => {
 					this.to = value;
 				});
 				text.inputEl.type = 'date';
+				this.toInputEl = text.inputEl;
 			});
 		}
 
@@ -178,8 +187,10 @@ export class SubscriptionTargetModal extends Modal {
 						return;
 					}
 
-					const fromMs = parseLocalDateInput(this.from);
-					const toMidnight = parseLocalDateInput(this.to);
+					// this.from/this.to(onChange 캐시)가 아니라 DOM에서 지금 값을 직접
+					// 읽는다 — 위 fromInputEl/toInputEl 주석 참고.
+					const fromMs = parseLocalDateInput(this.fromInputEl?.value ?? this.from);
+					const toMidnight = parseLocalDateInput(this.toInputEl?.value ?? this.to);
 					if (fromMs === undefined || toMidnight === undefined) {
 						new Notice('시작일/종료일을 올바르게 입력하세요');
 						return;
