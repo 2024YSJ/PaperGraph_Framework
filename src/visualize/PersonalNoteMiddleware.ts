@@ -452,10 +452,10 @@ export class PersonalNoteMiddleware implements Middleware {
 	}
 
 	// 이 미들웨어의 알림은 Obsidian 기본 위치(우하단) 대신 그래프 뷰 우상단에 뜨도록
-	// noticeEl에 전용 클래스를 붙인다(styles.css의 .papergraph3d-note-notice가
-	// position:fixed로 뷰포트 우상단에 앵커해 공용 notice-container의 배치를 벗어난다).
-	// noticeEl은 Notice API에서 deprecated 표시돼 있지만(1.8.7+는 messageEl/containerEl
-	// 권장), manifest.json의 minAppVersion(1.7.2)과의 호환을 위해 이걸 쓴다.
+	// noticeEl에 styles.css의 .papergraph3d-note-notice를 붙인다(position:fixed로 뷰포트
+	// 우상단에 앵커해 공용 notice-container의 flex 배치를 벗어난다). noticeEl은 Notice
+	// API에서 deprecated 표시돼 있지만(1.8.7+는 messageEl/containerEl 권장),
+	// manifest.json의 minAppVersion(1.7.2)과의 호환을 위해 이걸 쓴다.
 	private static notify(message: string, duration?: number): Notice {
 		const notice = new Notice(message, duration);
 		notice.noticeEl.addClass('papergraph3d-note-notice');
@@ -467,7 +467,9 @@ export class PersonalNoteMiddleware implements Middleware {
 	// 도는 실시간으로(=render()가 container를 비우기 전에) 보인다. render()가 결국
 	// container.replaceChildren()을 부르면서 자연히 사라지고, 그 직후 같은 자리에
 	// mountControlPanel의 패널이 뜬다. graph.container가 없으면(뷰가 아직 컨테이너를
-	// 세팅 안 함) 조용히 표시를 생략한다.
+	// 세팅 안 함) 조용히 표시를 생략한다. mountControlPanel과 같은 .papergraph3d-note-panel
+	// 클래스를 그대로 써서(전용 클래스를 따로 안 만듦) 둘이 같은 자리를 이어받는 것처럼
+	// 보이면서도 styles.css에 규칙을 더 늘리지 않는다.
 	private mountProgressIndicator(
 		graph: GraphData,
 		total: number,
@@ -476,7 +478,7 @@ export class PersonalNoteMiddleware implements Middleware {
 		if (!container || total === 0) {
 			return undefined;
 		}
-		const el = container.createDiv({ cls: 'papergraph3d-note-progress' });
+		const el = container.createDiv({ cls: 'papergraph3d-note-panel' });
 		return {
 			update: (current: number) => {
 				el.setText(`개인 노트 임베딩 중: ${current} / ${total}`);
@@ -515,7 +517,9 @@ export class PersonalNoteMiddleware implements Middleware {
 		// style.cssText 대신 CSS 클래스로 — obsidianmd/no-static-styles-assignment).
 		const panel = container.createDiv({ cls: 'papergraph3d-note-panel' });
 
-		const toggleRow = panel.createEl('label', { cls: 'papergraph3d-note-toggle-row' });
+		// 토글 행과 경로 행은 둘 다 "가운데 정렬된 가로 flex"라 같은 .papergraph3d-note-row
+		// 클래스를 공유한다(전용 클래스를 늘리지 않기 위해).
+		const toggleRow = panel.createEl('label', { cls: 'papergraph3d-note-row' });
 		const checkbox = toggleRow.createEl('input');
 		checkbox.type = 'checkbox';
 		checkbox.checked = notesVisible;
@@ -537,7 +541,7 @@ export class PersonalNoteMiddleware implements Middleware {
 		const renderPathRows = (): void => {
 			pathListEl.empty();
 			paths.forEach((path, index) => {
-				const row = pathListEl.createDiv({ cls: 'papergraph3d-note-path-row' });
+				const row = pathListEl.createDiv({ cls: 'papergraph3d-note-row' });
 				const input = row.createEl('input', { cls: 'papergraph3d-note-path-input' });
 				input.type = 'text';
 				input.value = path;

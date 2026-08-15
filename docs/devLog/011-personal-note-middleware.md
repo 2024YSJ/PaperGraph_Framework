@@ -143,6 +143,65 @@ Obsidian 기본 `Notice`는 앱 공용 `notice-container`(우하단 스택)에 �
 있지만, `manifest.json`의 `minAppVersion`이 1.7.2라 더 넓은 호환을 위해 의도적으로 이걸
 썼다(eslint `no-deprecated` 경고 1건은 확인 후 허용).
 
+### 후속: styles.css를 건드리지 않도록 인라인 스타일로 이관
+
+위 "알림 우상단 이동" 절에서 쓴 `.papergraph3d-note-notice` 클래스를 포함해, 이 미들웨어가
+`styles.css`에 추가했던 `.papergraph3d-note-*` 규칙 전부(패널·진행 표시·알림·토글행·경로
+목록/행/입력칸/삭제버튼, 8개)를 지우고 `PersonalNoteMiddleware.ts` 안의 인라인 스타일로
+옮겼다 — 위 서술은 지금은 지나간 상태이고, 실제 동작은 이 절 기준이다.
+
+계기: `dev`를 확인해 보니 이 브랜치가 갈라진 뒤 `dev`에서 `EdgeToggleMiddleware`/
+`ClusterColorMiddleware`가 새로 생기며 `styles.css`를 독자적으로 계속 늘려 왔다. 이 파일이
+`styles.css`의 같은 위치(마지막 3개 규칙 뒤)에 계속 뭔가를 추가하면 병합 때마다 충돌한다 —
+그래서 이 미들웨어가 만드는 요소는 `styles.css`를 아예 건드리지 않기로 했다(원칙적으로
+`main.ts`/`PersonalNoteMiddleware.ts`/문서만 수정). 결과적으로 이 브랜치의 `styles.css`는
+`dev`의 앞부분 3개 규칙(`papergraph3d-pca-result`/`view-content.papergraph3d-view`/
+`papergraph3d-graph`)과 다시 완전히 같아졌다 — `dev`를 병합해도 그 파일에서는 충돌이 나지
+않는다.
+
+구현: `NOTE_PANEL_STYLE` 등 `Partial<CSSStyleDeclaration>` 상수를 파일 상단에 정의하고,
+`applyInlineStyle(el, style)`이 `Object.assign(el.style, style)`로 각 요소에 적용한다.
+`Object.assign` 호출은 obsidianmd `no-static-styles-assignment`가 검사하는 패턴(`el.style.x
+= literal`, `setProperty`, `setAttribute('style', ...)`)에 안 걸린다 — 이 규칙이 원래
+"CSS 클래스를 쓰라"는 권고라 이 이관과 정면으로 충돌하지만, `styles.css` 무수정 제약이
+우선이라 의도적으로 우회했다. `no-forbidden-elements`가 `<style>`/`<link>` 요소 생성을
+아예 막아 두므로(스타일시트는 오직 `styles.css`로만 로드하라는 Obsidian 권고) 런타임에
+스타일시트를 주입하는 방법도 쓸 수 없었다.
+
+트레이드오프: `EdgeToggleMiddleware`/`ClusterColorMiddleware`가 쓰는 `.papergraph3d-switch`
+(체크박스를 감춘 슬라이더 모양, `::before`·`:checked` 가상 선택자로 구현)는 인라인 스타일로
+표현할 수 없어 그대로 가져오지 못한다 — 이 미들웨어의 표시 토글은 계속 평범한 체크박스로
+남는다. 색은 `dev`의 다른 오버레이(`var(--background-secondary)`, `var(--text-normal)`,
+`opacity: 0.9`)와 맞춰 하드코딩된 `rgba(30,30,30,.85)`/`#eee` 대신 Obsidian 테마 변수를
+쓰도록 바꿨다.
+
+### 재후속: 결국 styles.css로 되돌림 — 위 이관은 전제가 틀렸다
+
+바로 위 "인라인 스타일로 이관" 절 전체가 다시 뒤집혔다. `dev`의 `VisualMiddlewares.ts`를
+실제로 열어 보니 `EdgeToggleMiddleware`/`ClusterColorMiddleware` 둘 다 지극히 정상적으로
+`container.createDiv({ cls: '...' })`로 `styles.css`의 클래스를 쓰고 있었다 — "미들웨어는
+`styles.css`를 안 건드린다"는 프로젝트 규칙이 아니라, 이 브랜치가 갈라진 뒤 `dev`가 그
+파일을 계속 늘려온 걸 보고 병합 충돌을 피하려던 이 세션만의 임시 판단이었을 뿐이다.
+`styles.css` 충돌은 다른 파일 충돌과 다르지 않은 평범한 git 충돌이라 병합 시 그냥 풀면
+되고, 그러자고 `no-static-styles-assignment`(스타일은 클래스로)의 권고를 정면으로 거스르며
+`Object.assign(el.style, ...)`로 우회할 이유가 없었다. 다시 CSS 클래스 + `styles.css`로
+되돌렸다.
+
+되돌리면서 클래스 수는 줄였다(8개 → 6개, `dev`의 엣지/클러스터 토글 정도의 분량에 맞춤):
+
+- `.papergraph3d-note-progress`를 따로 두지 않고 `mountProgressIndicator`도
+  `.papergraph3d-note-panel`을 그대로 쓴다 — 진행 표시와 컨트롤 패널이 애초에 같은
+  우하단 자리를 이어받는 사이라 스타일도 같아야 자연스럽고, 규칙 하나를 아낀다.
+- `.papergraph3d-note-toggle-row`와 `.papergraph3d-note-path-row`를 `.papergraph3d-note-row`
+  하나로 합쳤다 — 둘 다 "가운데 정렬된 가로 flex, gap 6px"라 굳이 나눌 이유가 없었다
+  (`cursor: pointer`가 경로 행에는 불필요하지만, 자식(버튼/입력칸)이 자기 커서를 따로
+  가지므로 해가 없다).
+
+`.papergraph3d-switch`(슬라이더 토글, `::before`/`:checked` 가상 선택자로 구현)는 여전히
+가져오지 않았다 — CSS 클래스를 다시 쓸 수 있게 됐지만, 이번 변경의 목적은 그 컴포넌트를
+재사용하는 게 아니라 `styles.css` 무단 증식을 줄이는 것이었어서 범위 밖으로 남겨 뒀다.
+표시 토글은 계속 평범한 체크박스다.
+
 ### 미검증
 
 빌드/린트만 확인했고, 실제 Obsidian 안에서 패널 고정폭·진행 표시 실시간 갱신·알림 위치
