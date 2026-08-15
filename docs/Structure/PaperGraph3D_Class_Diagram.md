@@ -19,7 +19,11 @@ Class CollectAndSave {
 }
 
 Class Subscriptions {
-	+ int updateTime			// 갱신 시점	
+	+ int updateTime (이동 -> API.updateTime)	// 갱신 시점
+	// 실제 구현(Subscriptions.ts)에는 이 필드가 없다 — Subscriptions 하나가 커서 하나를
+	// 공유하면, 구독을 여러 개 묶었을 때 그중 가장 보수적인 값(Math.max) 하나로 전부를
+	// 다시 훑어야 했다. 커서를 구독(API 인스턴스)마다 독립으로 들게 하려고 API.updateTime
+	// 으로 옮겼다 — 구독이 배열 어디로 옮겨져도(추가/삭제) 커서가 그 구독을 계속 따라간다.
 	+ Secret secret 			// 보안 객체
 	+ API apis 					// api list
 }
@@ -96,6 +100,14 @@ interface Middleware {
 	... 						// 추가 가능한 각종 함수와 데이터 하지만 private임
 }
 
+// 'all' 타입 동작 방식 (실제 구현 — CollectAndSave.processChunk 참고)
+// 최초 설계는 "all은 수집 전체에 한 번"이라는 뉘앙스였지만, Backfill 상한이 없어서 그 방식을 쓰기 어려워졌다.
+// (5만 편을 다 받을 때까지 한 편도 저장 안 되고, 마지막에 실패하면 전부 버려짐). 
+// 그래서 지금은 청크(페이지) 단위로 흘려보내며 'all'도 청크마다 불린다
+// 즉 'all'이 받는 인자는 "전체 논문"이 아니라
+// "이번 청크의 논문들"이다. 청크를 가로지르는 중복 제거 등이 필요한 미들웨어는 자체
+// 상태를 들고 있어야 한다.
+
 
 Class File {
 	// 파일을 읽고 쓰는 작업을 해주는 클래스
@@ -121,9 +133,11 @@ Class TaskManager {
 }
 
 
-Class Task {
+interface Task {
 	+ string taskName			// task 이름
 	+ func 						// 사용자가 등록한 함수.
+	// (2026-08-09 확정) class가 아니라 interface — Middleware와 같은 확장 패턴.
+	// 개발자가 class로 implements해서 taskName/func 외 필드를 얹은 Task를 만들 수 있다.
 }
 
 

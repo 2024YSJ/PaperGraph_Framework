@@ -4,6 +4,7 @@ import type { Secret } from './Secret';
 import { Log } from '../common/Log';
 import {
 	chunk,
+	ConfigurationError,
 	delay,
 	hasRequiredFields,
 	parseXmlOrThrow,
@@ -76,11 +77,40 @@ export interface API {
 	SearchRecentPaper(hours: number, options?: CollectOptions): Promise<Paper[]>;
 	Backfill(from: number, to: number, options?: CollectOptions): Promise<Paper[]>;
 
-	// [3] 정책의 재시도 경로. citationsKnown=false인 논문만 골라 보강을 다시 시도하고,
+	// [3] 정책의 재시도 경로. 기본은 citationsKnown=false인 논문만 골라 보강을 다시 시도하고,
 	// 나머지는 건드리지 않는다. 수집 경로는 내부에서 자동으로 호출하므로 외부에서 부를
-	// 일은 "저장돼 있던 논문을 다시 읽어와 재시도하는" 보정 패스(CollectAndSave.repair)뿐이다.
+	// 일은 "저장돼 있던 논문을 다시 읽어와 재시도하는" 보정 패스(CollectAndSave.repair)다.
+	// options.force로 이미 아는 값까지 강제로 다시 묻는 쪽은 각 구현체의 Refresh()인데,
+	// 그건 이 인터페이스의 계약이 아니라 구현체 내부의 결정이다(ArxivAPI.Refresh 참고).
 	// 실패해도 throw하지 않는다 — 플래그가 false로 남아 다음 기회에 또 시도된다.
-	EnrichCitations(papers: Paper[]): Promise<void>;
+	EnrichCitations(papers: Paper[], options?: { force?: boolean }): Promise<void>;
+
+	// 새로고침(CollectAndSave.refreshAll())의 유일한 진입점 — "이 논문들의 최신 상태를
+	// 반영하라". 넘어온 Paper를 제자리에서 갱신한다.
+	//
+	// ⚠️ 무엇이 "최신 상태"인지는 전적으로 구현체의 사정이다. arXiv 구현체는 인용수 강제
+	// 재조회와 제목/초록/저자 재조회를 함께 하지만, 그 조합은 arXiv의 결정이지 계약이
+	// 아니다 — 호출자는 갱신 결과를 Paper에서 다시 읽을 뿐, 어떤 필드가 왜 바뀌었는지
+	// 알지 않는다. 예전에는 새로고침 몸통이 EnrichCitations(force)와 콘텐츠 재조회를
+	// 직접 순서대로 불렀는데, 그러면 출처를 갈아끼울 때마다 "인용수"·"제목/초록" 같은
+	// 도메인 지식이 박힌 그 몸통을 함께 고쳐야 했다. 계약을 이 한 줄로 좁히면 새로고침
+	// 로직이 아는 API 표면은 apiName과 이 메서드뿐이 된다.
+	//
+	// 실제로 값이 달라졌는지, 그래서 재임베딩할지는 도메인(CollectAndSave.refreshAllBody)이
+	// 호출 전후 스냅샷(Paper.embeddingSourceOf)으로 판단한다 — 이 메서드는 "최신값을
+	// 가져와 반영한다"까지만 책임진다(EnrichCitations가 인용수만 채우고 그걸 어디에 쓸지는
+	// 호출부가 정하는 것과 같은 구도). 모든 출처가 재조회를 지원하는 건 아니므로 선택
+	// 구현이다 — 구현하지 않은 API의 논문은 새로고침 대상에서 자연히 빠진다.
+	Refresh?(papers: Paper[]): Promise<void>;
+
+	// [2] 정책으로 스킵된 항목 중 "id는 있는데 제목/초록만 없었던" 부류만 재조회한다
+	// (SkippedEntryRecord.reason === 'missing-fields'). id 자체가 없는 부류는 애초에
+	// 이 메서드의 대상이 아니다 — 호출자(CollectAndSave.retrySkippedEntries)가 미리
+	// 걸러서 넘긴다. 모든 출처가 이 재조회를 지원하는 건 아니므로 선택 구현이다.
+	RetryMissingEntries?(
+		rawIds: string[],
+		collectedQuery: SearchQuery,
+	): Promise<{ recovered: Paper[]; stillMissingRawIds: string[] }>;
 
 	// 직전 SearchRecentPaper/Backfill 호출의 커버리지. 단발 조회(SearchBase)나 아직 한 번도
 	// 수집하지 않았으면 undefined. 커서 저장(CollectAndSave.run)과 결과 표시(UI)가 읽는
@@ -137,6 +167,30 @@ export interface CollectionCoverage {
 	// 받았지만 Paper로 승격되지 못한 것들 — 조용히 사라지면 "이런 논문이 있었다"는
 	// 사실 자체가 안 남으므로, 몇 건이 왜 빠졌는지 밖에서 확인할 수 있게 누적한다.
 	skippedEntries: number;
+	// skippedEntries의 상세 기록. 7번(부분 재조회) 전용 — 이 필드가 없어도 수집 자체는
+	// 아무 영향을 안 받는다(카운트만으로도 [2] 정책은 이미 완결돼 있었다). CollectAndSave가
+	// 이걸 읽어 SkippedEntries.json에 임시로 남기고, 그중 재시도 가능한 것만 나중에
+	// RetryMissingEntries로 재조회한다 — 이 기능 자체가 통째로 사라져도(devLog에 남긴 대로
+	// "임시" 설계) 이 필드 하나만 걷어내면 된다.
+	skipped: SkippedEntryRecord[];
+}
+
+// [2] 정책으로 스킵된 항목의 사유. id를 arXiv id로 해석할 수 있었는지가 재시도 가능
+// 여부를 가른다 — 있으면(제목/초록만 없었던 경우) id_list로 다시 물어볼 수 있고
+// ('missing-fields'), 없으면 애초에 무엇을 다시 물어야 할지 특정할 수 없다('no-id').
+export type SkippedEntryReason = 'no-id' | 'missing-fields';
+
+// SkippedEntries.json에 임시로 남기는 레코드 한 건 — 재수집 대상을 고르는 데 필요한
+// 최소한만 담는다(Paper 전체를 담지 않는다, 애초에 Paper가 못 됐으므로).
+export interface SkippedEntryRecord {
+	rawId: string;
+	title: string;
+	reason: SkippedEntryReason;
+	apiName: string;
+	// 재조회로 복구된 논문에 출처 조건을 다시 태그하려면 필요하다(parseEntry의
+	// collectedQuery와 같은 역할) — 어느 구독에서 이 항목을 만났는지.
+	collectedQuery: SearchQuery;
+	skippedAt: number;
 }
 
 // Secret.json에 등록할 때 쓰는 provider 키. File.ts의 PAPER_URL_BUILDERS가 sourceId
@@ -155,6 +209,8 @@ interface ArxivPage {
 	// 이 페이지에서 읽어낸 가장 늦은 제출 시각. 정렬이 ascending이므로 페이지가 진행될수록
 	// 커지고, 잘렸을 때 "여기까지는 확실히 훑었다"는 커서가 된다. 못 읽으면 undefined.
 	latestPublishedMs: number | undefined;
+	// 이 페이지에서 [2] 정책으로 건너뛴 항목의 상세 기록 — CollectionCoverage.skipped 참고.
+	skipped: SkippedEntryRecord[];
 }
 
 // S2 배치 응답 한 칸. externalIds.ArXiv는 이 레코드가 스스로 밝히는 arXiv id다.
@@ -345,6 +401,7 @@ export class ArxivAPI implements API {
 				pages: 0, // 호출 자체를 안 했다
 				totalResults: -1,
 				skippedEntries: 0,
+				skipped: [],
 			};
 			return [];
 		}
@@ -407,6 +464,7 @@ export class ArxivAPI implements API {
 		let cursor = from;
 		let pages = 0;
 		let skippedEntries = 0;
+		const skipped: SkippedEntryRecord[] = [];
 		let duplicates = 0;
 		let unique = 0;
 		// 첫 라운드의 값만 의미가 있다 — 이후 라운드는 좁아진 구간의 전체 건수라서
@@ -450,6 +508,7 @@ export class ArxivAPI implements API {
 
 			pages += roundCoverage.pages;
 			skippedEntries += roundCoverage.skippedEntries;
+			skipped.push(...roundCoverage.skipped);
 			if (round === 0) {
 				totalResults = roundCoverage.totalResults;
 			}
@@ -490,6 +549,7 @@ export class ArxivAPI implements API {
 			pages,
 			totalResults,
 			skippedEntries,
+			skipped,
 		};
 	}
 
@@ -515,6 +575,7 @@ export class ArxivAPI implements API {
 		// [2] 정책 — entry는 받았지만 필수 필드 누락 등으로 Paper가 못 된 항목의 누적 수.
 		// 페이지마다 조용히 사라지지 않도록 coverage에 실어 밖에서 확인할 수 있게 한다.
 		let skippedEntries = 0;
+		const skipped: SkippedEntryRecord[] = [];
 
 		for (let page = 0; page < ArxivAPI.MAX_PAGES; page += 1) {
 			if (page > 0) {
@@ -534,6 +595,7 @@ export class ArxivAPI implements API {
 			}
 			totalResults = result.totalResults;
 			skippedEntries += result.entryCount - result.papers.length;
+			skipped.push(...result.skipped);
 			// 커서는 절대 뒤로 가지 않게 max로 누적한다. ascending이라 보통은 페이지마다
 			// 커지지만, 그 정렬을 커서 정확성의 전제로 삼지는 않는다.
 			if (result.latestPublishedMs !== undefined) {
@@ -557,6 +619,7 @@ export class ArxivAPI implements API {
 					pages: page + 1,
 					totalResults,
 					skippedEntries,
+					skipped,
 				};
 				Log.info('arxiv.paged', '구간 완주', {
 					dateFilter,
@@ -583,6 +646,7 @@ export class ArxivAPI implements API {
 			pages: ArxivAPI.MAX_PAGES,
 			totalResults,
 			skippedEntries,
+			skipped,
 		};
 		Log.info('arxiv.paged', '라운드 상한(MAX_PAGES) 도달 — 남은 구간은 다음 라운드로', {
 			dateFilter,
@@ -619,6 +683,7 @@ export class ArxivAPI implements API {
 		const xml = parseXmlOrThrow(response.text, 'arXiv');
 		const entries = Array.from(xml.querySelectorAll('entry'));
 		const papers: Paper[] = [];
+		const skipped: SkippedEntryRecord[] = [];
 		let latestPublishedMs: number | undefined;
 
 		for (const entry of entries) {
@@ -637,6 +702,27 @@ export class ArxivAPI implements API {
 			const paper = ArxivAPI.parseEntry(entry, collectedQuery);
 			if (paper) {
 				papers.push(paper);
+			} else {
+				// [2] 정책으로 건너뛴 항목 — 나중에 "이게 진짜 arXiv 데이터 문제인지, 우리
+				// 파싱 버그인지"를 사람이 판단하려면 최소한 어떤 id였는지는 남아야 한다.
+				// 개수만 세던 예전 방식은 원인 조사가 아예 불가능했다.
+				const rawId = ArxivAPI.text(entry.querySelector('id'));
+				const title = ArxivAPI.text(entry.querySelector('title'));
+				Log.warn('arxiv.page', '[2] 정책 — 항목 스킵(필수 필드 없음 또는 id 해석 불가)', {
+					rawId: rawId || '(없음)',
+					title: title || '(없음)',
+				});
+				// 7번(부분 재조회) — id가 파싱되면 제목/초록만 없었다는 뜻이라 나중에
+				// id_list로 다시 물어볼 수 있다('missing-fields'). id 자체가 안 되면 무엇을
+				// 다시 물어야 할지조차 특정할 수 없다('no-id') — classifySkipReason 참고.
+				skipped.push({
+					rawId,
+					title,
+					reason: ArxivAPI.classifySkipReason(rawId),
+					apiName: this.apiName,
+					collectedQuery,
+					skippedAt: Date.now(),
+				});
 			}
 		}
 
@@ -656,6 +742,7 @@ export class ArxivAPI implements API {
 			entryCount: entries.length,
 			totalResults,
 			latestPublishedMs,
+			skipped,
 		};
 	}
 
@@ -668,7 +755,7 @@ export class ArxivAPI implements API {
 		sortOrder: 'ascending' | 'descending',
 	): string {
 		if (this.querys.length === 0) {
-			throw new Error('ArxivAPI: querys is empty');
+			throw new ConfigurationError('ArxivAPI: querys is empty');
 		}
 		const baseQuery = this.buildSearchQuery();
 		const searchQuery = dateFilter ? `${baseQuery} AND ${dateFilter}` : baseQuery;
@@ -698,7 +785,7 @@ export class ArxivAPI implements API {
 		// truthy라서 "Unknown searchType" 가드를 통과해버리고 쿼리에 함수 소스가 박힌다.
 		const prefix = ArxivAPI.FIELD_PREFIX[query.searchType];
 		if (typeof prefix !== 'string') {
-			throw new Error(`Unknown searchType for arXiv: ${query.searchType}`);
+			throw new ConfigurationError(`Unknown searchType for arXiv: ${query.searchType}`);
 		}
 		const value = query.query.replace(/"/g, '');
 		return prefix === 'cat' ? `${prefix}:${value}` : `${prefix}:"${value}"`;
@@ -752,6 +839,14 @@ export class ArxivAPI implements API {
 		return ArxivAPI.stripVersion(abs);
 	}
 
+	// 7번(부분 재조회) — extractId 성공 여부만으로 재시도 가능성을 가른다. extractId가
+	// 성공했는데도 parseEntry가 그 항목을 스킵했다면(fetchPage 호출부), 원인은 id가 아니라
+	// hasRequiredFields(제목/초록)일 수밖에 없다 — parseEntry의 두 검사(hasRequiredFields,
+	// extractId)가 정확히 이 함수의 두 갈래와 대응하기 때문이다.
+	private static classifySkipReason(rawId: string): SkippedEntryReason {
+		return ArxivAPI.extractId(rawId) ? 'missing-fields' : 'no-id';
+	}
+
 	// <published>(제출 시각, ISO 8601)를 epoch ms로. 커버리지 커서로 쓰므로 날짜 단위인
 	// Paper.publicationDate가 아니라 원본 타임스탬프를 그대로 읽는다.
 	private static publishedEpochMs(entry: Element): number | undefined {
@@ -776,7 +871,7 @@ export class ArxivAPI implements API {
 			return;
 		}
 		const reason = ArxivAPI.text(entry.querySelector('summary')) || rawId;
-		throw new Error(`arXiv rejected the query: ${reason}`);
+		throw new ConfigurationError(`arXiv rejected the query: ${reason}`);
 	}
 
 	// <opensearch:totalResults>를 읽어 이 검색의 전체 건수를 돌려준다. 페이지를 더 받을지
@@ -848,10 +943,10 @@ export class ArxivAPI implements API {
 	// 예외를 던지지 않고 citationsKnown=false로 남겨 다음 수집에서 다시 시도되게 한다.
 	// public인 이유: 보정 패스(CollectAndSave.repair)가 저장된 논문을 다시 읽어와 이 재시도
 	// 필터를 실사용한다 — 인터페이스 주석 참고.
-	public async EnrichCitations(papers: Paper[]): Promise<void> {
+	public async EnrichCitations(papers: Paper[], options?: { force?: boolean }): Promise<void> {
 		const idToPapers = new Map<string, Paper[]>();
 		for (const paper of papers) {
-			if (paper.citationsKnown) {
+			if (!options?.force && paper.citationsKnown) {
 				continue;
 			}
 			const localId = ArxivAPI.toLocalId(paper.sourceId);
@@ -961,5 +1056,150 @@ export class ArxivAPI implements API {
 			}
 		}
 		return Array.from(ids);
+	}
+
+	// ── 새로고침 ────────────────────────────────────────────────────────
+
+	// API.Refresh 구현 — arXiv에서 "최신 상태"란 인용수와 콘텐츠(제목/초록/저자) 둘 다다.
+	// 그 둘을 어떤 순서로 어떻게 가져오는지는 이 구현체의 사정이고, 호출자
+	// (CollectAndSave.refreshAllBody)는 알지 않는다.
+	//
+	// 인용수를 force로 다시 묻는 이유: 새로고침은 repair 계열과 달리 "실패한 것만"이
+	// 아니라 "이미 아는 값도 전부 다시" 확인하는 게 목적이다(citationsKnown=true인
+	// 논문도 인용수는 시간이 지나면 변한다).
+	public async Refresh(papers: Paper[]): Promise<void> {
+		await this.EnrichCitations(papers, { force: true });
+		await this.refreshContent(papers);
+	}
+
+	// id_list로 재조회해 arXiv이 지금 돌려주는 제목/초록/저자를 비교 없이 그대로 덮어쓴다
+	// ("정말 달라졌는지"는 CollectAndSave.refreshAllBody가 호출 전후 스냅샷으로 판단해
+	// 재임베딩 여부를 정한다 — 여기는 최신값을 가져와 반영하는 것까지만 책임진다). id_list에
+	// 없는(철회/삭제된) 논문은 건드리지 않는다.
+	private async refreshContent(papers: Paper[]): Promise<void> {
+		const idToPapers = new Map<string, Paper[]>();
+		for (const paper of papers) {
+			const localId = ArxivAPI.toLocalId(paper.sourceId);
+			if (!localId) {
+				continue;
+			}
+			const list = idToPapers.get(localId) ?? [];
+			list.push(paper);
+			idToPapers.set(localId, list);
+		}
+		if (idToPapers.size === 0) {
+			return;
+		}
+
+		const chunks = chunk(Array.from(idToPapers.keys()), ArxivAPI.PAGE_SIZE);
+		for (const [index, ids] of chunks.entries()) {
+			if (index > 0) {
+				await delay(ArxivAPI.PAGE_DELAY_MS);
+			}
+			await runQuietly(async () => {
+				const infos = await this.fetchIdListPage(ids);
+				for (const [localId, info] of infos) {
+					for (const paper of idToPapers.get(localId) ?? []) {
+						paper.title = info.title;
+						paper.abstract = info.abstract;
+						paper.authors = info.authors;
+					}
+				}
+			}, 'Refresh.fetchIdListPage');
+		}
+	}
+
+	// 7번(부분 재조회) — SkippedEntryRecord 중 'missing-fields'만 여기 온다(id는 파싱됐지만
+	// 제목/초록이 비어 있던 항목). id_list로 다시 물어 이번엔 필드가 채워져 있으면 정식
+	// Paper로 승격한다. refreshContent와 달리 이미 있는 Paper를 갱신하는 게 아니라 아직
+	// Paper가 아니었던 항목을 처음 완성하는 것이라, parseEntry를 그대로 재사용해 나머지
+	// 필드(citationCount 등 기본값)까지 정상 경로와 동일하게 채운다.
+	//
+	// id_list에 없거나 여전히 필수 필드가 비어 있으면 stillMissingRawIds에 남긴다 — 호출자
+	// (CollectAndSave.retrySkippedEntries)가 그 레코드를 SkippedEntries.json에 그대로 둔다.
+	public async RetryMissingEntries(
+		rawIds: string[],
+		collectedQuery: SearchQuery,
+	): Promise<{ recovered: Paper[]; stillMissingRawIds: string[] }> {
+		const idToRawIds = new Map<string, string[]>();
+		for (const rawId of rawIds) {
+			const localId = ArxivAPI.extractId(rawId);
+			if (!localId) {
+				// classifySkipReason이 이미 걸렀어야 정상이라 여기 오면 안 되지만, 방어적으로
+				// 그대로 stillMissing 취급되게 idToRawIds에 안 넣는다(아래 최종 계산 참고).
+				continue;
+			}
+			const list = idToRawIds.get(localId) ?? [];
+			list.push(rawId);
+			idToRawIds.set(localId, list);
+		}
+		if (idToRawIds.size === 0) {
+			return { recovered: [], stillMissingRawIds: rawIds };
+		}
+
+		const recovered: Paper[] = [];
+		const recoveredLocalIds = new Set<string>();
+		const chunks = chunk(Array.from(idToRawIds.keys()), ArxivAPI.PAGE_SIZE);
+		for (const [index, ids] of chunks.entries()) {
+			if (index > 0) {
+				await delay(ArxivAPI.PAGE_DELAY_MS);
+			}
+			await runQuietly(async () => {
+				const params = new URLSearchParams({ id_list: ids.join(','), max_results: String(ids.length) });
+				const url = `${ArxivAPI.ENDPOINT}?${params.toString()}`;
+				const response = await requestWithRetry({ url }, ArxivAPI.ARXIV_RETRY);
+				const xml = parseXmlOrThrow(response.text, 'arXiv');
+				const entries = Array.from(xml.querySelectorAll('entry'));
+				for (const entry of entries) {
+					const rawId = ArxivAPI.text(entry.querySelector('id'));
+					if (rawId.includes(ArxivAPI.ERROR_ID_MARK)) {
+						continue;
+					}
+					const paper = ArxivAPI.parseEntry(entry, collectedQuery);
+					if (!paper) {
+						// 다시 물어봐도 여전히 필드가 비어 있다 — 그대로 stillMissing에 남는다.
+						continue;
+					}
+					recovered.push(paper);
+					recoveredLocalIds.add(ArxivAPI.toLocalId(paper.sourceId) ?? '');
+				}
+			}, 'RetryMissingEntries.fetchIdList');
+		}
+
+		const stillMissingRawIds = rawIds.filter((rawId) => {
+			const localId = ArxivAPI.extractId(rawId);
+			return !localId || !recoveredLocalIds.has(localId);
+		});
+		return { recovered, stillMissingRawIds };
+	}
+
+	// id_list로 여러 논문을 한 번에 재조회한다. arXiv 에러 응답([1] 정책과 같은 기벽)은
+	// 개별 entry로 섞여 올 수 있어 ERROR_ID_MARK로 걸러 스킵한다 — id_list 전체를 실패
+	// 처리하지 않는다(요청한 id 중 일부가 이미 삭제/철회됐어도 나머지는 살린다).
+	private async fetchIdListPage(
+		ids: string[],
+	): Promise<Map<string, { title: string; abstract: string; authors: string[] }>> {
+		const params = new URLSearchParams({ id_list: ids.join(','), max_results: String(ids.length) });
+		const url = `${ArxivAPI.ENDPOINT}?${params.toString()}`;
+		const response = await requestWithRetry({ url }, ArxivAPI.ARXIV_RETRY);
+		const xml = parseXmlOrThrow(response.text, 'arXiv');
+		const entries = Array.from(xml.querySelectorAll('entry'));
+		const result = new Map<string, { title: string; abstract: string; authors: string[] }>();
+		for (const entry of entries) {
+			const rawId = ArxivAPI.text(entry.querySelector('id'));
+			if (rawId.includes(ArxivAPI.ERROR_ID_MARK)) {
+				continue;
+			}
+			const localId = ArxivAPI.extractId(rawId);
+			if (!localId) {
+				continue;
+			}
+			result.set(localId, {
+				title: ArxivAPI.text(entry.querySelector('title')).replace(/\s+/g, ' '),
+				abstract: ArxivAPI.text(entry.querySelector('summary')),
+				authors: Array.from(entry.querySelectorAll('author > name')).map((n) => ArxivAPI.text(n)),
+			});
+		}
+		return result;
 	}
 }
