@@ -135,6 +135,8 @@ const CLUSTER_COLORS = [
 	'#fffac8',
 	'#ffe119',
 ];
+// 경고를 띄워 두는 시간. 한글 한 문장을 읽기에 3초는 짧고, 더 길면 상태 표시가 오래 가려진다.
+const WARNING_MS = 5000;
 const COLOR_UNCLUSTERED = '#8a8a8a'; // 회색 — 어느 덩어리에도 안 속한 논문
 
 // 시각화 미들웨어: 논문을 임베딩으로 묶어 덩어리마다 다른 색을 칠한다.
@@ -166,6 +168,8 @@ export class ClusterColorMiddleware implements Middleware {
 	private requestedCount = 0;
 	// 결과·경고를 띄우는 자리. addSwitch가 만들고 showResult/showWarning이 갱신한다.
 	private info: HTMLElement | undefined;
+	// 경고를 지우는 예약. 새 경고가 오거나 결과를 다시 그릴 때 취소한다.
+	private warningTimer: number | undefined;
 
 	// 버튼이 읽는 상태 — 지금 켜져 있는가, 어떻게 나뉘었는가(덩어리 수·보류된 논문 수).
 	get enabled(): boolean {
@@ -180,6 +184,8 @@ export class ClusterColorMiddleware implements Middleware {
 		const graph = context as GraphData;
 		this.graph = graph;
 		this.previousColors = new Map();
+		// 예약된 경고 지우기를 취소한다. 남겨두면 새로 그린 화면의 상태 표시를 나중에 덮는다.
+		this.clearWarningTimer();
 		// 덩어리 수는 뷰를 새로 열 때마다 비운다. 허용 범위가 논문 수에 따라 달라지므로,
 		// 예전에 넣어둔 숫자는 지금 코퍼스에 맞는 값이라는 보장이 없다(논문 100편일 때 넣은
 		// 5가 8000편이 된 뒤에도 남아 있으면 그건 의도가 아니라 흔적이다). 스위치 상태(on)는
@@ -238,7 +244,16 @@ export class ClusterColorMiddleware implements Middleware {
 		this.showResult();
 
 		power.addEventListener('change', () => {
+			// 잘못된 값이 칸에 남아 있어도 켜는 것 자체는 막지 않는다 — 사용자가 원한 것은
+			// "클러스터를 보는 것"이고 숫자 실수는 부차적이다. 다만 그 값이 안 쓰였다는 사실은
+			// 알려야 하므로, 자동으로 켠 뒤 안내를 함께 띄운다(경고를 놓치고 자기가 넣은
+			// 수로 그려진 줄 아는 일을 막는다).
+			const invalid = ClusterColorMiddleware.parseCount(count.value, maxCount) === null;
 			this.toggle();
+			if (this.on && invalid) {
+				this.showWarning(`${range} 사이의 올바른 숫자를 입력해 주세요. 자동 숫자로 실행됩니다`);
+				return;
+			}
 			this.showResult();
 		});
 		count.addEventListener('change', () => {
@@ -275,15 +290,39 @@ export class ClusterColorMiddleware implements Middleware {
 		return value;
 	}
 
-	// 지금 몇 덩어리로 나뉘었는지 보여준다. 꺼져 있거나 아직 계산 전이면 비운다.
+	// 지금 몇 덩어리로 나뉘었는지, 그 수를 누가 정했는지 보여준다. 사용자가 안 넣어서
+	// 구독 개수로 정해진 경우를 "자동"이라고 밝혀야 한다 — 숫자만 띄우면 자기가 넣은 값이
+	// 적용된 것인지 알 수 없다(범위를 벗어난 값을 넣고 안내를 못 보면 특히 헷갈린다).
 	private showResult(): void {
+		this.clearWarningTimer();
 		this.info?.removeClass('papergraph3d-cluster-warn');
-		this.info?.setText(this.on && this.result ? `${this.result.clusterCount}개 덩어리` : '');
+		if (!this.on || !this.result) {
+			this.info?.setText('');
+			return;
+		}
+		const { clusterCount, requestedCount } = this.result;
+		this.info?.setText(
+			requestedCount > 0 ? `${clusterCount}개 덩어리` : `${clusterCount}개 덩어리 (자동)`,
+		);
 	}
 
+	// 경고는 잠깐 띄우고 원래 상태 표시로 되돌린다. 계속 남겨두면 "지금 몇 덩어리인지"를
+	// 가려버리고, 사용자가 값을 고친 뒤에도 옛 경고가 붙어 있는 것처럼 보인다.
 	private showWarning(text: string): void {
+		this.clearWarningTimer();
 		this.info?.setText(text);
 		this.info?.addClass('papergraph3d-cluster-warn');
+		this.warningTimer = window.setTimeout(() => {
+			this.warningTimer = undefined;
+			this.showResult();
+		}, WARNING_MS);
+	}
+
+	private clearWarningTimer(): void {
+		if (this.warningTimer !== undefined) {
+			window.clearTimeout(this.warningTimer);
+			this.warningTimer = undefined;
+		}
 	}
 
 	// 버튼이 부른다. 켜면 (캐시가 없으면 계산한 뒤) 덩어리 색으로, 끄면 원래 색으로 되돌린다.
