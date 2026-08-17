@@ -1086,6 +1086,17 @@ export class CollectAndSave {
 					'PaperGraph3D: 과거 논문 수집에는 수집할 구간(from/to)이 필요합니다. 수집 메뉴의 과거 논문 수집 항목에서 범위를 지정해 실행하세요.',
 				);
 			}
+			// from >= to(역순 또는 미래 범위 등)를 그대로 흘려보내면 API.collectWindow가
+			// "요청할 게 없다"고 보고 조용히 0편으로 끝낸다(coverage만 채우고 네트워크
+			// 요청도 안 나감) — 그 결과 완료 Notice가 "0편 수집 완료했습니다"로 떠서, 입력
+			// 자체가 잘못됐다는 걸 사용자가 알 방법이 없었다(실제 재현됨). 여기서 던지면
+			// 이 구독(들)의 실패로 잡혀 다른 검증 오류(searchType 오타 등)와 같은 경로로
+			// Notice/힌트가 뜬다.
+			if (from >= to) {
+				throw new Error(
+					'PaperGraph3D: 과거 논문 수집 구간이 올바르지 않습니다(시작이 종료보다 뒤이거나 같음) — 날짜를 확인하세요.',
+				);
+			}
 			return { from, to, advancesCursor: false };
 		}
 
