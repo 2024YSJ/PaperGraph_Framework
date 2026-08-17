@@ -1,3 +1,4 @@
+import { Notice } from 'obsidian';
 import { EventListener } from './EventListener';
 import { File } from './File';
 import { Log } from './Log';
@@ -44,8 +45,11 @@ export class Scheduler {
 		}
 		if (Scheduler.missedToday(settings)) {
 			// 오늘 목표 시각을 이미 지났는데 아직 실행 안 됐다 — 그 시각에 앱이 꺼져
-			// 있었다는 뜻이므로 지금 바로 캐치업한다.
+			// 있었다는 뜻이므로 지금 바로 캐치업한다. runRecentAuto 경로는 silent(Notice
+			// 없음)라, 이게 없으면 사용자는 방금 연 Obsidian이 왜 갑자기 네트워크를 쓰는지
+			// 알 방법이 없다(실사용 확인됨) — 캐치업이라는 사실만이라도 짧게 알린다.
 			Log.info('scheduler', '캐치업 실행 — 오늘 목표 시각을 지났지만 아직 실행 안 됨');
+			new Notice('PaperGraph3D: 놓친 자동 수집을 지금 실행합니다.');
 			await this.runNow();
 		}
 		this.scheduleNext();

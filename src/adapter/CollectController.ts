@@ -112,6 +112,12 @@ export class CollectController implements CollectProgressSink {
 	// 비율이 우연히도 쉽게 튀어 노이즈가 크다는 판단.
 	private readonly citationRepairFailureNotifier = new FailureNotifier();
 
+	// citationRetryOverflow(500편 상한 초과)도 같은 이유로 별도 알림이 필요하다 —
+	// 2000~3000편 규모 backfill에서는 예외가 아니라 일상적으로 발생 가능한데(청크 6개만
+	// 실패해도 상한을 넘김), buildPartialFailureSuffix에만 있으면 silent 실행(자동 backfill
+	// 등)에서는 아무도 못 본다.
+	private readonly citationOverflowNotifier = new FailureNotifier();
+
 	// 인용수 보정이 "시도는 했는데 하나도 못 고쳤다"고 판단할 최소 시도 편수. 1~2편은
 	// 그 논문들이 우연히 S2에 없었을 뿐일 수 있어 노이즈가 크다 — 몇 편 이상 전부
 	// 실패해야 "키/네트워크 문제"라는 구조적 신호로 본다.
@@ -481,6 +487,19 @@ export class CollectController implements CollectProgressSink {
 			} else {
 				this.citationRepairFailureNotifier.notifySuccess();
 			}
+		}
+
+		const stats = this.plugin.collectflow.lastStats;
+		if (stats && stats.citationRetryOverflow > 0) {
+			const overflow = stats.citationRetryOverflow;
+			this.citationOverflowNotifier.notifyFailure(
+				'citation-retry-overflow',
+				() =>
+					`PaperGraph3D: 이번 수집에서 인용수 재시도 대상이 너무 많아 ${overflow}편을 건너뛰었습니다 ` +
+					`— 다음 플러그인 로드 때 자동으로 보정됩니다.`,
+			);
+		} else {
+			this.citationOverflowNotifier.notifySuccess();
 		}
 	}
 
