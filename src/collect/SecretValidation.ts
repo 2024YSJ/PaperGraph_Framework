@@ -1,6 +1,5 @@
 import { HttpRequestError, requestWithRetry } from './ApiSupport';
 import { S2_SECRET_PROVIDER } from './API';
-import type { Secret } from './Secret';
 
 // API 키가 늘어날 걸 대비한 검증 레지스트리. provider마다 "가벼운 요청을 실제로
 // 날려본다"가 유일하게 신뢰할 수 있는 방법이다 — 키 형식만으로는 어떤 provider의
@@ -64,35 +63,8 @@ export const S2_KEY_VALIDATOR: KeyValidator = {
 // 검증 대상이 아니다.
 export const KEY_VALIDATORS: KeyValidator[] = [S2_KEY_VALIDATOR];
 
-// 이 키가 어떤 provider의 것인지 판별한다. 등록된 검증기에 순서대로 물어보고
-// valid:true가 나온 첫 provider를 채택한다. 형식 검사로는 판별할 수 없으므로
-// 이 방법(실제 호출)이 유일하게 신뢰할 수 있는 경로다.
-export async function identifyKeyProvider(
-	key: string,
-	validators: KeyValidator[] = KEY_VALIDATORS,
-): Promise<string | undefined> {
-	for (const validator of validators) {
-		const result = await validator.validate(key);
-		if (result.valid) {
-			return validator.provider;
-		}
-	}
-	return undefined;
-}
-
-// Secret에 등록된 키 전체를 점검한다. provider별로 키가 없으면 건너뛴다(등록 안 된
-// provider는 검증 대상이 아니다 — arXiv처럼 키 자체가 없는 경우와 같은 취급).
-export async function validateAllKeys(
-	secret: Secret,
-	validators: KeyValidator[] = KEY_VALIDATORS,
-): Promise<KeyValidationResult[]> {
-	const results: KeyValidationResult[] = [];
-	for (const validator of validators) {
-		const key = secret.getKey(validator.provider);
-		if (key === undefined) {
-			continue;
-		}
-		results.push(await validator.validate(key));
-	}
-	return results;
-}
+// (identifyKeyProvider/validateAllKeys는 2026-08 정리 때 없앴다 — 도입 당시(ecd7d08)엔
+// "키만 주면 어느 provider인지 순서대로 물어봐서 알아낸다"는 흐름을 염두에 뒀지만,
+// ApiManagementModal이 provider를 라디오로 명시적으로 고르는 UI로 자리 잡으면서
+// 호출부가 끝까지 안 생겼다. 여러 provider를 한 번에 점검/판별하는 기능이 다시
+// 필요해지면 이 파일의 KeyValidator/KEY_VALIDATORS를 그대로 재사용하면 된다.)
