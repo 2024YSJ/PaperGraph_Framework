@@ -393,6 +393,15 @@ export class File {
 	// 경로로 옮겨 이력이 그대로 이어지게 한다. 두 경로가 같으면(제목이 안 바뀌었으면)
 	// 아무 일도 안 한다. 새 경로에 이미 파일이 있으면(드문 충돌) 덮어쓰지 않고 그대로
 	// 둔다 — writePaperAt의 기존 동작(그 자리에 새로 만듦)에 맡긴다.
+	//
+	// ⚠️ 알려진 제약(2026-08-17, docs/devLog/013-refresh.md 후속 참고): 사용자가 파일
+	// 탐색기에서 .json/.md 파일명만 직접 바꾸고 내용(title 필드)은 안 건드리면, 이 함수는
+	// 그 상황을 감지 못 한다 — API.Refresh 전후로 paper.title이 안 바뀌었으니(콘텐츠는
+	// 그대로) "제목이 안 바뀌었다"고 판단해 rename 자체가 안 걸린다. 그 결과 사용자가
+	// 옮긴 파일은 고아로 남고 원래(내용 기준) 경로에 새 파일이 생긴다. 일반적으로
+	// 고치려면 sourceId -> 실제 경로 인덱스가 필요한데(경로 계산 실패 시 전체 스캔은
+	// 대규모 코퍼스에서 비용이 크고, 별도 인덱스 파일은 그 자체가 또 어긋날 수 있는 새
+	// 상태다), 이번 수정 범위보다 훨씬 무거워 의도적으로 범위 밖으로 남겨뒀다.
 	static async renamePaperFiles(oldPaper: Paper, newPaper: Paper): Promise<void> {
 		const oldBase = File.resolvePaperPath(oldPaper);
 		const newBase = File.resolvePaperPath(newPaper);
