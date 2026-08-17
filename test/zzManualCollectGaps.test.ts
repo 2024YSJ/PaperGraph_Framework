@@ -131,6 +131,27 @@ describe('B7: backfill 날짜를 거꾸로 주면', () => {
 		assert.equal(arxivRequests.length, 0, '역전 구간인데 arXiv를 호출했다');
 		assert.equal(vault.storedPapers().length, 0);
 	});
+
+	it('순방향이어도 종료일이 미래면 거부된다 ("미래-미래")', async () => {
+		writeSubscriptionsFile();
+		arxivOnly(feed(entries(3), 3));
+
+		const flow = collectFlow();
+		const farFuture = Date.now() + 365 * 24 * 60 * 60 * 1000;
+		await withFastTimers(() =>
+			assert.rejects(
+				() =>
+					flow.run('backfill', {
+						from: farFuture,
+						to: farFuture + 24 * 60 * 60 * 1000, // from < to — 순서는 맞지만 둘 다 미래
+					}),
+				/종료일이 미래입니다/,
+			),
+		);
+
+		const arxivRequests = recordedRequests().filter((r) => !r.url.includes('semanticscholar'));
+		assert.equal(arxivRequests.length, 0, '미래 구간인데 arXiv를 호출했다');
+	});
 });
 
 // ── D11 / D12 ────────────────────────────────────────────────────────
