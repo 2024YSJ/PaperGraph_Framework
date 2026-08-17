@@ -287,12 +287,16 @@ export class CollectController implements CollectProgressSink {
 			// 출처 하나가 실패해도 나머지는 계속 새로고침되므로(CollectAndSave.refreshAllBody의
 			// 출처 격리), 그 사실을 완료 문구에서 조용히 감추지 않는다 — collect()의
 			// failedSubscriptions를 buildPartialFailureSuffix가 알리는 것과 같은 이유.
-			const failedText =
+			// 논문 저장 실패(failedPapers)도 이제 전체를 죽이지 않고 목록으로만 남으므로
+			// (refreshAllBody의 논문 단위 격리), 같은 이유로 조용히 감추지 않는다.
+			const failedApisText =
 				stats && stats.failedApis.length > 0
 					? ` — ${stats.failedApis.map((f) => f.apiName).join(', ')} 실패`
 					: '';
+			const failedPapersText =
+				stats && stats.failedPapers.length > 0 ? ` — ${stats.failedPapers.length}편 저장 실패` : '';
 			const detail = stats
-				? `${stats.citationsRefreshed}편 확인, ${stats.reembedded}편 재임베딩${failedText}`
+				? `${stats.citationsRefreshed}편 확인, ${stats.reembedded}편 재임베딩${failedApisText}${failedPapersText}`
 				: undefined;
 			new Notice(`${label} — 완료했습니다.${detail ? ` (${detail})` : ''}`);
 			Log.info('ui', `${label} 완료`, { detail });

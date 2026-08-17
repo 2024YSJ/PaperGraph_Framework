@@ -117,6 +117,10 @@ export interface RefreshStats extends EmbedBreakerStats {
 	// 없어(EnrichCitations와 달리) 구현체가 실수로 던질 수 있다 — 그 경우에도 다른 출처의
 	// 새로고침은 계속 진행되고, 여기에 무엇이 실패했는지만 남는다.
 	failedApis: { apiName: string; error: string }[];
+	// 논문 저장(File.writePaper)이 실패한 것들 — 구독/출처 격리와 같은 원칙을 논문 단위로도
+	// 적용한다. 예전엔 여기서 던지면 refreshAllBody 전체가 그 자리에서 죽어 나머지 수천 편이
+	// 손도 못 댄 채 남았다(실제 재현됨). 이제 그 논문만 건너뛰고 목록에 남긴 뒤 계속 진행한다.
+	failedPapers: { sourceId: string; error: string }[];
 }
 
 // 7번(부분 재조회) 실행 하나의 집계 (retrySkippedEntries()가 남긴다). recovered는
@@ -752,6 +756,7 @@ export class CollectAndSave {
 			embedWaits: 0,
 			embedGaveUp: false,
 			failedApis: [],
+			failedPapers: [],
 		};
 		if (this.disposed) {
 			return stats;
@@ -779,6 +784,11 @@ export class CollectAndSave {
 			const before = new Map(
 				targets.map((paper) => [paper.sourceId, embeddingSourceOf(paper)]),
 			);
+			// 제목도 따로 스냅샷한다 — 저장 경로가 title을 포함해서(File.resolvePaperPath),
+			// Refresh가 콘텐츠를 재조회해 제목을 바꾸면 저장 경로 자체가 바뀐다. 아래에서
+			// 그 변화를 감지해 File.renamePaperFiles로 옛 파일을 새 경로로 옮긴다 —
+			// 안 옮기면 새 경로에 처음 보는 파일처럼 새로 만들어져 이력이 고아가 된다.
+			const titleBefore = new Map(targets.map((paper) => [paper.sourceId, paper.title]));
 			try {
 				// ⚠️ API.Refresh는 EnrichCitations와 달리 "절대 안 던진다"는 계약이 없다
 				// (인터페이스 주석 참고) — 구현체가 실수로 던질 수 있다는 전제로 collect()와
@@ -821,12 +831,24 @@ export class CollectAndSave {
 					}
 				}
 				try {
+					const oldTitle = titleBefore.get(paper.sourceId);
+					if (oldTitle !== undefined && oldTitle !== paper.title) {
+						const oldPaperSnapshot = Object.assign(new Paper(), paper, { title: oldTitle });
+						await File.renamePaperFiles(oldPaperSnapshot, paper);
+					}
 					await File.writePaper(paper);
 				} catch (error) {
-					Log.error('collect', '새로고침 중 논문 저장 실패', error, {
+					// 구독 격리(collect())·출처 격리(위 api.Refresh)와 같은 원칙을 논문 단위로도
+					// 적용한다 — 이 논문 하나가 저장 실패했다고(디스크 문제, 파일명 충돌 등)
+					// 나머지 수천 편까지 손도 못 대고 멈추면 안 된다. 실패 목록에 남기고 계속.
+					const message = error instanceof Error ? error.message : String(error);
+					Log.error('collect', '새로고침 중 논문 저장 실패 — 이 논문만 건너뛰고 계속', error, {
 						sourceId: paper.sourceId,
 					});
-					throw error;
+					stats.failedPapers.push({ sourceId: paper.sourceId, error: message });
+					done += 1;
+					onProgress?.(done, total);
+					continue;
 				}
 				stats.citationsRefreshed += 1;
 				done += 1;

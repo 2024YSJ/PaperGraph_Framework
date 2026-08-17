@@ -385,6 +385,31 @@ export class File {
 		await File.writePaperAt(paper, `${folder}/${File.baseNoteName(paper.title, paper.sourceId)}`);
 	}
 
+	// 저장 경로가 title을 포함(resolvePaperPath)하므로, arXiv 개정판 등으로 제목이 바뀌면
+	// writePaperAt이 "새 경로에 파일이 있는가"만으로 기존 여부를 판단해 옛 파일을 못 찾고
+	// 새 파일을 만든다 — createdAt/임베딩/extra/collectedApis 이력이 통째로 고아가 된다
+	// (실제 재현됨). 제목이 바뀌는 유일한 지점(API.Refresh 구현체가 콘텐츠를 재조회하는
+	// 경로)에서, 덮어쓰기 직전의 옛 Paper와 새 Paper를 넘기면 옛 경로의 .json/.md를 새
+	// 경로로 옮겨 이력이 그대로 이어지게 한다. 두 경로가 같으면(제목이 안 바뀌었으면)
+	// 아무 일도 안 한다. 새 경로에 이미 파일이 있으면(드문 충돌) 덮어쓰지 않고 그대로
+	// 둔다 — writePaperAt의 기존 동작(그 자리에 새로 만듦)에 맡긴다.
+	static async renamePaperFiles(oldPaper: Paper, newPaper: Paper): Promise<void> {
+		const oldBase = File.resolvePaperPath(oldPaper);
+		const newBase = File.resolvePaperPath(newPaper);
+		if (oldBase === newBase) {
+			return;
+		}
+		for (const ext of ['.json', '.md']) {
+			const oldPath = `${oldBase}${ext}`;
+			const newPath = `${newBase}${ext}`;
+			const oldFile = File.vault.getAbstractFileByPath(oldPath);
+			const newFileExists = File.vault.getAbstractFileByPath(newPath) !== null;
+			if (oldFile instanceof TFile && !newFileExists) {
+				await File.vault.rename(oldFile, newPath);
+			}
+		}
+	}
+
 	private static async writePaperAt(paper: Paper, base: string): Promise<void> {
 		const jsonPath = `${base}.json`;
 		const mdPath = `${base}.md`;
@@ -429,21 +454,35 @@ export class File {
 		// (2) updatedAt이 매번 지금 시각으로 갱신돼 "이 논문이 실제로 마지막으로 바뀐
 		// 시점"이라는 정보 자체가 사라진다. 인용수 보강이나 새 구독의 출처 추가처럼 값이
 		// 하나라도 실제로 다르면 정상적으로 다시 쓴다.
-		if (existing !== null && File.papersEqual(paper, existing.paper)) {
+		//
+		// ⚠️ 이 판단은 .json 값만 본다 — .md가 실제로 디스크에 있는지, 마커 안쪽(초록 자리)이
+		// 지금 초록과 같은지는 별개로 확인해야 한다. .json 값이 안 바뀌었다고 .md까지 최신이라는
+		// 보장은 없다 — 사용자가 마커 안쪽을 고치거나(초록이 아닌 다른 텍스트로) .md 자체를
+		// 지운 경우, 그 상태가 .json이 실제로 바뀔 때까지 무기한 방치된다(실제로 재현됨).
+		// .md는 "마커 안쪽은 항상 최신 초록을 반영한다"는 계약이라, 그 계약이 깨져 있으면
+		// .json 값과 무관하게 .md만이라도 다시 써야 한다.
+		const existingMd = await File.readVaultText(mdPath);
+		const userBody = existingMd ? File.parseUserBody(existingMd) : '';
+		const expectedMd = File.renderNote(paper, userBody);
+		const mdUpToDate = existingMd === expectedMd;
+
+		const jsonUnchanged = existing !== null && File.papersEqual(paper, existing.paper);
+		if (jsonUnchanged && mdUpToDate) {
 			return;
 		}
 
-		const existingMd = await File.readVaultText(mdPath);
-		const userBody = existingMd ? File.parseUserBody(existingMd) : '';
-
-		const wrapper: StoredPaperFile = {
-			schemaVersion: File.SCHEMA_VERSION,
-			paper,
-			createdAt,
-			updatedAt: Date.now(),
-		};
-		await File.writeVaultText(jsonPath, JSON.stringify(wrapper, null, 2));
-		await File.writeVaultText(mdPath, File.renderNote(paper, userBody));
+		if (!jsonUnchanged) {
+			const wrapper: StoredPaperFile = {
+				schemaVersion: File.SCHEMA_VERSION,
+				paper,
+				createdAt,
+				updatedAt: Date.now(),
+			};
+			await File.writeVaultText(jsonPath, JSON.stringify(wrapper, null, 2));
+		}
+		if (!mdUpToDate) {
+			await File.writeVaultText(mdPath, expectedMd);
+		}
 	}
 
 	// paper.collectedApis/collectedQueries에 existingPaper가 이미 가지고 있던 (api, query)
