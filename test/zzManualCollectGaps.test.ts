@@ -152,6 +152,29 @@ describe('B7: backfill 날짜를 거꾸로 주면', () => {
 		const arxivRequests = recordedRequests().filter((r) => !r.url.includes('semanticscholar'));
 		assert.equal(arxivRequests.length, 0, '미래 구간인데 arXiv를 호출했다');
 	});
+
+	it('"오늘까지"는 거부되지 않는다 — 종료일 당일 포함 보정(+24h)이 실제 재현된 버그', async () => {
+		// SubscriptionTargetModal은 "종료일 당일 포함"을 위해 선택한 날짜의 다음날
+		// 자정을 to로 넘긴다 — 오늘을 종료일로 고르면 to는 항상 "내일 자정"이라 이 순간
+		// (now)보다 크다. 단순히 to > now로 비교하면 이 정상적인 입력까지 막혀버렸다.
+		writeSubscriptionsFile();
+		arxivOnly(feed(entries(3), 3));
+
+		const flow = collectFlow();
+		const now = new Date();
+		const todayMidnightLocal = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+		const startOfTomorrowLocal = todayMidnightLocal + 24 * 60 * 60 * 1000; // "오늘까지" 선택 시 실제 to 값
+
+		await withFastTimers(() =>
+			flow.run('backfill', {
+				from: todayMidnightLocal - 14 * 24 * 60 * 60 * 1000,
+				to: startOfTomorrowLocal,
+			}),
+		);
+
+		const arxivRequests = recordedRequests().filter((r) => !r.url.includes('semanticscholar'));
+		assert.ok(arxivRequests.length > 0, '"오늘까지"인데 정상 요청이 안 나갔다 — 여전히 막혔다');
+	});
 });
 
 // ── D11 / D12 ────────────────────────────────────────────────────────

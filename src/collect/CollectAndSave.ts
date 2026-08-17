@@ -1102,7 +1102,19 @@ export class CollectAndSave {
 			// 존재할 수 없는 논문을 요청하는 것이라 항상 정직하게 0편만 돌아온다(재현됨:
 			// "미래-미래"). from>=to와 달리 순서는 맞으니 위 검사는 안 걸리지만, 사용자가
 			// 의도한 게 "과거 구간"이 아니라는 점은 똑같다.
-			if (to > now) {
+			//
+			// ⚠️ 단순히 `to > now`로 비교하면 안 된다 — SubscriptionTargetModal이 "종료일
+			// 당일 포함"을 위해 선택한 날짜의 다음날 자정을 to로 넘긴다(실사용 확인). 오늘을
+			// 종료일로 골라도 to는 항상 "내일 자정"이라 지금 이 순간(now)보다 큰 게 정상이다
+			// — 그대로 비교하면 "오늘까지"조차 미래 취급되어 막혀버린다. 실제로 막아야 하는
+			// 건 "선택한 종료일 자체가 오늘보다 뒤"인 경우이므로, 내일 자정까지는 허용한다.
+			const nowLocal = new Date(now);
+			const startOfTomorrow = new Date(
+				nowLocal.getFullYear(),
+				nowLocal.getMonth(),
+				nowLocal.getDate() + 1,
+			).getTime();
+			if (to > startOfTomorrow) {
 				throw new Error(
 					'PaperGraph3D: 과거 논문 수집 구간의 종료일이 미래입니다 — 오늘 이전 날짜로 지정하세요.',
 				);
