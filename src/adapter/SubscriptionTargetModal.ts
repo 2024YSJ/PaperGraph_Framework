@@ -152,6 +152,14 @@ export class SubscriptionTargetModal extends Modal {
 		this.renderGroups(contentEl);
 
 		if (this.needsDateRange) {
+			// 입력한 날짜는 로컬 자정으로 해석되는데(parseLocalDateInput), arXiv는 UTC
+			// 기준으로 논문을 분류한다. 한국(UTC+9)에서 "1/1부터"를 고르면 실제로는 UTC
+			// 12/31 15:00부터 걸려서, 결과에 12/31자 논문이 섞여 나올 수 있다 — 유실이나
+			// 오동작이 아니라 시차 때문이라는 걸 미리 알려 혼란을 줄인다(실사용 확인).
+			new Setting(contentEl).setDesc(
+				'날짜는 이 컴퓨터의 로컬 자정 기준입니다. arXiv는 UTC 기준으로 논문을 분류하므로, ' +
+					'시차 때문에 결과에 전날 논문이 몇 편 섞여 나올 수 있습니다 — 정상입니다.',
+			);
 			new Setting(contentEl).setName('시작일').addText((text) => {
 				text.setValue(this.from).onChange((value) => {
 					this.from = value;
