@@ -100,17 +100,13 @@ export default class PaperGraph3D extends Plugin {
 		// 과거 논문 수집 항목이 날짜 입력을 받아 run('backfill', {from, to})로 실행하는 것이
 		// 유일한 경로다.
 
-		this.addCommand({
-			id: 'collect-repair',
-			name: '보정 실행 (임베딩·인용수 재시도)',
-			callback: async () => {
-				try {
-					await this.eventListener.checking('ui:collect-repair');
-				} catch (e) {
-					new Notice(`보정 실패: ${e instanceof Error ? e.message : String(e)}`);
-				}
-			},
-		});
+		// "보정 실행" 커맨드는 없앴다(2026-08 팀 합의) — 보정은 사용자가 몰라도 되는
+		// 백그라운드 작업으로 설계됐는데(로드 시 자동 보정, main.ts 아래), 이 커맨드만
+		// 사용자가 직접 커맨드 팔레트에서 찾아 실행해야 하는 예외였고, 성공해도 Notice가
+		// 없어 반쪽짜리였다(실패만 알림). 「새로고침」이 force:true로 인용수를 이미 전부
+		// 다시 확인하고 있어(API.Refresh) 이 커맨드의 실질적 니즈(쿨다운 기다리지 않고
+		// 지금 당장 다시 확인)를 이미 포괄한다 — 순수 중복이라 판단해 제거.
+		// (collectflow.repair() 자체는 로드 시 자동 보정이 계속 쓰므로 그대로 남는다.)
 
 		this.addRibbonIcon('network', '시각화 열기', () => {
 			void this.activateVisualizationView();
@@ -227,11 +223,9 @@ export default class PaperGraph3D extends Plugin {
 		};
 		this.taskManager.setTask(collectRecentOneTask);
 
-		const collectRepairTask: Task = {
-			taskName: 'collect:repair',
-			func: () => this.collectflow.repair(),
-		};
-		this.taskManager.setTask(collectRepairTask);
+		// 'collect:repair' 태스크/'ui:collect-repair' 이벤트는 없앴다 — "보정 실행" 커맨드가
+		// 유일한 호출부였는데 그 커맨드 자체를 제거했다(위 참고). collectflow.repair()는
+		// 로드 시 자동 보정(main.ts onload)이 계속 직접 호출한다.
 
 		// 전체 코퍼스 강제 새로고침(인용수 강제 재조회 + arXiv 개정판 감지) — 설정 탭/리본
 		// 「새로고침」 전용. repair와 달리 실패한 것만이 아니라 전부 다시 확인하므로 별도
@@ -244,7 +238,6 @@ export default class PaperGraph3D extends Plugin {
 
 		this.eventListener.setEventListener('ui:collect-recent', 'collect:recent');
 		this.eventListener.setEventListener('ui:collect-recent-one', 'collect:recent-one');
-		this.eventListener.setEventListener('ui:collect-repair', 'collect:repair');
 		this.eventListener.setEventListener('ui:collect-refresh', 'collect:refresh');
 		// 6번: 스케줄러도 같은 'collect:recent' 작업을 탄다 — 자동이든 수동이든 "최근 논문
 		// 수집"은 하나의 작업이고, 스케줄러는 그걸 언제 부를지만 결정한다.
