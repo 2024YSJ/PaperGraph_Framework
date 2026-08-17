@@ -3,7 +3,7 @@ import type PaperGraph3D from '../main';
 import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { FailureNotifier } from '../common/Notify';
-import { SearchQuery } from '../collect/SearchQuery';
+import { hasMeaningfulQueryValue, SearchQuery } from '../collect/SearchQuery';
 import { KEY_VALIDATORS } from '../collect/SecretValidation';
 
 // 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들.
@@ -682,6 +682,16 @@ export class ApiManagementModal extends Modal {
 			.addButton((button) =>
 				button.setButtonText('필드에 추가').onClick(() => {
 					if (api.newConditionQuery.trim().length === 0) {
+						return;
+					}
+					// trim().length===0만으로는 안 걸러진다 — ""나 " "처럼 따옴표/공백만
+					// 있는 값은 원본 문자열 길이가 0이 아니라서 위 검사를 통과한다. 실제로
+					// arXiv에 전송될 값(formatTerm이 따옴표를 제거한 뒤의 값) 기준으로 다시
+					// 검사해야 이 값들이 걸린다 — ArxivAPI.formatTerm과 같은 기준
+					// (hasMeaningfulQueryValue)을 여기서도 써서, 수집이 실제로 돌기 전
+					// 저장 단계에서부터 막는다.
+					if (!hasMeaningfulQueryValue(api.newConditionQuery)) {
+						new Notice('검색어에 실제 내용(글자/숫자)이 있어야 합니다.');
 						return;
 					}
 					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상

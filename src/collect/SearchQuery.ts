@@ -6,6 +6,18 @@ export interface SearchQuery {
 	query: string; // 검색 쿼리 문자열
 }
 
+// SearchQuery.query가 실제로 검색에 쓸 만한 내용을 담고 있는지 확인한다. 따옴표만 있거나
+// (""/" ") 구두점 한 글자뿐인 값(?)은 겉보기엔 빈 문자열이 아니라 trim().length===0 검사를
+// 통과하지만, arXiv 등 검색엔진으로 나가는 실제 값(따옴표 제거 후)은 비거나 의미 없는
+// 토큰이 되어 사실상 "전체 검색"으로 해석될 수 있다(실제 재현: 빈 조건으로 recent인데도
+// 1200편 이상 걸림) — 글자/숫자가 하나도 없으면 거부한다.
+// UI(ApiManagementModal의 "필드에 추가")와 도메인(ArxivAPI.formatTerm)이 같은 기준을
+// 쓰도록 여기 하나로 모은다 — 검증 시점(입력 원본)과 실제 전송 시점(변형 후 값)이
+// 어긋나면 안 되므로, "이 값이 결국 무엇을 전송하게 되는가"를 기준으로 판단해야 한다.
+export function hasMeaningfulQueryValue(value: string): boolean {
+	return /[\p{L}\p{N}]/u.test(value.replace(/"/g, ''));
+}
+
 // 구독 조건은 최대 3개, 전부 AND로 결합한다 (2026-08-04 확정). Paper.collectedQueries의
 // 항목 하나는 "구독 하나"를 나타내므로, 한 구독 안에서 AND로 묶인 여러 조건은 하나의
 // 대표 SearchQuery로 합성해 기록한다(개별 조건 중 어느 것에 "매칭됐는지" 구분할 필요가

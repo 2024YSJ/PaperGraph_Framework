@@ -1,4 +1,4 @@
-import { SearchQuery, combineQueries } from './SearchQuery';
+import { SearchQuery, combineQueries, hasMeaningfulQueryValue } from './SearchQuery';
 import { Paper } from './Paper';
 import type { Secret } from './Secret';
 import { Log } from '../common/Log';
@@ -788,12 +788,10 @@ export class ArxivAPI implements API {
 			throw new ConfigurationError(`Unknown searchType for arXiv: ${query.searchType}`);
 		}
 		const value = query.query.replace(/"/g, '');
-		// UI(ApiManagementModal)는 원본 입력의 trim().length===0만 막는데, 그 검사는 이
-		// 함수가 따옴표를 제거한 "실제 전송 값"까지는 안 본다 — `""`나 `" "`처럼 따옴표만
-		// 있는 값은 원본 검사를 통과하고도 여기 와서 빈 값이 된다. 글자/숫자가 하나도 없으면
-		// (스페이스 포함 정상 검색어는 걸리지 않는다) arXiv가 사실상 "전체 검색"으로 받아들여
-		// recent인데도 수백~수천 편이 걸리는 사고로 이어진다 — 실제 재현됨.
-		if (!/[\p{L}\p{N}]/u.test(value)) {
+		// UI(ApiManagementModal의 "필드에 추가")도 hasMeaningfulQueryValue로 같은 기준을
+		// 검사해 저장 자체를 막지만, Subscriptions.json은 사용자가 직접 편집할 수 있는
+		// 평문 파일이라 그 방어를 우회할 수 있다 — 여기가 최종 방어선이다.
+		if (!hasMeaningfulQueryValue(query.query)) {
 			throw new ConfigurationError(
 				`Empty or meaningless query value for searchType "${query.searchType}"`,
 			);
