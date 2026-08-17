@@ -74,9 +74,42 @@ export class File {
 	static readScheduleSettings(): Promise<ScheduleSettings> {
 		return File.readConfig(
 			'Schedule.json',
-			(raw) => ({ ...DEFAULT_SCHEDULE_SETTINGS, ...(raw as Partial<ScheduleSettings>) }),
+			(raw) =>
+				File.sanitizeScheduleSettings({
+					...DEFAULT_SCHEDULE_SETTINGS,
+					...(raw as Partial<ScheduleSettings>),
+				}),
 			() => ({ ...DEFAULT_SCHEDULE_SETTINGS }),
 		);
+	}
+
+	// UI(ScheduleModal, type="time")는 0~23시/0~59분만 입력하게 막지만, Schedule.json은
+	// 사용자가 직접 편집할 수 있는 평문 파일이라 그 방어를 우회할 수 있다(실제 재현됨:
+	// targetHour=25/targetMinute=-5). 범위를 벗어난 값은 Scheduler의 두 계산(missedToday는
+	// 단순 산술이라 "영원히 도달 불가"로, msUntilNextTarget은 Date 정규화로 "다음날 엉뚱한
+	// 시각"으로) 서로 다르게 반응해 캐치업이 조용히 고장 난다. 클램핑(25->23)은 사용자가
+	// 의도한 것과도 다른 "그럴듯하지만 틀린" 값이 되어 더 헷갈리므로, 무효면 기본값으로
+	// 되돌린다 — "이 값은 무효였다"가 명확하다.
+	//
+	// 필드를 명시적으로 나열해 재구성한다(입력을 그대로 스프레드하지 않음) — 2026-08-14
+	// (514ee68) 구간/간격 기반 스케줄러(intervalHours/windowStartHour/windowEndHour)를
+	// 정시 기반으로 개편하며 타입에서는 이미 지웠는데, 그 전에 저장된 Schedule.json에는
+	// 여전히 이 키들이 남아 있다. 스프레드로 병합하면 그 죽은 키가 계속 실려 다니며 다음
+	// 저장 때 다시 파일에 쓰인다 — 여기서 알려진 필드만 골라내 자연스럽게 걸러낸다.
+	private static sanitizeScheduleSettings(settings: ScheduleSettings): ScheduleSettings {
+		const validHour =
+			Number.isInteger(settings.targetHour) && settings.targetHour >= 0 && settings.targetHour <= 23;
+		const validMinute =
+			Number.isInteger(settings.targetMinute) &&
+			settings.targetMinute >= 0 &&
+			settings.targetMinute <= 59;
+		return {
+			enabled: settings.enabled,
+			targetHour: validHour ? settings.targetHour : DEFAULT_SCHEDULE_SETTINGS.targetHour,
+			targetMinute: validMinute ? settings.targetMinute : DEFAULT_SCHEDULE_SETTINGS.targetMinute,
+			lastRunAt: settings.lastRunAt,
+			lastLoadRepairAt: settings.lastLoadRepairAt,
+		};
 	}
 
 	static writeScheduleSettings(settings: ScheduleSettings): Promise<void> {
@@ -124,16 +157,32 @@ export class File {
 				const legacyCursor = typeof data.updateTime === 'number' ? data.updateTime : 0;
 				const subscriptions = new Subscriptions();
 				subscriptions.secret = secret;
-				subscriptions.apis = (data.apis ?? []).map((apiData) => {
-					const api = File.createApi(
-						apiData.apiName,
-						(apiData.querys ?? []).map((query) => File.migrateSearchType(query)),
-						secret,
-					);
-					api.updateTime =
-						typeof apiData.updateTime === 'number' ? apiData.updateTime : legacyCursor;
-					return api;
-				});
+				// UI(ApiManagementModal)는 저장 시점에 같은 apiName+조건 조합의 중복을 막지만
+				// (hasDuplicateSubscription), Subscriptions.json은 사용자가 직접 편집할 수 있는
+				// 평문 파일이라 그 방어를 우회할 수 있다(실제 재현됨) — 완전히 같은 구독이
+				// 두 개면 매 수집마다 같은 요청이 영구히 두 번 나간다. 여기, 파일을 실제로
+				// 복원하는 유일한 지점에서 걸러내면 어떤 경로로 파일에 들어왔든(수동 편집,
+				// 앞으로 생길 다른 저장 경로) 런타임에는 항상 하나로만 존재한다.
+				const seen = new Set<string>();
+				subscriptions.apis = (data.apis ?? [])
+					.map((apiData) => ({
+						...apiData,
+						querys: (apiData.querys ?? []).map((query) => File.migrateSearchType(query)),
+					}))
+					.filter((apiData) => {
+						const key = `${apiData.apiName}::${JSON.stringify(apiData.querys)}`;
+						if (seen.has(key)) {
+							return false;
+						}
+						seen.add(key);
+						return true;
+					})
+					.map((apiData) => {
+						const api = File.createApi(apiData.apiName, apiData.querys, secret);
+						api.updateTime =
+							typeof apiData.updateTime === 'number' ? apiData.updateTime : legacyCursor;
+						return api;
+					});
 				return subscriptions;
 			},
 			() => {
