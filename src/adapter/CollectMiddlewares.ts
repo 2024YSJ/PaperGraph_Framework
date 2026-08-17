@@ -121,7 +121,7 @@ export function formatSubscriptionProgress(sub: SubscriptionProgressEntry): stri
 	if (sub.total < 0) {
 		return `→ ${ordinal}${name} 논문 수집 중... (총 편수 확인 중)`;
 	}
-	// 페이지(=청크)가 3초 간격으로 도착해 done/total이 100편 단위로 뭉쳐 오르는 것처럼
-	// 보일 수 있다 — 지금 몇 번째 묶음을 받고 있는지 같이 보여줘 그 점프를 설명한다.
-	return `→ ${ordinal}${name} 논문 처리 중 (${sub.done}/${sub.total}편 · ${sub.pageCount}번째 묶음 확인)`;
+	// "N번째 묶음 확인"(pageCount) 문구는 없앴다 — 불필요한 정보로 판단됨(실사용 확인).
+	// pageCount 자체(entry.pageCount)는 계속 집계되니, 필요해지면 언제든 다시 붙일 수 있다.
+	return `→ ${ordinal}${name} 논문 처리 중 (${sub.done}/${sub.total}편)`;
 }

@@ -172,7 +172,13 @@ export class ApiManagementModal extends Modal {
 					}),
 			);
 
-		// ── 등록된 키 목록 (조회/수정/삭제) ──────────────────────────────
+		// ── 등록된 키 목록 (조회/삭제) ──────────────────────────────────
+		// "수정" 버튼은 없앴다 — provider 라디오를 고르는 순간 이미 그 provider의 등록값이
+		// 폼에 자동으로 채워지므로(위 radio.addEventListener), 지금처럼 provider가 하나뿐인
+		// 구조에서는 버튼을 눌러도 이미 채워진 값을 다시 채우는 것뿐이라 화면상 아무 변화가
+		// 없어 고장난 것처럼 보였다(실사용 확인됨). provider가 여러 개로 늘어나 "다른
+		// provider의 등록값을 폼으로 불러오는 진입점"이 다시 필요해지면, 목록 항목 클릭이나
+		// 이 자리에 다시 추가하면 된다.
 		const providers = Object.keys(this.registeredKeys);
 		if (this.subscriptionsLoaded && providers.length === 0) {
 			new Setting(contentEl).setDesc('등록된 키가 없습니다.');
@@ -181,14 +187,6 @@ export class ApiManagementModal extends Modal {
 			new Setting(contentEl)
 				.setName(provider)
 				.setDesc(this.registeredKeys[provider] ?? '')
-				.addButton((button) =>
-					// 폼에 그대로 불러온다 — 다시 저장을 누르면 즉시 재검증까지 겸한 수정이 된다.
-					button.setButtonText('수정').onClick(() => {
-						this.apiKeyProviderDraft = provider;
-						this.apiKeyValueDraft = this.registeredKeys[provider] ?? '';
-						this.render();
-					}),
-				)
 				.addButton((button) =>
 					button.setButtonText('삭제').onClick(() => {
 						void this.deleteApiKey(provider);

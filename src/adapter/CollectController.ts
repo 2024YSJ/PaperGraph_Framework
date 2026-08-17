@@ -284,7 +284,14 @@ export class CollectController implements CollectProgressSink {
 	// 그대로 맞춘다.
 	async refreshAllAuto(): Promise<string | void> {
 		const label = '새로고침';
-		const notice = new Notice(`${label} — 준비 중...`, 0);
+		// "준비 중" 단계는 File.readAllPapers()로 볼트 전체를 스캔하는 구간이라 총량을 미리
+		// 몰라 진행률(%)을 못 낸다 — 그래서 오래 걸려도 멈춘 것처럼 보이지 않도록, 최소한
+		// 왜 오래 걸릴 수 있는지는 문구로 설명한다(정확한 진행률은 readAllPapers에 콜백을
+		// 추가하는 더 큰 작업이 필요해 이번엔 범위 밖으로 둔다).
+		const notice = new Notice(
+			`${label} — 준비 중... (파일을 읽는 중이라 코퍼스가 클수록 오래 걸릴 수 있습니다)`,
+			0,
+		);
 		try {
 			await this.plugin.collectflow.refreshAll(undefined, (done, total) => {
 				notice.setMessage(`${label} — 처리 중 (${done}/${total}편)`);
