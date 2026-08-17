@@ -45,6 +45,14 @@ export class VaultStub {
 		return Promise.resolve();
 	}
 
+	// File.renamePaperFiles(제목 변경 시 옛 파일을 새 경로로 옮기는 데 씀)가 사용한다.
+	rename(file: TFile, newPath: string): Promise<void> {
+		const text = this.files.get(file.path) ?? '';
+		this.files.delete(file.path);
+		this.files.set(newPath, text);
+		return Promise.resolve();
+	}
+
 	// ── adapter API (플러그인 폴더의 Secret/Subscriptions) ──────────
 	readonly adapter = {
 		exists: (path: string): Promise<boolean> => Promise.resolve(this.files.has(path)),
