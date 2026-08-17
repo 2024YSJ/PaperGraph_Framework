@@ -1,6 +1,6 @@
-import { ItemView, WorkspaceLeaf } from 'obsidian';
+import { ItemView, Notice, WorkspaceLeaf } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { PCAError } from '../visualize/PCA';
+import { PCAError, type PCAExcluded } from '../visualize/PCA';
 
 export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
 
@@ -58,6 +58,12 @@ export class VisualizationView extends ItemView {
 	private async renderWithRepairRetry(container: HTMLElement, retried = false): Promise<void> {
 		try {
 			await this.plugin.visualflow.run();
+			// malformed/duplicateId는 needsReembedding에 안 잡힌다(재임베딩으로 못 고치는
+			// 구조적 손상이라 — sourceId가 없거나 다른 논문과 겹침) — 그래서 위 재시도
+			// 경로를 안 타고 조용히 그래프에서 빠진 채로 남았다(무알림, 실사용에서 지적됨).
+			// PCA는 이미 이유별 제외 수를 계산해두므로(PCAResult.excluded), 여기서 읽어
+			// 알리기만 하면 된다 — PCA 쪽 계산 로직은 그대로 둔다.
+			this.notifyPermanentExclusions(this.plugin.visualflow.lastResult?.excluded);
 		} catch (error) {
 			if (error instanceof PCAError && error.needsReembedding.length > 0 && !retried) {
 				container.setText(
@@ -74,12 +80,40 @@ export class VisualizationView extends ItemView {
 				await this.renderWithRepairRetry(container, true);
 				return;
 			}
-			// PCAError(유효 논문 부족 등)는 메시지를 그대로 보여준다.
+			// PCAError(유효 논문 부족 등)는 메시지를 그대로 보여준다. 그래프 자체를 못
+			// 그린 상황에서도 malformed/duplicateId로 빠진 게 있으면 같이 알린다 —
+			// needsReembedding 재시도 대상이 아니라서 위 분기를 안 거치고 여기로 오므로.
+			this.notifyPermanentExclusions(error instanceof PCAError ? error.excluded : undefined);
 			container.setText(
 				error instanceof PCAError
 					? `시각화 실패: ${error.message}`
 					: `시각화 오류: ${String(error)}`,
 			);
 		}
+	}
+
+	// malformed(sourceId 없음/해석 불가)·duplicateId(같은 sourceId 중복)로 제외된 논문은
+	// 재임베딩으로 고칠 방법이 없어(needsReembedding에 안 잡힘) 이전엔 완전히 무알림이었다
+	// (excluded 값 자체는 PCA가 이미 정확히 계산해두고 있었는데, 읽는 쪽이 없었을 뿐).
+	// 어느 논문인지(sourceId)까지는 PCAExcluded가 안 갖고 있어 편수만 알린다 — 구체적인
+	// 원인 조사는 콘솔 로그/직접 코퍼스 확인이 필요하다는 걸 문구에 명시한다.
+	private notifyPermanentExclusions(excluded: PCAExcluded | undefined): void {
+		if (!excluded) {
+			return;
+		}
+		const parts: string[] = [];
+		if (excluded.malformed > 0) {
+			parts.push(`sourceId 없음/해석 불가 ${excluded.malformed}편`);
+		}
+		if (excluded.duplicateId > 0) {
+			parts.push(`sourceId 중복 ${excluded.duplicateId}편`);
+		}
+		if (parts.length === 0) {
+			return;
+		}
+		new Notice(
+			`PaperGraph3D: 그래프에서 영구히 제외된 논문이 있습니다 (${parts.join(', ')}) ` +
+				`— 재임베딩으로 고칠 수 없는 구조적 손상이라, 콘솔 로그나 코퍼스를 직접 확인해야 합니다.`,
+		);
 	}
 }
