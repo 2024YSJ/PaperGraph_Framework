@@ -125,8 +125,6 @@ describe('B7: backfill 날짜를 거꾸로 주면', () => {
 		);
 
 		const arxivRequests = recordedRequests().filter((r) => !r.url.includes('semanticscholar'));
-		console.log('역전 구간 — arXiv 요청 수:', arxivRequests.length);
-		console.log('역전 구간 — 저장된 논문 수:', vault.storedPapers().length);
 
 		assert.equal(arxivRequests.length, 0, '역전 구간인데 arXiv를 호출했다');
 		assert.equal(vault.storedPapers().length, 0);
@@ -189,7 +187,6 @@ describe('D11: 자동 인용수 보정 쿨다운', () => {
 
 		await withFastTimers(() => flow.run('recent'));
 		const firstRunS2 = s2RequestCount();
-		console.log('1회차 S2 요청 수(수집 중 보강 + 자동 보정):', firstRunS2);
 
 		// 요청 기록만 비우고 flow는 그대로 재사용 — 쿨다운 상태가 인스턴스에 남아 있어야 한다.
 		mockRequests((param) =>
@@ -198,7 +195,6 @@ describe('D11: 자동 인용수 보정 쿨다운', () => {
 
 		await withFastTimers(() => flow.run('recent'));
 		const secondRunS2 = s2RequestCount();
-		console.log('2회차 S2 요청 수(자동 보정 건너뛰어야 함):', secondRunS2);
 
 		assert.ok(firstRunS2 > 0, '1회차에 S2를 아예 안 불렀다면 이 테스트의 전제가 깨진다');
 		assert.ok(
@@ -220,7 +216,6 @@ describe('D11: 자동 인용수 보정 쿨다운', () => {
 
 		await withFastTimers(() => flow.repairCitations());
 		const manualS2 = s2RequestCount();
-		console.log('수동 인용수 보정의 S2 요청 수:', manualS2);
 
 		assert.ok(manualS2 > 0, '수동 보정이 쿨다운에 막혔다 — "지금 다시 해봐라"는 요청은 존중해야 한다');
 	});
@@ -250,7 +245,6 @@ describe('G20: 저장 실패 시 커서', () => {
 			assert.rejects(() => flow.run('recent'), /모든 구독의 수집이 실패했습니다/),
 		);
 
-		console.log('저장 실패 후 커서:', storedCursor(), '(초기값:', INITIAL_CURSOR, ')');
 		assert.equal(storedCursor(), INITIAL_CURSOR, '저장이 실패했는데 커서가 전진했다');
 	});
 });
@@ -312,8 +306,6 @@ describe('새로고침 — 논문 저장 실패는 그 논문만 건너뛰고 �
 		const flow = collectFlow();
 		await withFastTimers(() => flow.refreshAll());
 
-		console.log('저장 시도 횟수(실패 포함):', writeCount);
-		console.log('lastRefreshStats:', flow.lastRefreshStats);
 
 		// 격리 전이었다면 세 번째 논문은 시도조차 안 됐을 것 — 이제 3편 다 시도된다
 		// (2번은 실패로, 1·3번은 성공으로).
@@ -352,7 +344,6 @@ describe('F19: 스킵 항목 중복 누적', () => {
 		await flow.appendSkippedEntries([{ ...record, skippedAt: Date.now() + 1000 }]);
 
 		const stored = await File.readSkippedEntries();
-		console.log('중복 append 후 레코드 수:', stored.length);
 		assert.equal(stored.length, 1, '같은 rawId가 두 건으로 쌓였다');
 	});
 });
@@ -368,7 +359,6 @@ describe('파일명 정제 — 현재 동작 고정', () => {
 		const stored = vault.storedPapers();
 		assert.equal(stored.length, 1);
 		const path = stored[0]?.path ?? '';
-		console.log('생성된 경로:', path);
 
 		assert.ok(!path.includes('?'), '파일명에 ? 가 남았다');
 		assert.ok(!path.includes('_'), '금지문자가 _ 가 아니라 공백으로 치환되는 게 현재 동작이다');
@@ -383,7 +373,6 @@ describe('파일명 정제 — 현재 동작 고정', () => {
 
 		const path = vault.storedPapers()[0]?.path ?? '';
 		const stem = path.slice(path.lastIndexOf('/') + 1).replace(/\.json$/, '');
-		console.log('잘린 파일명:', stem);
 
 		// (localId) 부분을 뺀 제목 조각이 100자 이하로 잘려 있다.
 		const titlePart = stem.slice(0, stem.lastIndexOf(' ('));
@@ -395,7 +384,6 @@ describe('파일명 정제 — 현재 동작 고정', () => {
 		await File.writePaper(makePaper('arxiv:2501.99999', '???:::'));
 
 		const path = vault.storedPapers()[0]?.path ?? '';
-		console.log('폴백 경로:', path);
 		assert.ok(path.length > 0, '파일이 아예 안 만들어졌다');
 		assert.ok(path.includes('2501.99999'), 'sourceId 폴백이 안 걸렸다');
 	});
@@ -415,8 +403,6 @@ describe('L2: 날짜 입력의 로컬/UTC 경계', () => {
 		assert.equal(local.getDate(), 1);
 		assert.equal(local.getHours(), 0, '로컬 자정이 아니다');
 
-		console.log('로컬 입력 2026-01-01 → UTC:', new Date(ms).toISOString());
-		console.log('  (UTC+9 환경이면 2025-12-31T15:00:00.000Z가 나온다)');
 	});
 
 	it('형식이 안 맞으면 undefined', () => {
@@ -469,8 +455,6 @@ describe('15: extra는 조건 없이 복원된다 — 실패 도중 남긴 값�
 		const flow = collectFlow([flakySummaryMiddleware]);
 
 		await withFastTimers(() => flow.run('recent'));
-		const afterFirstRun = vault.storedPapers()[0]?.paper.extra;
-		console.log('1회차 attempts:', attempts, '/ 저장된 extra:', afterFirstRun);
 
 		// 재스캔 창(4일) 안이라 같은 논문이 다음 recent 실행에도 자연히 다시 걸린다 —
 		// 커서를 조작할 필요 없이 그냥 한 번 더 돌리면 된다.
@@ -480,7 +464,6 @@ describe('15: extra는 조건 없이 복원된다 — 실패 도중 남긴 값�
 
 		await withFastTimers(() => flow.run('recent'));
 		const afterSecondRun = vault.storedPapers()[0]?.paper.extra;
-		console.log('2회차 attempts(누적):', attempts, '/ 저장된 extra:', afterSecondRun);
 
 		assert.equal(attempts, 1, '미들웨어가 2회차에도 다시 시도했다 — 이 재현의 전제가 깨졌다');
 		assert.equal(
@@ -507,7 +490,6 @@ describe('그룹 A-1: 중복 구독이 파일에 있어도 런타임엔 하나�
 		);
 
 		const subs = await File.readSubscriptions();
-		console.log('복원된 구독 수:', subs.apis.length);
 		assert.equal(subs.apis.length, 1, '중복 구독이 걸러지지 않았다');
 	});
 
@@ -545,7 +527,6 @@ describe('그룹 A-2: Schedule.json의 범위 밖 값과 죽은 필드', () => {
 		);
 
 		const settings = await File.readScheduleSettings();
-		console.log('정제된 설정:', settings);
 
 		assert.equal(settings.targetHour, 3, '범위 밖 targetHour가 기본값으로 안 돌아왔다');
 		assert.equal(settings.targetMinute, 0, '범위 밖 targetMinute가 기본값으로 안 돌아왔다');
@@ -601,13 +582,13 @@ describe('그룹 D-1: .md가 지워지거나 마커 내용이 어긋나도 다�
 
 		const mdPath = vault.storedPapers()[0]?.path.replace(/\.json$/, '.md');
 		assert.ok(mdPath && vault.files.has(mdPath), '초기 저장에서 .md가 안 만들어졌다');
-		vault.files.delete(mdPath as string);
+		vault.files.delete(mdPath);
 
 		// .json 값은 그대로인 같은 paper로 다시 저장 시도.
 		await File.writePaper(paper);
 
-		assert.ok(vault.files.has(mdPath as string), '.md가 지워진 채로 복구되지 않았다');
-		const mdText = vault.files.get(mdPath as string) ?? '';
+		assert.ok(vault.files.has(mdPath), '.md가 지워진 채로 복구되지 않았다');
+		const mdText = vault.files.get(mdPath) ?? '';
 		assert.ok(mdText.includes(paper.abstract), '복구된 .md에 최신 초록이 없다');
 	});
 
@@ -635,7 +616,7 @@ describe('그룹 D-2: 제목이 바뀌면 옛 파일을 새 경로로 옮긴다'
 		const oldStored = vault.storedPapers()[0];
 		assert.ok(oldStored);
 		const oldCreatedAt = (
-			JSON.parse(vault.files.get(oldStored!.path) ?? '{}') as { createdAt?: number }
+			JSON.parse(vault.files.get(oldStored.path) ?? '{}') as { createdAt?: number }
 		).createdAt;
 
 		const newPaper = Object.assign(new Paper(), oldPaper, { title: 'Revised Title (v2)' });
@@ -643,7 +624,6 @@ describe('그룹 D-2: 제목이 바뀌면 옛 파일을 새 경로로 옮긴다'
 		await File.writePaper(newPaper);
 
 		const afterRename = vault.storedPapers();
-		console.log('rename 후 저장된 경로들:', afterRename.map((p) => p.path));
 
 		assert.equal(afterRename.length, 1, '제목 변경 후 파일이 두 개로 갈라졌다');
 		assert.ok(
