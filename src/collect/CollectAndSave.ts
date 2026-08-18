@@ -64,7 +64,15 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 이번 실행에서 끝까지 실패한 구독들. 한 구독의 실패가 나머지 구독의 진행/커서 갱신을
 	// 막지 않도록 collect()가 구독 경계에서 격리하는데(아래 collect() 주석 참고), 그
 	// 대가로 "무엇이 실패했는지"를 어딘가에는 남겨야 한다 — 그게 여기다.
-	failedSubscriptions: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[];
+	failedSubscriptions: {
+		apiName: string;
+		querys: SearchQuery[];
+		error: string;
+		hint: string;
+		// backfill 실패에서만 채워진다 — 어느 구간이 안 끝났는지 사용자가 알아야
+		// 「과거 논문 수집」을 그 범위로 다시 열어 재입력할 수 있다.
+		range?: { from: number; to: number };
+	}[];
 	// [2] 정책으로 arXiv 응답에서 건너뛴 항목 수의 합(API.CollectionCoverage.skippedEntries,
 	// 구독마다 누적). Paper로 승격되지 못해 어디에도 저장되지 않는 항목이라, 여기서 집계하지
 	// 않으면 "N편 수집" 요약만 보고는 이런 항목이 있었다는 사실 자체를 알 수 없다.
@@ -77,6 +85,11 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 자동 재시도(repairCitationsBody) 대상에서 빠진 수. 이 논문들은 유실은 아니고(다음
 	// 플러그인 로드 시 전수 보정이 결국 잡는다 — 위 상수 주석 참고) 재시도만 늦어진다.
 	citationRetryOverflow: number;
+	// 요청한 category 조건과 실제 응답이 어긋난 건수의 합(API.CollectionCoverage.
+	// categoryMismatches, 구독마다 누적). 정상 상황에서는 항상 0 — 0이 아니면 수집 도중
+	// 요청이 변조됐거나(8번, 프록시 재현 사례) arXiv 응답 자체가 이상했다는 신호라, 조용히
+	// 넘기지 않고 사용자에게 알린다.
+	categoryMismatches: number;
 }
 
 // 한 번의 보정 실행이 무엇을 했는지 (예전 combined 경로 — repair()가 남긴다).
@@ -492,6 +505,7 @@ export class CollectAndSave {
 			skippedEntries: 0,
 			anyTruncated: false,
 			citationRetryOverflow: 0,
+			categoryMismatches: 0,
 		};
 		const failures: { citation: Paper[] } = { citation: [] };
 		let chunks = 0;
@@ -1198,7 +1212,13 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<{
 		cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[];
-		subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[];
+		subscriptionFailures: {
+			apiName: string;
+			querys: SearchQuery[];
+			error: string;
+			hint: string;
+			range?: { from: number; to: number };
+		}[];
 		skippedRecords: SkippedEntryRecord[];
 	}> {
 		const options: CollectOptions = {
@@ -1207,7 +1227,13 @@ export class CollectAndSave {
 			onTotal,
 		};
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
-		const subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[] = [];
+		const subscriptionFailures: {
+			apiName: string;
+			querys: SearchQuery[];
+			error: string;
+			hint: string;
+			range?: { from: number; to: number };
+		}[] = [];
 		// 7번(부분 재조회)용 원자재 — CollectStats에는 안 넣는다(그 인터페이스는 이 기능이
 		// 없어져도 남아야 하는 핵심 통계라 임시 기능과 섞지 않는다). runNow()가 이 배열을
 		// 그대로 SkippedEntries.json에 append한다.
@@ -1242,8 +1268,9 @@ export class CollectAndSave {
 				apiName: api.apiName,
 				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
 			});
+			let window: CollectWindow | undefined;
 			try {
-				const window = this.resolveWindow(mode, testOptions, api);
+				window = this.resolveWindow(mode, testOptions, api);
 				if (window.hours === undefined) {
 					await api.Backfill(window.from, window.to, options);
 				} else {
@@ -1264,6 +1291,7 @@ export class CollectAndSave {
 						stats.anyTruncated = true;
 					}
 					skippedRecords.push(...coverage.skipped);
+					stats.categoryMismatches += coverage.categoryMismatches;
 				}
 				if (window.advancesCursor) {
 					cursorUpdates.push({
@@ -1283,7 +1311,21 @@ export class CollectAndSave {
 				// (검색어 인코딩 포함)를 담고 있어 Notice/로그 한 줄에 넣기엔 너무 길고
 				// 잡음이 많다. 전체 스택은 Log.error의 error 인자로 이미 따로 남는다.
 				const { code, label, hint } = describeFailure(error);
-				subscriptionFailures.push({ apiName: api.apiName, querys: api.querys, error: label, hint });
+				// backfill이 실패하면 어느 구간이 안 끝났는지 사용자가 알아야 재입력할 수
+				// 있다 — window가 resolveWindow까지 성공한 뒤(즉 range 자체는 유효했는데
+				// 네트워크 등으로 중단된 경우)에만 채워진다. window가 없으면(범위 검증
+				// 자체가 실패) 이미 error 메시지가 원인을 설명하므로 range는 생략한다.
+				const range =
+					mode === 'backfill' && window !== undefined
+						? { from: window.from, to: window.to }
+						: undefined;
+				subscriptionFailures.push({
+					apiName: api.apiName,
+					querys: api.querys,
+					error: label,
+					hint,
+					range,
+				});
 				// 메시지 문자열 자체에 "어느 구독이 왜 죽었는지, 뭘 확인해야 하는지"가 다
 				// 들어가야 한다 — 로그를 죽 훑을 때 매 줄 뒤의 JSON을 펼쳐보지 않고도 원인과
 				// 대응을 바로 알 수 있게. code를 대괄호로 붙이는 건 이 코드베이스가 이미
@@ -1291,15 +1333,24 @@ export class CollectAndSave {
 				// 종류의 실패를 모아볼 수 있다.
 				const querysText = api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND ');
 				const hintText = hint ? ` — ${hint}` : '';
+				const rangeText = range
+					? ` — 미완료 구간 ${CollectAndSave.formatDate(range.from)}~${CollectAndSave.formatDate(range.to)}`
+					: '';
 				Log.error(
 					'collect',
-					`구독 수집 실패 [${code}] — [${api.apiName}] ${querysText} — ${label}${hintText} — 다음 구독으로 진행`,
+					`구독 수집 실패 [${code}] — [${api.apiName}] ${querysText} — ${label}${hintText}${rangeText} — 다음 구독으로 진행`,
 					error,
 					{ apiName: api.apiName, querys: api.querys.map((q) => `${q.searchType}:${q.query}`) },
 				);
 			}
 		}
 		return { cursorUpdates, subscriptionFailures, skippedRecords };
+	}
+
+	// 실패 메시지에 넣을 사람이 읽는 날짜(YYYY-MM-DD). 시각까지는 필요 없다 — backfill
+	// 범위는 항상 날짜 단위로 고른다(SubscriptionTargetModal).
+	private static formatDate(ms: number): string {
+		return new Date(ms).toISOString().slice(0, 10);
 	}
 
 	// 잘린(truncated) API는 그 지점까지만 인정한다. 요청한 구간의 끝(requestedTo)을

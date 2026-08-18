@@ -173,6 +173,15 @@ export interface CollectionCoverage {
 	// RetryMissingEntries로 재조회한다 — 이 기능 자체가 통째로 사라져도(devLog에 남긴 대로
 	// "임시" 설계) 이 필드 하나만 걷어내면 된다.
 	skipped: SkippedEntryRecord[];
+	// 이번 수집에서 요청한 category 조건(searchType: 'category')과 실제 응답 entry의
+	// <category> 태그가 하나도 안 맞은 건수. 정상 상황에서는 항상 0이다 — arXiv 자체가
+	// 요청한 카테고리로 결과를 좁혀 돌려주므로. 0이 아니면 요청과 실제 응답이 어긋났다는
+	// 뜻인데, 그 원인이 될 수 있는 것 중 하나가 프록시 등으로 요청이 중간에 변조된 경우다
+	// (8번, 실제 재현됨: UI가 cs.LG를 보냈다고 표시하는 동안 서버로는 cs.CR이 나간 사례).
+	// arXiv가 실제로 뭘 돌려줬는지는 이 카운트만으로 증명되지 않지만(카테고리 태그를
+	// 아예 안 붙이는 등 다른 이유도 있을 수 있다), 0이 아니면 사용자가 확인해야 한다는
+	// 신호로는 충분하다.
+	categoryMismatches: number;
 }
 
 // [2] 정책으로 스킵된 항목의 사유. id를 arXiv id로 해석할 수 있었는지가 재시도 가능
@@ -211,6 +220,9 @@ interface ArxivPage {
 	latestPublishedMs: number | undefined;
 	// 이 페이지에서 [2] 정책으로 건너뛴 항목의 상세 기록 — CollectionCoverage.skipped 참고.
 	skipped: SkippedEntryRecord[];
+	// 이 페이지에서 요청한 category 조건과 실제 응답 entry의 category가 어긋난 건수 —
+	// CollectionCoverage.categoryMismatches 참고.
+	categoryMismatches: number;
 }
 
 // S2 배치 응답 한 칸. externalIds.ArXiv는 이 레코드가 스스로 밝히는 arXiv id다.
@@ -411,6 +423,7 @@ export class ArxivAPI implements API {
 				totalResults: -1,
 				skippedEntries: 0,
 				skipped: [],
+				categoryMismatches: 0,
 			};
 			return [];
 		}
@@ -474,6 +487,7 @@ export class ArxivAPI implements API {
 		let pages = 0;
 		let skippedEntries = 0;
 		const skipped: SkippedEntryRecord[] = [];
+		let categoryMismatches = 0;
 		let duplicates = 0;
 		let unique = 0;
 		// 첫 라운드의 값만 의미가 있다 — 이후 라운드는 좁아진 구간의 전체 건수라서
@@ -518,6 +532,7 @@ export class ArxivAPI implements API {
 			pages += roundCoverage.pages;
 			skippedEntries += roundCoverage.skippedEntries;
 			skipped.push(...roundCoverage.skipped);
+			categoryMismatches += roundCoverage.categoryMismatches;
 			if (round === 0) {
 				totalResults = roundCoverage.totalResults;
 			}
@@ -559,6 +574,7 @@ export class ArxivAPI implements API {
 			totalResults,
 			skippedEntries,
 			skipped,
+			categoryMismatches,
 		};
 	}
 
@@ -585,6 +601,7 @@ export class ArxivAPI implements API {
 		// 페이지마다 조용히 사라지지 않도록 coverage에 실어 밖에서 확인할 수 있게 한다.
 		let skippedEntries = 0;
 		const skipped: SkippedEntryRecord[] = [];
+		let categoryMismatches = 0;
 
 		for (let page = 0; page < ArxivAPI.MAX_PAGES; page += 1) {
 			if (page > 0) {
@@ -605,6 +622,7 @@ export class ArxivAPI implements API {
 			totalResults = result.totalResults;
 			skippedEntries += result.entryCount - result.papers.length;
 			skipped.push(...result.skipped);
+			categoryMismatches += result.categoryMismatches;
 			// 커서는 절대 뒤로 가지 않게 max로 누적한다. ascending이라 보통은 페이지마다
 			// 커지지만, 그 정렬을 커서 정확성의 전제로 삼지는 않는다.
 			if (result.latestPublishedMs !== undefined) {
@@ -629,6 +647,7 @@ export class ArxivAPI implements API {
 					totalResults,
 					skippedEntries,
 					skipped,
+					categoryMismatches,
 				};
 				Log.info('arxiv.paged', '구간 완주', {
 					dateFilter,
@@ -656,6 +675,7 @@ export class ArxivAPI implements API {
 			totalResults,
 			skippedEntries,
 			skipped,
+			categoryMismatches,
 		};
 		Log.info('arxiv.paged', '라운드 상한(MAX_PAGES) 도달 — 남은 구간은 다음 라운드로', {
 			dateFilter,
@@ -683,6 +703,13 @@ export class ArxivAPI implements API {
 		sortOrder: 'ascending' | 'descending',
 	): Promise<ArxivPage> {
 		const collectedQuery = combineQueries(this.querys);
+		// 이번 구독이 실제로 요청한 category 조건들 — 프록시 등으로 요청이 변조돼도 이
+		// 배열은 로컬에서 만든 원래 요청을 그대로 반영한다(변조는 네트워크 상에서
+		// 일어나므로 여기 값 자체는 안 바뀐다). 응답 entry의 실제 category와 대조하는
+		// 기준이 된다.
+		const requestedCategories = this.querys
+			.filter((q) => q.searchType === 'category')
+			.map((q) => q.query);
 		const url = this.buildUrl(dateFilter, start, maxResults, sortOrder);
 		const startedAt = Date.now();
 		// 실패하면 여기서 throw로 끊긴다([1] 정책). 어느 요청에서 끊겼는지 남기려면
@@ -694,6 +721,7 @@ export class ArxivAPI implements API {
 		const papers: Paper[] = [];
 		const skipped: SkippedEntryRecord[] = [];
 		let latestPublishedMs: number | undefined;
+		let categoryMismatches = 0;
 
 		for (const entry of entries) {
 			ArxivAPI.assertNotErrorEntry(entry);
@@ -706,6 +734,15 @@ export class ArxivAPI implements API {
 					latestPublishedMs === undefined
 						? published
 						: Math.max(latestPublishedMs, published);
+			}
+
+			if (requestedCategories.length > 0) {
+				const entryCategories = Array.from(entry.querySelectorAll('category')).map(
+					(c) => c.getAttribute('term') ?? '',
+				);
+				if (!requestedCategories.some((rc) => entryCategories.includes(rc))) {
+					categoryMismatches += 1;
+				}
 			}
 
 			const paper = ArxivAPI.parseEntry(entry, collectedQuery);
@@ -745,6 +782,14 @@ export class ArxivAPI implements API {
 			latestPublished:
 				latestPublishedMs === undefined ? undefined : new Date(latestPublishedMs).toISOString(),
 		});
+		if (categoryMismatches > 0) {
+			// 요청-응답 불일치는 흔한 일이 아니므로 debug가 아니라 warn으로 남긴다 — 8번
+			// (프록시로 요청이 변조된 사례)처럼 조용히 지나가면 안 되는 신호다.
+			Log.warn('arxiv.page', '요청한 category와 응답 category가 어긋난 항목 발견', {
+				requestedCategories,
+				categoryMismatches,
+			});
+		}
 
 		return {
 			papers,
@@ -752,6 +797,7 @@ export class ArxivAPI implements API {
 			totalResults,
 			latestPublishedMs,
 			skipped,
+			categoryMismatches,
 		};
 	}
 

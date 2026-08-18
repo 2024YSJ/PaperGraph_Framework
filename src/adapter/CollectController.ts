@@ -118,6 +118,13 @@ export class CollectController implements CollectProgressSink {
 	// 등)에서는 아무도 못 본다.
 	private readonly citationOverflowNotifier = new FailureNotifier();
 
+	// categoryMismatches(8번: 요청-응답 category 불일치, 프록시 변조 재현 사례)도 같은
+	// 이유로 silent 실행에서 새는 신호다 — 자동 스케줄러가 도는 동안 요청이 변조돼도
+	// buildPartialFailureSuffix만으로는 아무도 못 본다. 보안과 관련된 신호라 매 실행마다
+	// 뜨는 스팸을 감수하기보다는(반복되는 동안은 조용히) 최초 발생/재발생 시점만 확실히
+	// 알리는 이 코드베이스의 기존 절충을 그대로 따른다.
+	private readonly categoryMismatchNotifier = new FailureNotifier();
+
 	// 인용수 보정이 "시도는 했는데 하나도 못 고쳤다"고 판단할 최소 시도 편수. 1~2편은
 	// 그 논문들이 우연히 S2에 없었을 뿐일 수 있어 노이즈가 크다 — 몇 편 이상 전부
 	// 실패해야 "키/네트워크 문제"라는 구조적 신호로 본다.
@@ -460,6 +467,16 @@ export class CollectController implements CollectProgressSink {
 		if (stats.anyTruncated) {
 			parts.push('일부 구간은 다 훑지 못해 다음 실행에서 이어집니다');
 		}
+		if (stats.categoryMismatches > 0) {
+			// 정상 상황에서는 절대 발생하지 않는 신호다 — arXiv는 요청한 category로 이미
+			// 걸러 응답하므로, 어긋난 게 있다면 수집 도중 요청이 변조됐거나(8번, 프록시로
+			// 재현된 사례) 응답 자체가 이상했다는 뜻이다. 조용히 넘기면 사용자는 자기가
+			// 무엇을 수집했는지 잘못 알게 된다.
+			parts.push(
+				`${stats.categoryMismatches}건은 요청한 분류(category)와 실제 응답이 어긋남 — ` +
+					`수집 경로(프록시 등)를 확인하세요`,
+			);
+		}
 		if (stats.failedSubscriptions.length > 0) {
 			// 사유(f.error, CollectAndSave.collect의 describeFailure — "HTTP 503" 등 짧은
 			// 형태)와 힌트(f.hint — "그래서 뭘 확인하면 되는지")까지 같이 보여준다. 어느
@@ -467,7 +484,16 @@ export class CollectController implements CollectProgressSink {
 			// 503이면 기다리면 됨) 알 수 없다 — 힌트가 빈 문자열이면(원인을 특정 못 함)
 			// 사유만 보여준다.
 			const detail = stats.failedSubscriptions
-				.map((f) => `${f.apiName}(${f.error}${f.hint ? ` — ${f.hint}` : ''})`)
+				.map((f) => {
+					// backfill 실패는 어느 구간이 안 끝났는지 보여줘야 사용자가 그 범위로
+					// 「과거 논문 수집」을 다시 열어 재입력할 수 있다 — 조용히 사라지면
+					// 영영 모른 채 넘어가는 것을 막는다(recent는 커서가 있어 다음 자동
+					// 실행이 알아서 이어가지만, backfill은 그 안전망이 없다).
+					const rangeText = f.range
+						? ` — 미완료 구간 ${isoDateInput(f.range.from)}~${isoDateInput(f.range.to)}`
+						: '';
+					return `${f.apiName}(${f.error}${f.hint ? ` — ${f.hint}` : ''}${rangeText})`;
+				})
 				.join(', ');
 			parts.push(`${detail} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
 		}
@@ -507,6 +533,18 @@ export class CollectController implements CollectProgressSink {
 			);
 		} else {
 			this.citationOverflowNotifier.notifySuccess();
+		}
+
+		if (stats && stats.categoryMismatches > 0) {
+			const mismatches = stats.categoryMismatches;
+			this.categoryMismatchNotifier.notifyFailure(
+				'category-mismatch',
+				() =>
+					`PaperGraph3D: 요청한 분류(category)와 실제 응답이 어긋난 항목이 ${mismatches}건 ` +
+					`있습니다 — 수집 요청이 중간에 변조됐을 수 있습니다. 네트워크/프록시 설정을 확인하세요.`,
+			);
+		} else {
+			this.categoryMismatchNotifier.notifySuccess();
 		}
 	}
 
