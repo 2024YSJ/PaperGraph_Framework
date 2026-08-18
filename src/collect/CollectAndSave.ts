@@ -167,6 +167,10 @@ export class CollectAndSave {
 	private queueListeners: ((state: CollectQueueState) => void)[] = [];
 	// 아직 시작하지 않은 recent 작업. 합침(coalescing) 대상이다 — 아래 requestRecent 참고.
 	private pendingRecent: Promise<void> | undefined;
+	// 아직 시작하지 않은 run() 작업들 — mode+대상 구독이 같으면 새로 큐에 넣지 않고 여기
+	// 걸린 Promise를 그대로 돌려준다. 사용자가 같은 버튼을 연타해도 대기 중인 동일 요청이
+	// 있으면 합쳐진다(연타로 큐가 무한히 쌓이는 것을 막는다) — run() 참고.
+	private pendingRuns = new Map<string, Promise<void>>();
 	// dispose() 이후 true. 이미 시작한 네트워크 요청은 취소할 수 없지만(requestUrl에
 	// 취소 수단이 없다 — ApiSupport.requestWithTimeout 주석 참고), 이 플래그가 서는
 	// 지점들(enqueue/collect/processChunk/repairNow)은 그 요청이 끝나는 대로 더 진행하지
@@ -312,8 +316,12 @@ export class CollectAndSave {
 	}
 
 	// 실행 계열. 큐를 거쳐 직렬로 실행된다 — 이미 돌고 있는 작업이 있으면 그 뒤에 선다.
-	// requestRecent와 달리 합치지 않는다: 호출자가 명시적으로 요청한 실행이라 임의로
-	// 하나로 묶으면 "누른 만큼 돈다"는 기대가 깨진다.
+	//
+	// 아직 시작하지 않은 동일 요청(mode + 대상 구독이 같음)이 큐에 있으면 새로 넣지 않고
+	// 그 Promise를 합쳐 돌려준다(pendingRuns) — 사용자가 같은 버튼을 연타해도 의미 없는
+	// 중복 실행이 쌓이지 않는다. targetSubscriptions가 없으면(구독 전체 대상) 항상 같은
+	// 키로 취급한다. 이미 시작된 작업은 합치지 않는다 — 그 시점의 구독 목록으로 이미 돌고
+	// 있어서 뒤늦은 요청은 별개로 다시 실행해야 반영된다.
 	//
 	// onStart는 "줄에서 빠져나와 실제로 시작했다"는 신호다. 큐가 생기면서 요청 시점과 실행
 	// 시점이 갈라졌고, UI는 그 둘을 다르게 표시해야 한다(대기 중 / 수집 중).
@@ -334,11 +342,36 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
 		const label = mode === 'recent' ? '최근 논문 수집' : '과거 논문 수집';
-		return this.enqueue(
+		const key = CollectAndSave.runKey(mode, testOptions);
+		const pending = this.pendingRuns.get(key);
+		if (pending !== undefined) {
+			return pending;
+		}
+		const result = this.enqueue(
 			{ kind: mode, label },
 			() => this.runNow(mode, testOptions, onTotal, onApiStart, onApiDone),
-			onStart,
+			() => {
+				// 시작하는 순간 합침 대상에서 빠진다(requestRecent와 같은 패턴).
+				if (this.pendingRuns.get(key) === result) {
+					this.pendingRuns.delete(key);
+				}
+				onStart?.();
+			},
 		);
+		this.pendingRuns.set(key, result);
+		return result;
+	}
+
+	// run() 합침 판단용 키 — mode와 대상 구독(선택 안 했으면 "전체")이 같으면 같은 요청으로
+	// 본다. backfill은 날짜 범위도 다르면 별개 요청이어야 하므로 from/to까지 포함한다.
+	private static runKey(mode: 'recent' | 'backfill', testOptions?: CollectTestOptions): string {
+		const targets =
+			testOptions?.targetSubscriptions
+				?.map((t) => `${t.apiName}:${t.querys.map((q) => `${q.searchType}:${q.query}`).join(',')}`)
+				.sort()
+				.join('|') ?? 'ALL';
+		const range = mode === 'backfill' ? `:${testOptions?.from ?? ''}~${testOptions?.to ?? ''}` : '';
+		return `${mode}:${targets}${range}`;
 	}
 
 	// targetSourceIds를 주면 그 논문들만 재시도한다. 생략하면 코퍼스 전체에서 실패 플래그가
