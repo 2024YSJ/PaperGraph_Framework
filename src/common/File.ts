@@ -1,4 +1,4 @@
-import { TFile, Vault } from 'obsidian';
+import { Notice, TFile, Vault } from 'obsidian';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
@@ -213,6 +213,28 @@ export class File {
 		return typeof renamed === 'string' ? { ...query, searchType: renamed } : query;
 	}
 
+	// 구독 조건은 API 단위로 최대 3개(002.md 확정)까지, 그리고 그 API가 인정하는
+	// searchType(예: arXiv의 keyword/author/category)만 허용한다. 이 화이트리스트는 각
+	// API 구현체가 정한다(ArxivAPI.isValidSearchType) — File.ts는 apiName으로 어느
+	// 구현체의 규칙을 적용할지만 안다.
+	private static readonly MAX_QUERYS_PER_SUBSCRIPTION = 3;
+	private static readonly QUERY_TYPE_VALIDATORS: Record<string, (searchType: string) => boolean> = {
+		arxiv: (searchType) => ArxivAPI.isValidSearchType(searchType),
+	};
+
+	// ApiManagementModal은 UI에서 keyword/author/category 드롭다운과 3개 상한을 지키게
+	// 하지만, 저장 파일(Subscriptions.json)은 사용자가 개발자 도구로 DOM/네트워크 요청을
+	// 조작해 그 UI 제약을 우회하고 임의의 필드/개수를 심을 수 있다(9번, 실제 재현됨).
+	// 저장이 실제로 일어나는 이 지점에서 다시 걸러내면 어떤 경로로 들어온 값이든(정상
+	// UI, 조작된 요청, 앞으로 생길 다른 저장 경로) 파일에는 항상 유효한 조건만 남는다.
+	// 알 수 없는 apiName(QUERY_TYPE_VALIDATORS에 없음)은 검증 기준이 없으므로 그대로
+	// 통과시킨다 — 그 apiName 자체가 잘못됐다면 File.createApi(복원 시점)가 이미 막는다.
+	private static sanitizeQuerys(apiName: string, querys: SearchQuery[]): SearchQuery[] {
+		const isValid = File.QUERY_TYPE_VALIDATORS[apiName];
+		const filtered = isValid ? querys.filter((q) => isValid(q.searchType)) : querys;
+		return filtered.slice(0, File.MAX_QUERYS_PER_SUBSCRIPTION);
+	}
+
 	static writeSubscriptions(subscriptions: Subscriptions): Promise<void> {
 		// secret은 별도 Secret.json(난독화)에만 저장한다. Subscriptions.json에 함께 넣으면
 		// API 키가 평문으로 중복 저장되므로 제외한다.
@@ -226,13 +248,22 @@ export class File {
 		// 커서(updateTime)를 구독 하나마다 따로 싣는다 — 전역 커서 한 값이던 시절과 달리,
 		// 구독이 배열의 어느 위치로 옮겨져도(추가/삭제/재배열) 그 구독 고유의 진행 상황이
 		// 함께 따라간다.
-		return File.writeConfig('Subscriptions.json', {
-			apis: subscriptions.apis.map((api) => ({
-				apiName: api.apiName,
-				querys: api.querys,
-				updateTime: api.updateTime,
-			})),
+		let droppedAny = false;
+		const apis = subscriptions.apis.map((api) => {
+			const querys = File.sanitizeQuerys(api.apiName, api.querys);
+			if (querys.length !== api.querys.length) {
+				droppedAny = true;
+			}
+			return { apiName: api.apiName, querys, updateTime: api.updateTime };
 		});
+		if (droppedAny) {
+			// 저장은 계속 진행한다(나머지 정상 구독까지 막을 이유는 없다) — 다만 조용히
+			// 걸러내면 사용자는 자기 구독이 왜 줄었는지 알 방법이 없다.
+			new Notice(
+				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 저장에서 제외되었습니다 — 구독 관리에서 확인하세요.',
+			);
+		}
+		return File.writeConfig('Subscriptions.json', { apis });
 	}
 
 	// Subscriptions.json에 대한 읽기-수정-쓰기를 한 번에 하나씩만 실행한다.

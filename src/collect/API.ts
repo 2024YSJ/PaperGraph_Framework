@@ -265,6 +265,15 @@ export class ArxivAPI implements API {
 		category: 'cat',
 	};
 
+	// 이 API가 인정하는 searchType인가 — File.writeSubscriptions가 저장 시점에 구독 조건을
+	// 검증할 때 쓴다(9번: 개발자 도구로 UI를 우회해 keyword/author/category 밖의 조건을
+	// Subscriptions.json에 심는 경로 방어). formatTerm도 결국 이 맵을 보고 거부하지만, 그건
+	// "수집을 실행하는 시점"의 최종 방어선이고, 저장 시점에도 막아야 애초에 이상한 조건이
+	// 파일에 남지 않는다.
+	static isValidSearchType(searchType: string): boolean {
+		return typeof ArxivAPI.FIELD_PREFIX[searchType] === 'string';
+	}
+
 	private static readonly ENDPOINT = 'https://export.arxiv.org/api/query';
 
 	// SearchBase()가 한 번에 가져오는 건수. 인터페이스가 정한 값이 아니라 arXiv 구현체의
