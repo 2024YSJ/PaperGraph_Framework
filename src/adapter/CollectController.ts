@@ -196,11 +196,21 @@ export class CollectController implements CollectProgressSink {
 	runRecent(app: App): void {
 		new SubscriptionTargetModal(app, '최근 논문 수집 — 구독 선택', false, (targets) => {
 			const label = describeTargets('최근 논문 수집', targets);
+			const testOptions = { targetSubscriptions: targets };
+			// run()은 내부적으로 동일 요청을 합쳐주지만(pendingRuns), 그걸 모르고 여기서
+			// 매번 새 runWithProgress를 부르면 클릭마다 새 진행률 Notice가 또 생겨 실제로는
+			// 하나로 합쳐진 실행인데도 화면에는 여러 개가 쌓인 것처럼 보인다(57번과 같은
+			// 근본 원인 — UI는 항상 도메인의 합침 여부를 먼저 확인해야 한다). 이미 같은
+			// 요청이 대기 중이면 새 진행률 UI를 만들지 않고 안내만 한다.
+			if (this.plugin.collectflow.hasPendingRun('recent', testOptions)) {
+				new Notice(`${label} — 이미 대기 중입니다.`);
+				return;
+			}
 			void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
 				this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
 					this.plugin.collectflow.run(
 						'recent',
-						{ targetSubscriptions: targets },
+						testOptions,
 						onStart,
 						onTotal,
 						onApiStart,
@@ -222,11 +232,18 @@ export class CollectController implements CollectProgressSink {
 					return;
 				}
 				const label = describeTargets('과거 논문 수집', targets);
+				const testOptions = { from: range.from, to: range.to, targetSubscriptions: targets };
+				// runRecent와 같은 이유 — run()의 합침을 UI가 모르면 클릭마다 진행률
+				// Notice가 또 생긴다.
+				if (this.plugin.collectflow.hasPendingRun('backfill', testOptions)) {
+					new Notice(`${label} — 이미 대기 중입니다.`);
+					return;
+				}
 				void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
 					this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
 						this.plugin.collectflow.run(
 							'backfill',
-							{ from: range.from, to: range.to, targetSubscriptions: targets },
+							testOptions,
 							onStart,
 							onTotal,
 							onApiStart,
@@ -291,6 +308,14 @@ export class CollectController implements CollectProgressSink {
 	// 그대로 맞춘다.
 	async refreshAllAuto(): Promise<string | void> {
 		const label = '새로고침';
+		// refreshAll()은 이미 대기 중인 요청과 내부적으로 합쳐지지만(57번), 그걸 모르고
+		// 여기서 매번 새 "준비 중..." Notice를 띄우면 실제로는 하나로 합쳐진 실행인데도
+		// 화면에는 여러 개가 쌓인 것처럼 보인다 — runRecent/openBackfillModal과 같은 이유로
+		// 여기서도 먼저 확인한다.
+		if (this.plugin.collectflow.hasPendingRefresh) {
+			new Notice(`${label} — 이미 대기 중입니다.`);
+			return undefined;
+		}
 		// "준비 중" 단계는 File.readAllPapers()로 볼트 전체를 스캔하는 구간이라 총량을 미리
 		// 몰라 진행률(%)을 못 낸다 — 그래서 오래 걸려도 멈춘 것처럼 보이지 않도록, 최소한
 		// 왜 오래 걸릴 수 있는지는 문구로 설명한다(정확한 진행률은 readAllPapers에 콜백을

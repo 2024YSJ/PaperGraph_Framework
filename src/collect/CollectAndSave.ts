@@ -239,6 +239,23 @@ export class CollectAndSave {
 		return this.pendingRecent !== undefined;
 	}
 
+	// run()과 정확히 같은 키(mode+대상 구독)로 아직 시작하지 않은 요청이 이미 큐에 있는가 —
+	// hasPendingRecent와 같은 이유다. run() 자체는 이미 대기 중인 요청과 합쳐 같은
+	// Promise를 돌려주지만(57번, 새로고침과 같은 근본 원인), 그 사실을 모르는 호출자
+	// (CollectController.runRecent/openBackfillModal)는 매 클릭마다 새 ProgressFlow와
+	// Notice를 또 만든다 — run()이 내부적으로 합쳐도 UI에서는 "쌓이는 것처럼" 보였다.
+	// 호출자가 실제로 run()을 부르기 전에 이걸로 먼저 확인해, 이미 대기 중이면 새
+	// 진행률 UI를 만들지 않고 조용히 안내만 하게 한다.
+	hasPendingRun(mode: 'recent' | 'backfill', testOptions?: CollectTestOptions): boolean {
+		return this.pendingRuns.has(CollectAndSave.runKey(mode, testOptions));
+	}
+
+	// hasPendingRun과 같은 이유로 refreshAll() 전용 — CollectController.refreshAllAuto가
+	// 매 클릭마다 "준비 중..." Notice를 새로 띄우기 전에 먼저 확인한다.
+	get hasPendingRefresh(): boolean {
+		return this.pendingRefresh !== undefined;
+	}
+
 	// 큐가 변할 때마다(입큐/시작/종료) 불린다. UI가 버튼 상태와 안내 문구를 갱신한다.
 	onQueueChange(listener: (state: CollectQueueState) => void): void {
 		this.queueListeners.push(listener);
