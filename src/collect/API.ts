@@ -286,6 +286,19 @@ export class ArxivAPI implements API {
 		return typeof ArxivAPI.FIELD_PREFIX[searchType] === 'string';
 	}
 
+	// arXiv 분류 코드(cs.AI, math.NA, astro-ph.GA, 또는 상위 아카이브만 있는 cs 같은 형태)의
+	// 모양 — 소문자로 시작하는 영문/숫자/하이픈 토큰, 선택적으로 "."+영문/숫자/하이픈
+	// 서브클래스. category는 formatTerm에서 따옴표로 감싸지 않고 `cat:${value}`로 그대로
+	// 쿼리에 꽂히므로(69번: keyword/author는 따옴표 구문 검색이라 안의 AND/OR가 arXiv에서
+	// 연산자로 해석되지 않지만, category는 감싸지 않아 공백/AND/OR/콜론/괄호를 넣으면 그
+	// 자체로 새 쿼리 절이 삽입된다 — 실제 재현된 필터 우회), 이 형식을 벗어나면 애초에
+	// 값 자체를 거부한다.
+	private static readonly CATEGORY_PATTERN = /^[a-z][a-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)?$/;
+
+	static isValidCategoryValue(value: string): boolean {
+		return ArxivAPI.CATEGORY_PATTERN.test(value);
+	}
+
 	private static readonly ENDPOINT = 'https://export.arxiv.org/api/query';
 
 	// SearchBase()가 한 번에 가져오는 건수. 인터페이스가 정한 값이 아니라 arXiv 구현체의
@@ -850,6 +863,12 @@ export class ArxivAPI implements API {
 			throw new ConfigurationError(
 				`Empty or meaningless query value for searchType "${query.searchType}"`,
 			);
+		}
+		// category는 따옴표로 감싸지 않으므로(위 클래스 주석), 값 자체가 cs.AI 같은 고정
+		// 토큰 모양이 아니면 거부한다 — 그렇지 않으면 공백+AND/OR+다른 필드로 쿼리 전체를
+		// 조작할 수 있다(69번, 실제 재현됨).
+		if (prefix === 'cat' && !ArxivAPI.isValidCategoryValue(value)) {
+			throw new ConfigurationError(`Invalid arXiv category format: "${query.query}"`);
 		}
 		return prefix === 'cat' ? `${prefix}:${value}` : `${prefix}:"${value}"`;
 	}

@@ -213,13 +213,19 @@ export class File {
 		return typeof renamed === 'string' ? { ...query, searchType: renamed } : query;
 	}
 
-	// 구독 조건은 API 단위로 최대 3개(002.md 확정)까지, 그리고 그 API가 인정하는
-	// searchType(예: arXiv의 keyword/author/category)만 허용한다. 이 화이트리스트는 각
-	// API 구현체가 정한다(ArxivAPI.isValidSearchType) — File.ts는 apiName으로 어느
-	// 구현체의 규칙을 적용할지만 안다.
+	// 구독 조건은 API 단위로 최대 3개(002.md 확정)까지, 그 API가 인정하는 searchType
+	// (예: arXiv의 keyword/author/category)만, 그리고 그 searchType이 받아들이는 값
+	// 모양만 허용한다. searchType은 맞아도 값 자체가 문제인 경우가 있다 — arXiv의
+	// category는 값을 따옴표로 감싸지 않고 쿼리에 그대로 꽂히므로(ArxivAPI.formatTerm),
+	// "cs.AI" 같은 고정 토큰이 아니라 공백+AND/OR+다른 필드를 넣으면 쿼리 전체를 조작할
+	// 수 있다(69번, 실제 재현됨: searchType은 정상인데 값으로 필터를 우회). 이 화이트
+	// 리스트는 각 API 구현체가 정한다(ArxivAPI.isValidSearchType/isValidCategoryValue) —
+	// File.ts는 apiName으로 어느 구현체의 규칙을 적용할지만 안다.
 	private static readonly MAX_QUERYS_PER_SUBSCRIPTION = 3;
-	private static readonly QUERY_TYPE_VALIDATORS: Record<string, (searchType: string) => boolean> = {
-		arxiv: (searchType) => ArxivAPI.isValidSearchType(searchType),
+	private static readonly QUERY_VALIDATORS: Record<string, (query: SearchQuery) => boolean> = {
+		arxiv: (query) =>
+			ArxivAPI.isValidSearchType(query.searchType) &&
+			(query.searchType !== 'category' || ArxivAPI.isValidCategoryValue(query.query)),
 	};
 
 	// ApiManagementModal은 UI에서 keyword/author/category 드롭다운과 3개 상한을 지키게
@@ -227,11 +233,11 @@ export class File {
 	// 조작해 그 UI 제약을 우회하고 임의의 필드/개수를 심을 수 있다(9번, 실제 재현됨).
 	// 저장이 실제로 일어나는 이 지점에서 다시 걸러내면 어떤 경로로 들어온 값이든(정상
 	// UI, 조작된 요청, 앞으로 생길 다른 저장 경로) 파일에는 항상 유효한 조건만 남는다.
-	// 알 수 없는 apiName(QUERY_TYPE_VALIDATORS에 없음)은 검증 기준이 없으므로 그대로
+	// 알 수 없는 apiName(QUERY_VALIDATORS에 없음)은 검증 기준이 없으므로 그대로
 	// 통과시킨다 — 그 apiName 자체가 잘못됐다면 File.createApi(복원 시점)가 이미 막는다.
 	private static sanitizeQuerys(apiName: string, querys: SearchQuery[]): SearchQuery[] {
-		const isValid = File.QUERY_TYPE_VALIDATORS[apiName];
-		const filtered = isValid ? querys.filter((q) => isValid(q.searchType)) : querys;
+		const isValid = File.QUERY_VALIDATORS[apiName];
+		const filtered = isValid ? querys.filter((q) => isValid(q)) : querys;
 		return filtered.slice(0, File.MAX_QUERYS_PER_SUBSCRIPTION);
 	}
 

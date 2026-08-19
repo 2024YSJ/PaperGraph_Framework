@@ -123,6 +123,27 @@ describe('쿼리 조립 (formatTerm / buildSearchQuery)', () => {
 			/Unknown searchType/,
 		);
 	});
+
+	// 69번: category는 값을 따옴표로 감싸지 않고 `cat:${value}`로 그대로 쿼리에 꽂히므로,
+	// keyword/author와 달리 값 자체에 공백+AND/OR+다른 필드를 넣으면 쿼리 전체를 조작할
+	// 수 있었다(searchType 화이트리스트만으로는 못 막음, 실제 재현됨).
+	it('category 값에 arXiv 쿼리 문법을 심으면 거부한다 — searchType은 정상이어도 필터 우회', async () => {
+		await assert.rejects(
+			() =>
+				new ArxivAPI([
+					{ searchType: 'category', query: 'cs.CR OR abs:"secret"' },
+				]).SearchBase(),
+			/Invalid arXiv category format/,
+		);
+	});
+
+	it('정상적인 category 코드(하이픈 서브클래스 포함)는 통과한다', async () => {
+		await new ArxivAPI([{ searchType: 'category', query: 'cond-mat.str-el' }]).SearchBase();
+		assert.equal(
+			queryParams(arxivRequests()[0]!.url).get('search_query'),
+			'cat:cond-mat.str-el',
+		);
+	});
 });
 
 describe('필드 매핑 (parseEntry)', () => {

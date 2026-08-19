@@ -1275,6 +1275,69 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 // 커서(updateTime)는 Subscriptions 전체가 아니라 구독(API 인스턴스)마다 따로 갖는다.
 // 새 구독을 추가해도 다른 구독의 진행 상황을 건드리지 않고, 구독이 배열에서 옮겨져도
 // (추가/삭제) 커서가 그 구독을 계속 따라가야 한다.
+describe('File.writeSubscriptions — 저장 시점 구독 조건 화이트리스트 (9번/69번)', () => {
+	// 개발자 도구로 UI를 우회해 keyword/author/category 밖의 searchType이나(9번), searchType은
+	// 정상이지만 category 값에 arXiv 쿼리 문법을 심은 조건(69번)을 강제로 저장 시도해도,
+	// 저장이 실제로 일어나는 File.writeSubscriptions 지점에서 걸러져야 한다.
+	it('알 수 없는 searchType은 저장에서 제외된다', async () => {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(
+			File.createApi('arxiv', [
+				{ searchType: 'keyword', query: 'ok' },
+				{ searchType: 'admin-override', query: 'anything' },
+			]),
+		);
+		await File.writeSubscriptions(subscriptions);
+
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: { searchType: string }[] }[];
+		};
+		const querys = raw.apis?.[0]?.querys ?? [];
+		assert.deepEqual(
+			querys.map((q) => q.searchType),
+			['keyword'],
+		);
+	});
+
+	it('category 값에 쿼리 문법을 심은 조건은 저장에서 제외된다', async () => {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(
+			File.createApi('arxiv', [
+				{ searchType: 'category', query: 'cs.CR OR abs:"secret"' },
+				{ searchType: 'category', query: 'cs.AI' },
+			]),
+		);
+		await File.writeSubscriptions(subscriptions);
+
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: { query: string }[] }[];
+		};
+		const querys = raw.apis?.[0]?.querys ?? [];
+		assert.deepEqual(
+			querys.map((q) => q.query),
+			['cs.AI'],
+		);
+	});
+
+	it('조건이 3개를 넘으면 앞에서부터 3개만 저장된다', async () => {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(
+			File.createApi('arxiv', [
+				{ searchType: 'keyword', query: 'a' },
+				{ searchType: 'keyword', query: 'b' },
+				{ searchType: 'keyword', query: 'c' },
+				{ searchType: 'keyword', query: 'd' },
+			]),
+		);
+		await File.writeSubscriptions(subscriptions);
+
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: unknown[] }[];
+		};
+		assert.equal(raw.apis?.[0]?.querys.length, 3);
+	});
+});
+
 describe('File.readSubscriptions/writeSubscriptions — 구독별 커서', () => {
 	it('구독마다 커서를 따로 저장하고 따로 복원한다', async () => {
 		vault.files.set(
