@@ -1336,6 +1336,33 @@ describe('File.writeSubscriptions — 저장 시점 구독 조건 화이트리�
 		};
 		assert.equal(raw.apis?.[0]?.querys.length, 3);
 	});
+
+	// 실제 재현된 문제: 파일을 직접 편집해 4개 조건(3개 상한 초과)을 넣으면, writeSubscriptions
+	// 검증만으로는 "다음에 뭔가 저장되기 전까지" 그대로 읽혀서 실제 수집(runNow →
+	// readSubscriptions)에 검증 안 된 4개 조건이 그대로 쓰였다 — 그 사이 창을 없애려면
+	// 읽기 시점에도 같은 검증이 필요하다.
+	it('파일을 직접 편집해 상한을 넘긴 경우 — 쓰기 전에도 읽는 즉시 잘린다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{
+						apiName: 'arxiv',
+						querys: [
+							{ searchType: 'keyword', query: 'privacy' },
+							{ searchType: 'keyword', query: 'llm' },
+							{ searchType: 'keyword', query: 'large language model' },
+							{ searchType: 'keyword', query: 'chatgpt' },
+						],
+						updateTime: 0,
+					},
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis[0]?.querys.length, 3);
+	});
 });
 
 describe('File.readSubscriptions/writeSubscriptions — 구독별 커서', () => {

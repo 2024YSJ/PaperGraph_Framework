@@ -164,11 +164,30 @@ export class File {
 				// 복원하는 유일한 지점에서 걸러내면 어떤 경로로 파일에 들어왔든(수동 편집,
 				// 앞으로 생길 다른 저장 경로) 런타임에는 항상 하나로만 존재한다.
 				const seen = new Set<string>();
+				// sanitizeQuerys(9번/69번 화이트리스트)는 원래 writeSubscriptions에만 있었는데,
+				// 그러면 파일을 직접 편집해 잘못된 조건을 넣었을 때 "다음에 뭔가 저장되기
+				// 전까지"는 검증 없이 그대로 읽혀 실제 수집(runNow → readSubscriptions)에
+				// 쓰였다(실제 재현됨 — write가 한 번 더 일어나기 전까지 4개 조건이 그대로
+				// 실행되고, 그제서야 뒤늦게 3개로 줄어들며 Notice가 떴다). 읽는 이 시점에도
+				// 같은 검증을 적용해 파일을 읽자마자 걸러지게 한다 — 쓰기 전까지의 창을 없앤다.
+				let droppedAny = false;
 				subscriptions.apis = (data.apis ?? [])
-					.map((apiData) => ({
-						...apiData,
-						querys: (apiData.querys ?? []).map((query) => File.migrateSearchType(query)),
-					}))
+					.map((apiData) => {
+						const migrated = (apiData.querys ?? []).map((query) => File.migrateSearchType(query));
+						const sanitized = File.sanitizeQuerys(apiData.apiName, migrated);
+						if (sanitized.length !== migrated.length) {
+							droppedAny = true;
+						}
+						return { ...apiData, querys: sanitized };
+					})
+					// 유효한 조건이 하나도 안 남았다고 여기서 구독 자체를 통째로 빼면 안 된다 —
+					// apiName이 애초에 모르는 값이라 querys를 검증할 기준조차 없는 경우
+					// (QUERY_VALIDATORS에 없음)도 이 조건에 걸리는데, 그런 항목은 조용히
+					// 사라지는 대신 아래 createApi가 "Unknown apiName"으로 크게 실패해야
+					// 한다(팀원이 새 API를 추가한 브랜치에서 저장한 파일을 구버전이 열어
+					// 조용히 그 구독을 지워버리는 사고를 막는 안전장치, 기존 테스트로 고정됨).
+					// searchType/category 값이 정말 걸러진 경우는 querys가 빈 채로 createApi까지
+					// 가고, 실제 수집 시점(buildUrl)에서 "querys is empty"로 드러난다.
 					.filter((apiData) => {
 						const key = `${apiData.apiName}::${JSON.stringify(apiData.querys)}`;
 						if (seen.has(key)) {
@@ -183,6 +202,11 @@ export class File {
 							typeof apiData.updateTime === 'number' ? apiData.updateTime : legacyCursor;
 						return api;
 					});
+				if (droppedAny) {
+					new Notice(
+						'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 구독 관리에서 확인하세요.',
+					);
+				}
 				return subscriptions;
 			},
 			() => {
