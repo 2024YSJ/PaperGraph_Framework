@@ -53,9 +53,10 @@ async function runCollectFlow(
 	busy: boolean,
 	action: () => Promise<string | void>,
 ): Promise<void> {
-	if (busy) {
-		new Notice(`${label} — 대기열에 넣었습니다. 진행 중인 작업이 끝나면 실행됩니다.`);
-	}
+	// busy일 때 여기서 Notice를 따로 띄우지 않는다 — action()이 부르는 runWithProgress가
+	// 곧바로 "○○ — 대기 중..." 상태 Notice를 띄우는데(renderProgress), 둘이 똑같은
+	// 내용을 거의 동시에 두 번 보여줘서 정신없었다(실제 재현됨). 그쪽 Notice는 실행이
+	// 시작되면 진행률로 계속 바뀌는 살아있는 표시라 이 일회성 토스트보다 정보량이 많다.
 	Log.info('ui', `${label} 요청`, { queued: busy });
 	try {
 		const detail = await action();
