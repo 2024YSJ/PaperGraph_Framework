@@ -749,13 +749,31 @@ export class ArxivAPI implements API {
 						: Math.max(latestPublishedMs, published);
 			}
 
+			let categoryMismatched = false;
 			if (requestedCategories.length > 0) {
 				const entryCategories = Array.from(entry.querySelectorAll('category')).map(
 					(c) => c.getAttribute('term') ?? '',
 				);
 				if (!requestedCategories.some((rc) => entryCategories.includes(rc))) {
 					categoryMismatches += 1;
+					categoryMismatched = true;
 				}
+			}
+
+			// 무결성 위반(8번, 프록시 재현 사례)은 저장 자체를 거부한다 — 데이터를 살려서
+			// 잘못된 collectedQueries("cs.LG로 찾음")로 저장해두면 조용히 거짓 기록이
+			// 남는다. [2] 정책(파싱 실패)과 달리 재시도로 고쳐질 문제가 아니라서
+			// SkippedEntries.json(RetryMissingEntries 대상)에는 넣지 않고, 카운트와
+			// 로그로만 남긴다 — 사용자 요청.
+			if (categoryMismatched) {
+				const rawId = ArxivAPI.text(entry.querySelector('id'));
+				const title = ArxivAPI.text(entry.querySelector('title'));
+				Log.warn('arxiv.page', '요청-응답 category 불일치로 저장 거부', {
+					rawId: rawId || '(없음)',
+					title: title || '(없음)',
+					requestedCategories,
+				});
+				continue;
 			}
 
 			const paper = ArxivAPI.parseEntry(entry, collectedQuery);

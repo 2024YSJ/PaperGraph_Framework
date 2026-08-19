@@ -503,10 +503,11 @@ export class CollectController implements CollectProgressSink {
 		if (stats.categoryMismatches > 0) {
 			// 정상 상황에서는 절대 발생하지 않는 신호다 — arXiv는 요청한 category로 이미
 			// 걸러 응답하므로, 어긋난 게 있다면 수집 도중 요청이 변조됐거나(8번, 프록시로
-			// 재현된 사례) 응답 자체가 이상했다는 뜻이다. 조용히 넘기면 사용자는 자기가
-			// 무엇을 수집했는지 잘못 알게 된다.
+			// 재현된 사례) 응답 자체가 이상했다는 뜻이다. API.ts가 이런 항목은 애초에
+			// 저장하지 않으므로(무결성 위반, 사용자 요청) 여기 숫자는 "걸렀다"는 뜻이지
+			// "잘못 저장됐다"는 뜻이 아니다.
 			parts.push(
-				`${stats.categoryMismatches}건은 요청한 분류(category)와 실제 응답이 어긋남 — ` +
+				`${stats.categoryMismatches}건은 요청한 분류(category)와 실제 응답이 어긋나 저장을 거부함 — ` +
 					`수집 경로(프록시 등)를 확인하세요`,
 			);
 		}
@@ -573,8 +574,8 @@ export class CollectController implements CollectProgressSink {
 			this.categoryMismatchNotifier.notifyFailure(
 				'category-mismatch',
 				() =>
-					`PaperGraph3D: 요청한 분류(category)와 실제 응답이 어긋난 항목이 ${mismatches}건 ` +
-					`있습니다 — 수집 요청이 중간에 변조됐을 수 있습니다. 네트워크/프록시 설정을 확인하세요.`,
+					`PaperGraph3D: 요청한 분류(category)와 실제 응답이 어긋나 ${mismatches}건의 저장을 ` +
+					`거부했습니다 — 수집 요청이 중간에 변조됐을 수 있습니다. 네트워크/프록시 설정을 확인하세요.`,
 			);
 		} else {
 			this.categoryMismatchNotifier.notifySuccess();

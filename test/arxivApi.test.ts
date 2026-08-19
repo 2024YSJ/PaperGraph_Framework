@@ -182,7 +182,9 @@ describe('필드 매핑 (parseEntry)', () => {
 	});
 
 	it('수집 출처를 배열로 기록한다 — 같은 인덱스가 한 쌍', async () => {
-		arxivOnly(feed([entry()], 1));
+		// category 조건으로 수집하므로 entry에도 매칭되는 category 태그가 있어야 한다 —
+		// 없으면 요청-응답 정합성 검사(8번)가 불일치로 보고 저장을 거부한다.
+		arxivOnly(feed([entry({ categories: ['cs.LG'] })], 1));
 
 		const [paper] = await new ArxivAPI([
 			KEYWORD,
@@ -255,6 +257,93 @@ describe('[2] 정책 — 개별 논문이 불완전하면 그 논문만 제외',
 
 		assert.equal(papers.length, 1);
 		assert.equal(api.lastCoverage?.skippedEntries, 2);
+	});
+});
+
+// 8번(프록시로 요청이 변조된 사례) — 요청한 category와 실제 응답의 category가 어긋난
+// 논문은 [2] 정책(파싱 실패)과 별개로 저장 자체를 거부한다. 무결성 문제라 재시도로
+// 고쳐지지 않으므로 SkippedEntries.json(재조회 대상)에는 안 남고, 카운트로만 보고된다.
+describe('요청-응답 category 무결성 (8번) — 어긋난 논문은 저장을 거부한다', () => {
+	it('요청 category와 다른 category가 붙은 entry는 저장되지 않는다', async () => {
+		arxivOnly(
+			feed(
+				[entry({ id: 'http://arxiv.org/abs/2501.00001v1', categories: ['cs.CR'] })],
+				1,
+			),
+		);
+
+		const api = new ArxivAPI([{ searchType: 'category', query: 'cs.LG' }]);
+		const papers = await api.SearchBase();
+		assert.equal(papers.length, 0, '요청(cs.LG)과 다른 category(cs.CR)면 저장되면 안 된다');
+	});
+
+	it('요청 category와 일치하면 정상 저장된다', async () => {
+		arxivOnly(
+			feed(
+				[entry({ id: 'http://arxiv.org/abs/2501.00001v1', categories: ['cs.LG'] })],
+				1,
+			),
+		);
+
+		const api = new ArxivAPI([{ searchType: 'category', query: 'cs.LG' }]);
+		const papers = await api.SearchBase();
+		assert.equal(papers.length, 1);
+	});
+
+	it('여러 category 조건 중 하나만 맞아도 통과한다(AND 아님 — entry가 여러 category를 가질 수 있음)', async () => {
+		arxivOnly(
+			feed(
+				[
+					entry({
+						id: 'http://arxiv.org/abs/2501.00001v1',
+						categories: ['cs.CR', 'cs.LG'],
+					}),
+				],
+				1,
+			),
+		);
+
+		const api = new ArxivAPI([{ searchType: 'category', query: 'cs.LG' }]);
+		const papers = await api.SearchBase();
+		assert.equal(papers.length, 1);
+	});
+
+	it('일부만 어긋나면 그 항목만 빠지고 나머지는 저장되며, 어긋난 수는 lastCoverage에 집계된다', async () => {
+		mockRequests((param) => {
+			if (param.url.includes('semanticscholar')) {
+				return response(200, '[]');
+			}
+			return response(
+				200,
+				feed(
+					[
+						entry({ id: 'http://arxiv.org/abs/2501.00001v1', categories: ['cs.LG'] }),
+						entry({ id: 'http://arxiv.org/abs/2501.00002v1', categories: ['cs.CR'] }),
+						entry({ id: 'http://arxiv.org/abs/2501.00003v1', categories: ['cs.LG'] }),
+					],
+					3,
+				),
+			);
+		});
+
+		const api = new ArxivAPI([{ searchType: 'category', query: 'cs.LG' }]);
+		const papers = await withFastTimers(() =>
+			api.Backfill(1_700_000_000_000, 1_700_100_000_000),
+		);
+
+		assert.equal(papers.length, 2);
+		assert.deepEqual(
+			papers.map((p) => p.sourceId),
+			['arxiv:2501.00001', 'arxiv:2501.00003'],
+		);
+		assert.equal(api.lastCoverage?.categoryMismatches, 1);
+	});
+
+	it('category 조건이 없는 구독은 대조 자체를 안 한다 — category 태그 없는 entry도 정상 저장', async () => {
+		arxivOnly(feed([entry()], 1)); // 기본 entry는 category 태그가 없다
+
+		const papers = await new ArxivAPI([KEYWORD]).SearchBase();
+		assert.equal(papers.length, 1);
 	});
 });
 
