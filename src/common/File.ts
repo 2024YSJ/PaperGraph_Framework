@@ -1,4 +1,5 @@
 import { Notice, TFile, Vault } from 'obsidian';
+import { Log } from './Log';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
@@ -221,12 +222,17 @@ export class File {
 			// 걸러낸 결과를 즉시 파일에 되돌려 쓴다 — 안 그러면 파일은 여전히 잘못된 값을
 			// 그대로 갖고 있어서, 이 함수가 다시 불릴 때마다(같은 수집 한 번 안에서도
 			// runNow 시작과 커서 갱신용 mutateSubscriptions가 각각 부른다) 매번 다시
-			// 걸러지고 Notice도 매번 뜬다(실제 재현됨 — 한 번의 수집에서 Notice가 2번).
-			// writeSubscriptions에도 같은 검증이 있지만, 여기서 넘기는 subscriptions는
-			// 이미 이 함수가 정리한 값이라 그쪽에서는 아무것도 더 안 걸리고 알림도 안 뜬다
-			// — 알림은 실제로 걸러낸 사실을 아는 여기서 한 번만 띄운다.
-			new Notice(
-				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 구독 관리에서 확인하세요.',
+			// 걸러진다. writeSubscriptions에도 같은 검증이 있지만, 여기서 넘기는
+			// subscriptions는 이미 이 함수가 정리한 값이라 그쪽에서는 아무것도 더 안 걸린다.
+			//
+			// Notice가 아니라 로그로만 남긴다 — 이 시점(readSubscriptions)은 수집 실행
+			// 도중에도 불리는데, 곧이어 뜨는 완료 Notice("N편 수집")와 겹쳐 한 번의 수집에
+			// 대해 Notice가 2개(무시됨+완료) 뜨는 게 오히려 산만하다는 피드백이 있었다
+			// (실제 재현됨). 걸러졌다는 사실 자체는 구독 관리 화면에서 조건 개수/내용으로
+			// 이미 확인 가능하다.
+			Log.warn(
+				'subscriptions',
+				'일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 파일을 정리된 상태로 되돌려 씀',
 			);
 			await File.writeSubscriptions(subscriptions);
 		}

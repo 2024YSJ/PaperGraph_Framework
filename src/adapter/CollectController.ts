@@ -207,9 +207,11 @@ export class CollectController implements CollectProgressSink {
 			// 매번 새 runWithProgress를 부르면 클릭마다 새 진행률 Notice가 또 생겨 실제로는
 			// 하나로 합쳐진 실행인데도 화면에는 여러 개가 쌓인 것처럼 보인다(57번과 같은
 			// 근본 원인 — UI는 항상 도메인의 합침 여부를 먼저 확인해야 한다). 이미 같은
-			// 요청이 대기 중이면 새 진행률 UI를 만들지 않고 안내만 한다.
+			// 요청이 대기 중이면 새 진행률 UI를 만들지 않는다. Notice는 따로 안 띄운다 —
+			// 이미 첫 요청이 띄운 상태 Notice("대기 중...")가 화면에 떠 있는 상태라, 여기서
+			// 또 띄우면 같은 내용이 2번 보인다(실제 재현됨).
 			if (this.plugin.collectflow.hasPendingRun('recent', testOptions)) {
-				new Notice(`${label} — 이미 대기 중입니다.`);
+				Log.info('ui', `${label} — 이미 대기 중`);
 				return;
 			}
 			void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
@@ -239,10 +241,9 @@ export class CollectController implements CollectProgressSink {
 				}
 				const label = describeTargets('과거 논문 수집', targets);
 				const testOptions = { from: range.from, to: range.to, targetSubscriptions: targets };
-				// runRecent와 같은 이유 — run()의 합침을 UI가 모르면 클릭마다 진행률
-				// Notice가 또 생긴다.
+				// runRecent와 같은 이유 — Notice는 안 띄운다(이미 뜬 상태 Notice와 중복).
 				if (this.plugin.collectflow.hasPendingRun('backfill', testOptions)) {
-					new Notice(`${label} — 이미 대기 중입니다.`);
+					Log.info('ui', `${label} — 이미 대기 중`);
 					return;
 				}
 				void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
@@ -317,9 +318,10 @@ export class CollectController implements CollectProgressSink {
 		// refreshAll()은 이미 대기 중인 요청과 내부적으로 합쳐지지만(57번), 그걸 모르고
 		// 여기서 매번 새 "준비 중..." Notice를 띄우면 실제로는 하나로 합쳐진 실행인데도
 		// 화면에는 여러 개가 쌓인 것처럼 보인다 — runRecent/openBackfillModal과 같은 이유로
-		// 여기서도 먼저 확인한다.
+		// 여기서도 먼저 확인한다. Notice는 안 띄운다 — 먼저 큐에 들어간 요청의 "준비
+		// 중.../처리 중" Notice가 이미 떠 있어서, 여기서 또 띄우면 중복이다.
 		if (this.plugin.collectflow.hasPendingRefresh) {
-			new Notice(`${label} — 이미 대기 중입니다.`);
+			Log.info('ui', `${label} — 이미 대기 중`);
 			return undefined;
 		}
 		// "준비 중" 단계는 File.readAllPapers()로 볼트 전체를 스캔하는 구간이라 총량을 미리

@@ -1366,9 +1366,11 @@ describe('File.writeSubscriptions — 저장 시점 구독 조건 화이트리�
 
 	// 실제 재현된 문제: 걸러낸 결과를 파일에 되돌려 쓰지 않으면, 같은 수집 한 번 안에서도
 	// readSubscriptions가 여러 번 불릴 때마다(runNow 시작, 커서 갱신용 mutateSubscriptions)
-	// 매번 다시 걸러지며 Notice가 반복해서 떴다(한 번의 수집에서 Notice 2번). 정리된 결과를
-	// 즉시 파일에 써서 다음 읽기부터는 걸러질 게 없어야 한다.
-	it('걸러낸 즉시 파일에 되돌려 써서 — 다시 읽으면 더 안 걸러지고 알림도 한 번뿐이다', async () => {
+	// 매번 다시 걸러졌다. 정리된 결과를 즉시 파일에 써서 다음 읽기부터는 걸러질 게 없어야
+	// 한다. 걸러졌다는 사실은 Notice가 아니라 로그로만 남긴다 — 곧이어 뜨는 수집 완료
+	// Notice와 겹쳐 한 번의 수집에 Notice가 2개(무시됨+완료) 뜨는 게 산만하다는 피드백이
+	// 있었다(실제 재현됨).
+	it('걸러낸 즉시 파일에 되돌려 써서 — 다시 읽으면 더 안 걸러진다 (Notice는 안 뜬다)', async () => {
 		vault.files.set(
 			`${PLUGIN_DIR}/Subscriptions.json`,
 			JSON.stringify({
@@ -1389,8 +1391,7 @@ describe('File.writeSubscriptions — 저장 시점 구독 조건 화이트리�
 
 		const noticesBefore = recordedNotices().length;
 		await File.readSubscriptions(); // 1차 읽기 — 걸러내고 파일에 되돌려 써야 한다.
-		const noticesAfterFirst = recordedNotices().length;
-		assert.equal(noticesAfterFirst - noticesBefore, 1, '1차 읽기에서 알림이 정확히 한 번 떠야 한다');
+		assert.equal(recordedNotices().length, noticesBefore, '읽기에서는 Notice가 뜨면 안 된다(로그로만 남김)');
 
 		// 파일이 이미 3개로 정리돼 있어야 한다(자가 복구).
 		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
@@ -1399,8 +1400,10 @@ describe('File.writeSubscriptions — 저장 시점 구독 조건 화이트리�
 		assert.equal(raw.apis?.[0]?.querys.length, 3);
 
 		await File.readSubscriptions(); // 2차 읽기 — 이미 정리됐으니 더 걸러질 게 없어야 한다.
-		const noticesAfterSecond = recordedNotices().length;
-		assert.equal(noticesAfterSecond, noticesAfterFirst, '2차 읽기에서는 알림이 추가로 뜨면 안 된다');
+		const raw2 = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: unknown[] }[];
+		};
+		assert.equal(raw2.apis?.[0]?.querys.length, 3);
 	});
 });
 
