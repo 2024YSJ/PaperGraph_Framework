@@ -60,6 +60,13 @@ export class SubscriptionTargetModal extends Modal {
 		private readonly onSubmit: (
 			targets: SubscriptionTarget[],
 			range?: { from: number; to: number },
+			// 등록된 구독 전부를 선택한 상태로 실행했는가 — 스케줄러/명령어 팔레트가
+			// "대상 없음"(undefined)으로 부르는 것과 의미상 같은 요청임을 호출자가 알 수
+			// 있게 한다. 호출자가 이 값을 몰라 매번 명시적 목록을 넘기면, run()의 합침
+			// 판단 키가 "명시적 전체 목록"과 "undefined(전체)"로 갈라져 같은 요청인데도
+			// 서로 합쳐지지 않는 문제가 생긴다(실제 재현됨 — 리본 메뉴 경로와 자동 실행
+			// 경로가 동시에 큐에 쌓임).
+			allSelected?: boolean,
 		) => void | Promise<void>,
 		defaultFrom = '',
 		defaultTo = '',
@@ -188,9 +195,10 @@ export class SubscriptionTargetModal extends Modal {
 						new Notice('구독을 1개 이상 선택하세요.');
 						return;
 					}
+					const allSelected = targets.length === this.options.length;
 
 					if (!this.needsDateRange) {
-						void this.onSubmit(targets);
+						void this.onSubmit(targets, undefined, allSelected);
 						this.close();
 						return;
 					}
@@ -207,7 +215,7 @@ export class SubscriptionTargetModal extends Modal {
 					// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 					// "종료일 당일 포함"으로 맞춘다.
 					const toMs = toMidnight + 24 * 60 * 60 * 1000;
-					void this.onSubmit(targets, { from: fromMs, to: toMs });
+					void this.onSubmit(targets, { from: fromMs, to: toMs }, allSelected);
 					this.close();
 				}),
 		);

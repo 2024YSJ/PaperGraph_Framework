@@ -194,9 +194,14 @@ export class CollectController implements CollectProgressSink {
 	// isBusy 체크는 모달을 여는 시점이 아니라 사용자가 실제로 「실행」을 누른 시점에
 	// 해야 한다 — 그 사이 다른 수집이 시작/종료될 수 있다.
 	runRecent(app: App): void {
-		new SubscriptionTargetModal(app, '최근 논문 수집 — 구독 선택', false, (targets) => {
+		new SubscriptionTargetModal(app, '최근 논문 수집 — 구독 선택', false, (targets, _range, allSelected) => {
 			const label = describeTargets('최근 논문 수집', targets);
-			const testOptions = { targetSubscriptions: targets };
+			// 「전체 선택」 상태로 실행하면 targetSubscriptions를 아예 넘기지 않는다 —
+			// 스케줄러/명령어 팔레트(runRecentAuto)가 "대상 없음(undefined)"으로 같은
+			// 요청을 표현하는 것과 동일한 키가 되게 맞춘다. 그렇지 않으면 리본 메뉴로 고른
+			// "명시적 전체 목록"과 자동 실행의 "undefined"가 의미는 같아도 키가 달라 서로
+			// 합쳐지지 않고 대기열에 각자 쌓인다(실제 재현된 문제).
+			const testOptions = allSelected ? undefined : { targetSubscriptions: targets };
 			// run()은 내부적으로 동일 요청을 합쳐주지만(pendingRuns), 그걸 모르고 여기서
 			// 매번 새 runWithProgress를 부르면 클릭마다 새 진행률 Notice가 또 생겨 실제로는
 			// 하나로 합쳐진 실행인데도 화면에는 여러 개가 쌓인 것처럼 보인다(57번과 같은
