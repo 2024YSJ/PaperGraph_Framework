@@ -490,6 +490,15 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
 		this.sub = await File.readSubscriptions();
+		// 읽는 중에 허용되지 않는 조건이 걸러졌으면(9번/69번 화이트리스트 — 보통 파일을
+		// 직접 편집한 경우) 이번 수집은 하지 않는다. 걸러진 채로 조용히 진행해 "N편 수집
+		// 완료"가 뜨면, 구독이 이상했다는 사실을 완료 Notice에 묻혀 놓치기 쉽다 — 사용자가
+		// 구독 관리에서 직접 확인하고 다시 실행하도록 여기서 멈춘다(사용자 요청).
+		if (File.lastReadDroppedInvalidConditions) {
+			throw new Error(
+				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 구독 관리에서 확인 후 다시 실행하세요.',
+			);
+		}
 		const allApis = this.sub.apis ?? [];
 		if (allApis.length === 0) {
 			throw new Error(

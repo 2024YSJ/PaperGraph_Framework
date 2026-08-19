@@ -49,6 +49,13 @@ export class File {
 
 	private static readonly PAPER_ROOT = 'PaperGraph3D';
 
+	// 가장 최근 readSubscriptions() 호출에서 화이트리스트 검증(9번/69번)에 걸려 조건이
+	// 걸러졌는지 — 호출자(CollectAndSave.runNow)가 "구독이 이상하면 이번 수집은 하지 않고
+	// 경고만 띄운다"를 판단하는 데 쓴다. readSubscriptions 자체는 자가 복구(파일을 정리된
+	// 상태로 되돌려 씀)까지만 책임지고, "그래서 이번 수집을 계속할지"는 도메인(수집 로직)의
+	// 판단이라 여기 File은 사실만 노출한다. readSubscriptions를 부를 때마다 다시 계산된다.
+	static lastReadDroppedInvalidConditions = false;
+
 	static init(vault: Vault, pluginDir: string): void {
 		File.vault = vault;
 		File.pluginDir = pluginDir;
@@ -143,6 +150,8 @@ export class File {
 		// revive는 동기 함수라 그 안에서 flag를 못 들고 나가므로, 바깥의 let으로 받는다 —
 		// 아래 readConfig 호출 이후 이 값을 보고 자가 복구(write-back) 여부를 정한다.
 		let droppedAny = false;
+		// 이번 호출 결과로 매번 새로 계산한다 — 이전 호출의 값이 남아있으면 안 된다.
+		File.lastReadDroppedInvalidConditions = false;
 		const subscriptions = await File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
@@ -225,16 +234,16 @@ export class File {
 			// 걸러진다. writeSubscriptions에도 같은 검증이 있지만, 여기서 넘기는
 			// subscriptions는 이미 이 함수가 정리한 값이라 그쪽에서는 아무것도 더 안 걸린다.
 			//
-			// Notice가 아니라 로그로만 남긴다 — 이 시점(readSubscriptions)은 수집 실행
-			// 도중에도 불리는데, 곧이어 뜨는 완료 Notice("N편 수집")와 겹쳐 한 번의 수집에
-			// 대해 Notice가 2개(무시됨+완료) 뜨는 게 오히려 산만하다는 피드백이 있었다
-			// (실제 재현됨). 걸러졌다는 사실 자체는 구독 관리 화면에서 조건 개수/내용으로
-			// 이미 확인 가능하다.
+			// Notice는 여기서 안 띄운다 — 수집(CollectAndSave.runNow)이 이 플래그를 보고
+			// "구독이 이상하면 이번엔 경고만 띄우고 수집 자체를 하지 않는다"로 처리한다
+			// (사용자 요청 — 걸러진 채로 조용히 "정상 완료"된 것처럼 보이면 안 됨). 수집이
+			// 아닌 다른 경로(설정 탭 등)에서 읽었을 때는 로그로만 남는다.
 			Log.warn(
 				'subscriptions',
 				'일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 파일을 정리된 상태로 되돌려 씀',
 			);
 			await File.writeSubscriptions(subscriptions);
+			File.lastReadDroppedInvalidConditions = true;
 		}
 		return subscriptions;
 	}

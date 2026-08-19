@@ -233,6 +233,41 @@ describe('CollectAndSave.run — 사전 조건', () => {
 		);
 		assert.equal(recordedRequests().length, 0);
 	});
+
+	// 사용자 요청: 구독 조건이 허용되지 않는 형식이라 걸러졌으면(9번/69번, 보통 파일을
+	// 직접 편집한 경우), 걸러진 채로 조용히 "정상 완료"되면 안 된다 — 경고로 멈추고,
+	// 사용자가 구독 관리에서 확인한 뒤 다시 실행해야 한다.
+	it('구독 조건이 걸러졌으면(파일 직접 편집) 수집을 하지 않고 경고로 멈춘다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{
+						apiName: 'arxiv',
+						querys: [
+							{ searchType: 'keyword', query: 'a' },
+							{ searchType: 'keyword', query: 'b' },
+							{ searchType: 'keyword', query: 'c' },
+							{ searchType: 'keyword', query: 'd' },
+						],
+						updateTime: 0,
+					},
+				],
+			}),
+		);
+		arxivOnly(feed([entry()], 1));
+		const { embedding } = fakeEmbedding();
+
+		await assert.rejects(
+			() => collectFlow(embedding).run('recent'),
+			/일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다/,
+		);
+		assert.equal(recordedRequests().length, 0, '구독이 이상하면 네트워크 요청도 나가면 안 된다');
+
+		// 파일은 이미 3개로 자가 복구됐으니, 재시도하면 정상적으로 수집된다.
+		await collectFlow(fakeEmbedding().embedding).run('recent');
+		assert.ok(recordedRequests().length > 0, '자가 복구된 뒤 재시도는 정상 진행돼야 한다');
+	});
 });
 
 // 중복 제거는 run()의 책임이 아니라 'all' 미들웨어로 붙는다(별도 담당자). 여기서는
