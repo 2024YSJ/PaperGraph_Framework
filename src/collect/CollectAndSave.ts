@@ -184,6 +184,10 @@ export class CollectAndSave {
 	// 걸린 Promise를 그대로 돌려준다. 사용자가 같은 버튼을 연타해도 대기 중인 동일 요청이
 	// 있으면 합쳐진다(연타로 큐가 무한히 쌓이는 것을 막는다) — run() 참고.
 	private pendingRuns = new Map<string, Promise<void>>();
+	// 아직 시작하지 않은 refreshAll() 작업 — pendingRecent와 같은 패턴. refreshAll은
+	// 대상을 좁히는 인자가 없어(항상 코퍼스 전체) 요청마다 구분할 키가 필요 없다 —
+	// 「새로고침」 버튼 연타가 그대로 큐에 쌓이던 문제(57번) 방지.
+	private pendingRefresh: Promise<void> | undefined;
 	// dispose() 이후 true. 이미 시작한 네트워크 요청은 취소할 수 없지만(requestUrl에
 	// 취소 수단이 없다 — ApiSupport.requestWithTimeout 주석 참고), 이 플래그가 서는
 	// 지점들(enqueue/collect/processChunk/repairNow)은 그 요청이 끝나는 대로 더 진행하지
@@ -437,11 +441,22 @@ export class CollectAndSave {
 		onStart?: () => void,
 		onProgress?: (done: number, total: number) => void,
 	): Promise<void> {
-		return this.enqueue(
+		if (this.pendingRefresh !== undefined) {
+			return this.pendingRefresh;
+		}
+		const pending = this.enqueue(
 			{ kind: 'refresh', label: '새로고침' },
 			() => this.refreshAllNow(onProgress),
-			onStart,
+			() => {
+				// 시작하는 순간 합침 대상에서 빠진다(requestRecent/run()과 같은 패턴).
+				if (this.pendingRefresh === pending) {
+					this.pendingRefresh = undefined;
+				}
+				onStart?.();
+			},
 		);
+		this.pendingRefresh = pending;
+		return pending;
 	}
 
 	// 실제 수집 몸통 — 큐가 한 번에 하나만 부른다.
