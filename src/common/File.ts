@@ -139,7 +139,10 @@ export class File {
 	// 넘긴다.
 	static async readSubscriptions(): Promise<Subscriptions> {
 		const secret = await File.readSecret();
-		return File.readConfig(
+		// revive는 동기 함수라 그 안에서 flag를 못 들고 나가므로, 바깥의 let으로 받는다 —
+		// 아래 readConfig 호출 이후 이 값을 보고 자가 복구(write-back) 여부를 정한다.
+		let droppedAny = false;
+		const subscriptions = await File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
 				// 저장된 apis는 평범한 객체({ apiName, querys, updateTime })라 메서드가 없다.
@@ -170,7 +173,6 @@ export class File {
 				// 쓰였다(실제 재현됨 — write가 한 번 더 일어나기 전까지 4개 조건이 그대로
 				// 실행되고, 그제서야 뒤늦게 3개로 줄어들며 Notice가 떴다). 읽는 이 시점에도
 				// 같은 검증을 적용해 파일을 읽자마자 걸러지게 한다 — 쓰기 전까지의 창을 없앤다.
-				let droppedAny = false;
 				subscriptions.apis = (data.apis ?? [])
 					.map((apiData) => {
 						const migrated = (apiData.querys ?? []).map((query) => File.migrateSearchType(query));
@@ -202,11 +204,6 @@ export class File {
 							typeof apiData.updateTime === 'number' ? apiData.updateTime : legacyCursor;
 						return api;
 					});
-				if (droppedAny) {
-					new Notice(
-						'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 구독 관리에서 확인하세요.',
-					);
-				}
 				return subscriptions;
 			},
 			() => {
@@ -220,6 +217,20 @@ export class File {
 				return subscriptions;
 			},
 		);
+		if (droppedAny) {
+			// 걸러낸 결과를 즉시 파일에 되돌려 쓴다 — 안 그러면 파일은 여전히 잘못된 값을
+			// 그대로 갖고 있어서, 이 함수가 다시 불릴 때마다(같은 수집 한 번 안에서도
+			// runNow 시작과 커서 갱신용 mutateSubscriptions가 각각 부른다) 매번 다시
+			// 걸러지고 Notice도 매번 뜬다(실제 재현됨 — 한 번의 수집에서 Notice가 2번).
+			// writeSubscriptions에도 같은 검증이 있지만, 여기서 넘기는 subscriptions는
+			// 이미 이 함수가 정리한 값이라 그쪽에서는 아무것도 더 안 걸리고 알림도 안 뜬다
+			// — 알림은 실제로 걸러낸 사실을 아는 여기서 한 번만 띄운다.
+			new Notice(
+				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 구독 관리에서 확인하세요.',
+			);
+			await File.writeSubscriptions(subscriptions);
+		}
+		return subscriptions;
 	}
 
 	// 이름이 바뀐 searchType을 현재 값으로 옮긴다. 설정탭이 'domain'을 저장하던 시절의
