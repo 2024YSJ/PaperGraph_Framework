@@ -30,6 +30,11 @@ const CONFIG_SCHEMA_VERSION = 2;
 // 설정 파일이 없을 때(최초 실행)의 기본값 — 예전 하드코딩 동작과 100% 호환.
 const DEFAULT_FOLDER_PATH = 'PersonalNotes';
 const DEFAULT_FOLDER_PATHS = [DEFAULT_FOLDER_PATH];
+// 경로 입력칸의 placeholder(예시일 뿐 실제 채워지는 값이 아님). DEFAULT_FOLDER_PATH를
+// 그대로 쓰면 "빈 칸일 때 실제로 적용되는 기본값"과 "그냥 예시"가 헷갈린다 — 특히
+// PersonalNotes/PaperGraph3D 관련 경로 혼동을 겪은 뒤라 더 그렇다. 실제 기본 경로와
+// PAPER_GRAPH_ROOT 어느 쪽과도 겹치지 않는 별개 예시를 쓴다.
+const PATH_INPUT_PLACEHOLDER = '예: Notes/Papers';
 // 노트 노드의 sourceId 접두사. 런타임에 "이 GraphNode가 논문이 아니라 노트다"를 판별하는
 // 유일한 수단이다(GraphNode/Paper 타입을 확장하지 않기로 했으므로).
 const NOTE_SOURCE_PREFIX = 'note:';
@@ -88,12 +93,21 @@ export class PersonalNoteMiddleware implements Middleware {
 
 		const config = await this.readConfig();
 
+		// PAPER_GRAPH_ROOT(및 그 하위 — 캐시/설정 포함) 경로는 설정에 남아 있어도 절대
+		// 노트 소스로 취급하지 않는다. UI(normalizeFolderPaths)가 입력을 막아도, 이 픽스
+		// 이전에 저장된 config.json이나 수동 편집으로 여전히 들어와 있을 수 있어 여기서도
+		// 방어한다 — 안 그러면 논문 md 자체가 "노트"로 재임베딩되거나(논문 폴더를 통째로
+		// 지정한 경우) 캐시 폴더를 지정해 파이프라인이 깨진다.
+		const validFolderPaths = config.folderPaths.filter(
+			(folderPath) => !PersonalNoteMiddleware.isWithinPaperGraphRoot(folderPath),
+		);
+
 		const noteFiles =
-			config.folderPaths.length > 0
+			validFolderPaths.length > 0
 				? this.app.vault
 						.getMarkdownFiles()
 						.filter((file) =>
-							config.folderPaths.some(
+							validFolderPaths.some(
 								(folderPath) => file.path === folderPath || file.path.startsWith(`${folderPath}/`),
 							),
 						)
@@ -545,7 +559,7 @@ export class PersonalNoteMiddleware implements Middleware {
 				const input = row.createEl('input', { cls: 'papergraph3d-note-path-input' });
 				input.type = 'text';
 				input.value = path;
-				input.placeholder = DEFAULT_FOLDER_PATH;
+				input.placeholder = PATH_INPUT_PLACEHOLDER;
 				input.addEventListener('input', () => {
 					paths[index] = input.value;
 				});
@@ -569,7 +583,20 @@ export class PersonalNoteMiddleware implements Middleware {
 
 		const applyButton = panel.createEl('button', { text: '적용' });
 		applyButton.addEventListener('click', () => {
-			const folderPaths = PersonalNoteMiddleware.normalizeFolderPaths(paths);
+			const { accepted: folderPaths, rejected } = PersonalNoteMiddleware.normalizeFolderPaths(paths);
+			if (rejected.length > 0) {
+				PersonalNoteMiddleware.notify(
+					`"${PAPER_GRAPH_ROOT}" 폴더(및 하위 경로)는 개인 노트 폴더로 지정할 수 없습니다 — 제외됨: ${rejected.join(', ')}`,
+				);
+				// 거부된 경로가 있으면 저장/재실행을 아예 진행하지 않는다 — 입력 목록에서
+				// 거부된 값만 지우고 사용자가 다시 "적용"을 눌러야 나머지 경로가 반영된다.
+				// (거부와 저장을 한 클릭에서 같이 처리하면 반쯤 적용된 상태로 rerun이 걸려
+				// 버튼이 계속 비활성으로 남는 사례가 있었다 — QA 재현.)
+				paths.length = 0;
+				paths.push(...(folderPaths.length > 0 ? folderPaths : ['']));
+				renderPathRows();
+				return;
+			}
 			applyButton.disabled = true;
 			void this.writeConfig({ ...config, folderPaths })
 				.then(() => this.rerun())
@@ -594,17 +621,32 @@ export class PersonalNoteMiddleware implements Middleware {
 		return raw.trim().replace(/^\/+/, '').replace(/\/+$/, '');
 	}
 
-	// 각 행을 정리하고, 빈 입력(사용자가 지우고 안 채운 행)과 중복 경로는 저장에서 뺀다.
-	private static normalizeFolderPaths(raw: string[]): string[] {
+	// 각 행을 정리하고, 빈 입력(사용자가 지우고 안 채운 행)·중복 경로·PAPER_GRAPH_ROOT
+	// 하위 경로(논문/캐시/설정이 있는 곳)는 저장에서 뺀다. rejected는 사용자에게 알림을
+	// 띄우기 위한 것 — 조용히 걸러지면 "적용했는데 왜 안 되지"로 이어진다.
+	private static normalizeFolderPaths(raw: string[]): { accepted: string[]; rejected: string[] } {
 		const seen = new Set<string>();
-		const result: string[] = [];
+		const accepted: string[] = [];
+		const rejected: string[] = [];
 		for (const value of raw) {
 			const normalized = PersonalNoteMiddleware.normalizeFolderPath(value);
-			if (normalized && !seen.has(normalized)) {
-				seen.add(normalized);
-				result.push(normalized);
+			if (!normalized || seen.has(normalized)) {
+				continue;
 			}
+			seen.add(normalized);
+			if (PersonalNoteMiddleware.isWithinPaperGraphRoot(normalized)) {
+				rejected.push(normalized);
+				continue;
+			}
+			accepted.push(normalized);
 		}
-		return result;
+		return { accepted, rejected };
+	}
+
+	// path가 PAPER_GRAPH_ROOT 자신이거나 그 하위인지. 논문 md·노트 캐시·설정 파일이 전부
+	// 이 아래에 있으므로, 이 영역을 노트 소스로 허용하면 논문이 "노트"로 재임베딩되거나
+	// 캐시/설정 폴더를 노트 폴더로 지정해 파이프라인이 깨진다.
+	private static isWithinPaperGraphRoot(path: string): boolean {
+		return path === PAPER_GRAPH_ROOT || path.startsWith(`${PAPER_GRAPH_ROOT}/`);
 	}
 }
