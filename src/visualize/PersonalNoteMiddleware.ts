@@ -1,4 +1,4 @@
-import { App, Notice, TFile } from 'obsidian';
+import { App, Notice, TFile, TFolder } from 'obsidian';
 import type { ForceGraph3DInstance } from '3d-force-graph';
 import { Middleware, MiddlewareType } from '../common/Middleware';
 import { Log } from '../common/Log';
@@ -586,10 +586,18 @@ export class PersonalNoteMiddleware implements Middleware {
 
 		const applyButton = panel.createEl('button', { text: '적용' });
 		applyButton.addEventListener('click', () => {
-			const { accepted: folderPaths, rejectedOutsideVault, rejectedInvalid, rejectedPaperGraphRoot } =
-				PersonalNoteMiddleware.normalizeFolderPaths(paths);
+			const {
+				accepted: folderPaths,
+				rejectedOutsideVault,
+				rejectedInvalid,
+				rejectedPaperGraphRoot,
+				rejectedNonexistent,
+			} = this.normalizeFolderPaths(paths);
 			const hasRejected =
-				rejectedOutsideVault.length > 0 || rejectedInvalid.length > 0 || rejectedPaperGraphRoot.length > 0;
+				rejectedOutsideVault.length > 0 ||
+				rejectedInvalid.length > 0 ||
+				rejectedPaperGraphRoot.length > 0 ||
+				rejectedNonexistent.length > 0;
 			if (hasRejected) {
 				// 원인마다 다른 안내를 띄운다 — 뭉뚱그리면 "왜 안 되는지" 알기 어렵다(QA #68:
 				// 볼트 밖 경로가 조용히 "0개 수집중"으로만 뜨던 문제).
@@ -606,6 +614,11 @@ export class PersonalNoteMiddleware implements Middleware {
 				if (rejectedPaperGraphRoot.length > 0) {
 					PersonalNoteMiddleware.notify(
 						`"${PAPER_GRAPH_ROOT}" 폴더(및 하위 경로)는 개인 노트 폴더로 지정할 수 없습니다 — 제외됨: ${rejectedPaperGraphRoot.join(', ')}`,
+					);
+				}
+				if (rejectedNonexistent.length > 0) {
+					PersonalNoteMiddleware.notify(
+						`볼트에 존재하지 않는 폴더라 유효하지 않은 경로입니다 — 제외됨: ${rejectedNonexistent.join(', ')}`,
 					);
 				}
 				// 거부된 경로가 있으면 저장/재실행을 아예 진행하지 않는다 — 입력 목록에서
@@ -676,20 +689,23 @@ export class PersonalNoteMiddleware implements Middleware {
 	}
 
 	// 각 행을 정리하고, 빈 입력(사용자가 지우고 안 채운 행)·중복 경로·볼트 밖을 가리키는
-	// 경로·금지 문자가 섞인 경로·PAPER_GRAPH_ROOT 하위 경로(논문/캐시/설정이 있는 곳)는
-	// 저장에서 뺀다. 세 거부 종류를 따로 모으는 이유는 원인마다 사용자에게 다른 안내를
-	// 보여주기 위함 — 뭉뚱그리면 "왜 안 되는지" 알기 어렵다.
-	private static normalizeFolderPaths(raw: string[]): {
+	// 경로·금지 문자가 섞인 경로·PAPER_GRAPH_ROOT 하위 경로(논문/캐시/설정이 있는 곳)·볼트에
+	// 실제로 존재하지 않는 경로는 저장에서 뺀다. 거부 종류를 따로 모으는 이유는 원인마다
+	// 사용자에게 다른 안내를 보여주기 위함 — 뭉뚱그리면 "왜 안 되는지" 알기 어렵다.
+	// (인스턴스 메서드인 이유: 존재 확인에 this.app.vault가 필요하다.)
+	private normalizeFolderPaths(raw: string[]): {
 		accepted: string[];
 		rejectedOutsideVault: string[];
 		rejectedInvalid: string[];
 		rejectedPaperGraphRoot: string[];
+		rejectedNonexistent: string[];
 	} {
 		const seen = new Set<string>();
 		const accepted: string[] = [];
 		const rejectedOutsideVault: string[] = [];
 		const rejectedInvalid: string[] = [];
 		const rejectedPaperGraphRoot: string[] = [];
+		const rejectedNonexistent: string[] = [];
 		for (const value of raw) {
 			const trimmed = value.trim();
 			if (!trimmed) {
@@ -714,9 +730,18 @@ export class PersonalNoteMiddleware implements Middleware {
 				rejectedPaperGraphRoot.push(normalized);
 				continue;
 			}
+			// "안녕하세요"처럼 금지 문자도 없고 볼트 밖도 아니지만(문법적으로는 멀쩡한
+			// 폴더명), 실제로 볼트에 그 이름의 폴더가 없는 경우 — 오타/엉뚱한 입력을
+			// 조용히 저장해 "0개 수집중"으로만 실패하던 것(QA #68과 같은 종류의 무알림
+			// 실패)을 막는다. 최초 설정 전 폴더를 미리 만들어두지 않는 사용 흐름은 이
+			// 체크로 막히는 게 의도된 트레이드오프다(2026-08-21 확인).
+			if (!(this.app.vault.getAbstractFileByPath(normalized) instanceof TFolder)) {
+				rejectedNonexistent.push(normalized);
+				continue;
+			}
 			accepted.push(normalized);
 		}
-		return { accepted, rejectedOutsideVault, rejectedInvalid, rejectedPaperGraphRoot };
+		return { accepted, rejectedOutsideVault, rejectedInvalid, rejectedPaperGraphRoot, rejectedNonexistent };
 	}
 
 	// 볼트 밖을 가리키려는 경로인지: 드라이브 절대 경로(C:\...), UNC 경로(\\server\share),
