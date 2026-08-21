@@ -72,6 +72,16 @@ export class PersonalNoteMiddleware implements Middleware {
 	// run()마다 새로 채운다 — 클릭 핸들러가 sourceId로 실제 파일을 찾을 때 쓴다.
 	private noteFilesBySourceId = new Map<string, TFile>();
 
+	// QA #81: 시각화 창을 열었다 닫았다 빠르게 반복하면(VisualizationView.onClose는 진행
+	// 중인 run()을 기다리거나 취소하지 않는다) 이전 run()의 노트 임베딩 루프가 아직 도는
+	// 중에 onOpen이 VisualizationFlow.run()을 다시 불러 이 미들웨어의 run()도 겹쳐 돈다.
+	// this.embedding은 이 미들웨어와 논문 수집이 공유하는 인스턴스라(생성자 참고),
+	// Embedding.embed()는 세션/서킷브레이커를 락 없이 공유해 순차 호출만 안전한데(아래
+	// 루프 주석 참고) 두 run()이 겹치면 그 전제가 깨진다 — 이게 "개인 노트 임베딩 오류
+	// 메시지가 간헐적으로 출력됨"의 원인으로 보인다. run()마다 세대 번호를 매겨, 최신
+	// run()이 아니게 된 실행은 더 이상 embed()를 부르지 않고 스스로 멈춘다.
+	private runGeneration = 0;
+
 	constructor(
 		private app: App,
 		private embedding: Embedding,
@@ -82,6 +92,7 @@ export class PersonalNoteMiddleware implements Middleware {
 	) {}
 
 	async run(context: unknown): Promise<void> {
+		const generation = ++this.runGeneration;
 		const graph = context as GraphData;
 		this.noteFilesBySourceId.clear();
 
@@ -92,6 +103,12 @@ export class PersonalNoteMiddleware implements Middleware {
 		}
 
 		const config = await this.readConfig();
+
+		// readConfig 대기 중에 더 최신 run()이 시작됐으면 여기서 멈춘다 — 아래 embed()
+		// 루프까지 가지 않는다(위 runGeneration 주석 참고).
+		if (generation !== this.runGeneration) {
+			return;
+		}
 
 		// PAPER_GRAPH_ROOT 하위·볼트 밖을 가리키는 경로·금지 문자가 섞인 경로는 설정에
 		// 남아 있어도 절대 노트 소스로 취급하지 않는다. UI(normalizeFolderPaths)가 입력을
@@ -130,6 +147,13 @@ export class PersonalNoteMiddleware implements Middleware {
 				);
 			}
 
+			// isModelInstalled 대기 중에도 더 최신 run()이 시작될 수 있다 — 여기서 멈추면
+			// resetCircuitBreaker()가 그 최신 run()이 이미 진행 중인 임베딩 상태를 건드리지
+			// 않는다.
+			if (generation !== this.runGeneration) {
+				return;
+			}
+
 			// CollectAndSave.run()/repairEmbeddingsBody()와 같은 패턴 — 새 배치를 시작하기
 			// 전에 서킷브레이커를 리셋한다. 안 하면 이전 배치(논문 수집이든 이전 그래프
 			// 열람이든)에서 트립된 상태가 남아 있을 때, 이번 노트들이 멀쩡한데도 첫 시도부터
@@ -147,6 +171,12 @@ export class PersonalNoteMiddleware implements Middleware {
 			// await 사이마다 브라우저가 그릴 기회를 얻어 진행 표시가 실시간으로 갱신된다.
 			try {
 				for (const [index, file] of noteFiles.entries()) {
+					// 이 배치 도중 더 최신 run()이 시작됐으면(창을 닫았다 빠르게 다시 연
+					// 경우 등) 여기서 멈춘다 — 계속 돌면 두 run()의 embed() 호출이 겹쳐
+					// this.embedding의 순차 호출 전제를 깬다(위 runGeneration 주석 참고).
+					if (generation !== this.runGeneration) {
+						break;
+					}
 					progress?.update(index + 1);
 					try {
 						const node = await this.buildNoteNode(file, graph, modelInstalled);
