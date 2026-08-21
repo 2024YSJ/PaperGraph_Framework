@@ -2,6 +2,7 @@ import { SearchQuery, combineQueries, hasMeaningfulQueryValue } from './SearchQu
 import { Paper } from './Paper';
 import type { Secret } from './Secret';
 import { Log } from '../common/Log';
+import { isUsablePaperDate } from '../common/DateUtil';
 import {
 	chunk,
 	ConfigurationError,
@@ -1019,7 +1020,10 @@ export class ArxivAPI implements API {
 		paper.references = [];
 
 		// <published>는 최초 버전 제출일(ISO 8601) — 앞 10자(YYYY-MM-DD)만 취한다.
-		paper.publicationDate = ArxivAPI.text(entry.querySelector('published')).slice(0, 10);
+		// 응답이 변조/파손돼 달력에 없거나 미래인 날짜가 오면 폴더 규격이 깨지므로
+		// (12번/15번) 빈 값으로 두어 저장 경로가 unknown/으로 가게 한다.
+		const published = ArxivAPI.text(entry.querySelector('published')).slice(0, 10);
+		paper.publicationDate = isUsablePaperDate(published) ? published : '';
 
 		// arXiv 응답엔 인용수가 없다. [3] 정책 — 보강 단계에서 채워지며, 실패하면 false로 남는다.
 		paper.citationCount = 0;

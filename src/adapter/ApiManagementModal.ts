@@ -4,6 +4,7 @@ import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { FailureNotifier } from '../common/Notify';
 import { hasMeaningfulQueryValue, SearchQuery } from '../collect/SearchQuery';
+import { ArxivAPI } from '../collect/API';
 import { KEY_VALIDATORS } from '../collect/SecretValidation';
 
 // 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들.
@@ -692,6 +693,17 @@ export class ApiManagementModal extends Modal {
 					// 저장 단계에서부터 막는다.
 					if (!hasMeaningfulQueryValue(api.newConditionQuery)) {
 						new Notice('검색어에 실제 내용(글자/숫자)이 있어야 합니다.');
+						return;
+					}
+					// 분류(category)만은 arXiv 쿼리에서 따옴표로 감쌀 수 없어 값 자체가
+					// 문법이 된다 — 저장 시점 화이트리스트(File.sanitizeQuerys)가 어차피
+					// 걸러내는데, 여기서 안 막으면 사용자는 "추가됐다가 저장하니 사라진"
+					// 것처럼 보인다. 같은 기준으로 즉시 거부한다.
+					if (
+						api.newConditionType === 'category' &&
+						!ArxivAPI.isValidCategoryValue(api.newConditionQuery.trim())
+					) {
+						new Notice('분류는 arXiv 분류 코드 형식이어야 합니다 (예: cs.LG).');
 						return;
 					}
 					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상

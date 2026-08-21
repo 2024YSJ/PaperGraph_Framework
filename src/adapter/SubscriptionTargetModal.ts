@@ -1,5 +1,6 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import { File } from '../common/File';
+import { isCalendarDate } from '../common/DateUtil';
 import type { SearchQuery } from '../collect/SearchQuery';
 
 export interface SubscriptionTarget {
@@ -19,9 +20,12 @@ interface SubscriptionOption extends SubscriptionTarget {
 // 자정으로 해석되는데, 이 앱은 항상 사용자의 로컬 기기에서만 도는 단일 사용자 플러그인
 // 이라 그 해석이 사용자가 <input type=date>에서 실제로 고른 날짜와 어긋난다(로컬이
 // UTC+9면 하루 밀림). 연/월/일을 분리해 로컬 컴포넌트로 직접 구성해 이 어긋남을 없앤다.
+//
+// 모양만 보면 2026-02-31 같은 값이 통과해 Date가 조용히 3월 3일로 굴려버린다 —
+// isCalendarDate로 달력 유효성까지 확인한다(12번과 같은 뿌리).
 export function parseLocalDateInput(value: string): number | undefined {
 	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-	if (!match) {
+	if (!match || !isCalendarDate(value)) {
 		return undefined;
 	}
 	const [, y, mo, d] = match;

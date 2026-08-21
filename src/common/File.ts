@@ -6,6 +6,7 @@ import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
 import { ExtraData, Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
 import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
+import { isUsablePaperDate } from './DateUtil';
 
 // .json 저장 래퍼. schemaVersion은 향후 대비 상수(현재 분기/마이그레이션엔 안 씀).
 // 설계 근거: docs/devLog/002.md.
@@ -55,6 +56,20 @@ export class File {
 	// 상태로 되돌려 씀)까지만 책임지고, "그래서 이번 수집을 계속할지"는 도메인(수집 로직)의
 	// 판단이라 여기 File은 사실만 노출한다. readSubscriptions를 부를 때마다 다시 계산된다.
 	static lastReadDroppedInvalidConditions = false;
+
+	// 가장 최근 readAllPapers()/readPapersByYear() 호출에서 규격을 벗어나 건너뛴 파일들
+	// (QA 12번/15번/18번). lastReadDroppedInvalidConditions와 같은 방침 — File은 "이런
+	// 파일을 무시했다"는 사실만 노출하고, 사용자에게 알릴지 말지는 호출자가 정한다.
+	// 경로 목록은 로그용이라 앞쪽 몇 개만 보관한다(코퍼스 전체가 어긋난 경우 대비).
+	static lastScanSkipped: { count: number; samples: string[] } = { count: 0, samples: [] };
+
+	private static readonly SKIPPED_SAMPLE_LIMIT = 5;
+
+	// 콘텐츠 트리에서 논문으로 인정하는 유일한 경로 모양:
+	// PaperGraph3D/<YYYY>/<MM>/<DD>/<이름>.json (날짜가 없는 논문은 unknown/<이름>.json).
+	// startsWith + 확장자만 보던 예전 필터는 깊이를 전혀 안 봐서, 연도 폴더 바로 밑에
+	// 넣은 .json(18번)도 논문으로 읽혔다.
+	private static readonly PAPER_RELATIVE_PATH = /^(?:(\d{4})\/(\d{2})\/(\d{2})|unknown)\/[^/]+\.json$/;
 
 	static init(vault: Vault, pluginDir: string): void {
 		File.vault = vault;
@@ -423,20 +438,85 @@ export class File {
 	// readPapersByYear/readAllPapers의 공통 몸통 — 둘 다 "이 prefix 아래 .json을 전부
 	// Paper로 읽는다"만 다르게 좁힌 것이라 한 곳에만 둔다. vault.getFiles()가 이미 전체
 	// 목록을 주므로 연도를 하나씩 열거할 필요가 없다.
+	//
+	// 이 함수가 "이 파일은 논문이다"를 정하는 유일한 지점이라, 콘텐츠 트리를 신뢰 경계로
+	// 두고 여기서 전부 검사한다(QA 12번/15번/18번 — 손으로 만든 3월 50일 폴더, 미래
+	// 날짜 폴더, 연도 폴더 바로 밑 .json이 전부 임베딩·시각화까지 되던 문제):
+	//   1) 경로 모양(연/월/일 4단계 또는 unknown)이 맞는가
+	//   2) 폴더에서 조합한 날짜가 달력에 있고 미래가 아닌가
+	//   3) 폴더 날짜와 파일 안의 publicationDate가 일치하는가 (파일을 옮겨 심는 경우 차단
+	//      — 응답 category 불일치 논문을 저장 거부한 8번과 같은 무결성 검사)
+	// 걸린 파일은 조용히 빼고 File.lastScanSkipped로만 사실을 남긴다.
 	private static async readPapersUnder(prefix: string): Promise<Paper[]> {
 		const files = File.vault
 			.getFiles()
 			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
 		const papers: Paper[] = [];
+		const skipped: string[] = [];
+		let skippedCount = 0;
+		const skip = (path: string): void => {
+			skippedCount += 1;
+			if (skipped.length < File.SKIPPED_SAMPLE_LIMIT) {
+				skipped.push(path);
+			}
+		};
 		for (const file of files) {
-			const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
+			const folderDate = File.paperPathDate(file.path);
+			if (folderDate === null) {
+				skip(file.path);
+				continue;
+			}
+			// 손상된 .json 하나가 스캔 전체를 예외로 끝내면 그래프가 통째로 안 뜬다 —
+			// 그 파일만 건너뛴다.
+			let wrapper: StoredPaperFile;
+			try {
+				wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
+			} catch {
+				skip(file.path);
+				continue;
+			}
+			if (wrapper?.paper === undefined || wrapper.paper === null) {
+				skip(file.path);
+				continue;
+			}
 			const paper = Object.assign(new Paper(), wrapper.paper);
+			// unknown/ 은 날짜를 모르는 논문의 정상 자리라 대조할 게 없다.
+			if (folderDate !== 'unknown' && paper.publicationDate !== folderDate) {
+				skip(file.path);
+				continue;
+			}
 			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
 			paper.collectedApis ??= [];
 			paper.collectedQueries ??= [];
 			papers.push(paper);
 		}
+		File.lastScanSkipped = { count: skippedCount, samples: skipped };
+		if (skippedCount > 0) {
+			Log.warn(
+				'papers',
+				`콘텐츠 트리 규격에 맞지 않는 파일 ${skippedCount}개를 건너뜀: ${skipped.join(', ')}${skippedCount > skipped.length ? ' 외' : ''}`,
+			);
+		}
 		return papers;
+	}
+
+	// 논문 .json의 경로에서 폴더가 나타내는 날짜(YYYY-MM-DD)를 돌려준다. 규격을 벗어나면
+	// null, 날짜 없는 정상 저장 자리(unknown/)면 문자열 'unknown'.
+	private static paperPathDate(path: string): string | null {
+		if (!path.startsWith(`${File.PAPER_ROOT}/`)) {
+			return null;
+		}
+		const relative = path.slice(File.PAPER_ROOT.length + 1);
+		const match = File.PAPER_RELATIVE_PATH.exec(relative);
+		if (!match) {
+			return null;
+		}
+		const [, year, month, day] = match;
+		if (year === undefined) {
+			return 'unknown';
+		}
+		const date = `${year}-${month}-${day}`;
+		return isUsablePaperDate(date) ? date : null;
 	}
 
 	// .json(진실 원본)과 .md(Obsidian 뷰)를 함께 쓴다. 재작성 시 기존 createdAt / 사용자
@@ -466,8 +546,10 @@ export class File {
 
 	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
 	// 바로 아래에 저장한다. .json+.md 형식과 upsert(생성 또는 갱신) 동작은 writePaper와
-	// 동일 — readPapersByYear는 PaperGraph3D/<year>/ 접두사만 보므로 이 폴더 아래 파일은
-	// 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용 SettingTab 버튼에서 사용).
+	// 동일 — 이 폴더 아래 파일은 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용
+	// SettingTab 버튼에서 사용).
+	// ⚠️ folder는 반드시 PaperGraph3D/ 밖이어야 한다. 안에 두면 평평하게 쓰는 이 경로가
+	// 콘텐츠 트리 규격(<YYYY>/<MM>/<DD>/)을 어겨 readPapersUnder가 건너뛴다.
 	static async writeTestPaper(paper: Paper, folder: string): Promise<void> {
 		await File.writePaperAt(paper, `${folder}/${File.baseNoteName(paper.title, paper.sourceId)}`);
 	}
@@ -832,8 +914,10 @@ export class File {
 
 	// 논문의 연/월/일 폴더. 기존은 publicationYear를 썼으나 새 Paper는 이를 제거해
 	// publicationDate(ISO)에서 연도까지 파생한다. 유효한 날짜가 없으면 'unknown'.
+	// 모양 정규식만으로는 2026-03-50 같은 값이 통과해 달력에 없는 폴더가 생겼다(12번) —
+	// 달력 유효성과 미래 여부까지 본다. 어느 쪽이든 실패하면 'unknown'으로 보낸다.
 	private static publicationDir(paper: Paper): string {
-		if (/^\d{4}-\d{2}-\d{2}$/.test(paper.publicationDate)) {
+		if (isUsablePaperDate(paper.publicationDate)) {
 			return `${paper.publicationDate.slice(0, 4)}/${paper.publicationDate.slice(5, 7)}/${paper.publicationDate.slice(8, 10)}`;
 		}
 		return 'unknown';
@@ -889,7 +973,7 @@ export class File {
 			}
 		}
 		// 새 Paper는 publicationYear를 제거 → publicationDate(ISO)에서 연도 파생.
-		if (/^\d{4}-\d{2}-\d{2}$/.test(paper.publicationDate)) {
+		if (isUsablePaperDate(paper.publicationDate)) {
 			lines.push(`publicationYear: ${Number(paper.publicationDate.slice(0, 4))}`);
 		}
 		if (paper.publicationDate) {
