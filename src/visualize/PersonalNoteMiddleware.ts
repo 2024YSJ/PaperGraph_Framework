@@ -584,6 +584,17 @@ export class PersonalNoteMiddleware implements Middleware {
 			renderPathRows();
 		});
 
+		// QA #85: 적용 처리 중(rerun 진행 중)에 경로 필드를 추가/편집/삭제하거나 노트 표시
+		// 토글을 건드릴 수 있었다 — 어차피 성공하면 rerun()이 끝에서 패널 전체를 새로
+		// 그리며 그 사이의 편집은 조용히 버려지고, 체크박스 토글은 별도로 writeConfig를
+		// 불러 이 적용의 writeConfig와 경합할 수도 있었다. 처리 중에는 패널의 모든
+		// 입력/버튼을 잠가 혼란과 경합을 둘 다 막는다.
+		const setPanelLocked = (locked: boolean): void => {
+			panel.querySelectorAll('input, button').forEach((el) => {
+				(el as HTMLInputElement | HTMLButtonElement).disabled = locked;
+			});
+		};
+
 		const applyButton = panel.createEl('button', { text: '적용' });
 		applyButton.addEventListener('click', () => {
 			const {
@@ -640,14 +651,14 @@ export class PersonalNoteMiddleware implements Middleware {
 				renderPathRows();
 				return;
 			}
-			applyButton.disabled = true;
+			setPanelLocked(true);
 			// rerun()은 이 미들웨어만 도는 게 아니라 VisualizationFlow.run() 전체(전체 논문
 			// 재로드 -> PCA -> 모든 시각화 미들웨어 -> 렌더)를 다시 돈다 — 노트가 몇 개 안 돼도
 			// 논문이 많은 그래프에서는 눈에 띄게 오래 걸릴 수 있다. QA #4: 이 대기 시간 동안
 			// 버튼이 그냥 "적용"인 채로 흐려지기만 해서 "눌러도 반응 없음/활성화 안 됨"으로
 			// 오인됐다 — 처리 중임을 텍스트로도 드러낸다. (rerun()이 성공하면 render()가
-			// container를 갈아치우면서 이 버튼 자체가 새 패널의 새 버튼으로 교체되므로, 아래
-			// finally의 복원은 실패/조기 반환 등 이 버튼이 그대로 남는 경우에만 의미가 있다.)
+			// container를 갈아치우면서 이 패널 자체가 새 패널로 교체되므로, 아래 finally의
+			// 복원은 실패/조기 반환 등 이 패널이 그대로 남는 경우에만 의미가 있다.)
 			applyButton.setText('적용 중…');
 			void this.writeConfig({ ...config, folderPaths })
 				.then(() => this.rerun())
@@ -662,7 +673,7 @@ export class PersonalNoteMiddleware implements Middleware {
 					);
 				})
 				.finally(() => {
-					applyButton.disabled = false;
+					setPanelLocked(false);
 					applyButton.setText('적용');
 				});
 		});
