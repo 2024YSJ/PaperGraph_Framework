@@ -597,6 +597,16 @@ export class PersonalNoteMiddleware implements Middleware {
 				renderPathRows();
 				return;
 			}
+			// 경로를 하나도 안 고쳤거나(빈 칸 행만 추가하고 채우지 않은 경우 포함) 결과가
+			// 저장된 값과 똑같으면 저장/재실행을 건너뛴다 — 매번 전체 파이프라인(전체 논문
+			// 재로드 -> PCA -> 모든 시각화 미들웨어 -> 렌더)을 다시 도는 건 비용이 크다.
+			if (PersonalNoteMiddleware.sameFolderSet(folderPaths, config.folderPaths)) {
+				PersonalNoteMiddleware.notify('경로에 변경 사항이 없어 적용하지 않았습니다.');
+				paths.length = 0;
+				paths.push(...(folderPaths.length > 0 ? folderPaths : ['']));
+				renderPathRows();
+				return;
+			}
 			applyButton.disabled = true;
 			// rerun()은 이 미들웨어만 도는 게 아니라 VisualizationFlow.run() 전체(전체 논문
 			// 재로드 -> PCA -> 모든 시각화 미들웨어 -> 렌더)를 다시 돈다 — 노트가 몇 개 안 돼도
@@ -628,6 +638,21 @@ export class PersonalNoteMiddleware implements Middleware {
 	// 앞뒤 슬래시만 정리한다 — 나머지는 run()의 file.path 비교 로직이 그대로 처리한다.
 	private static normalizeFolderPath(raw: string): string {
 		return raw.trim().replace(/^\/+/, '').replace(/\/+$/, '');
+	}
+
+	// 두 경로 목록이 (순서 무시하고) 같은 집합인지. "적용"이 실제로 뭔가 바꾸는지 판단하는
+	// 데 쓴다 — b(저장된 config.folderPaths)는 과거에 이미 normalizeFolderPath를 거쳐
+	// 저장된 값일 수도, 아닐 수도 있어(구버전 스키마 등) 여기서도 다시 정규화해 비교한다.
+	private static sameFolderSet(a: string[], b: string[]): boolean {
+		const normalize = (list: string[]): string[] =>
+			[
+				...new Set(
+					list.map((p) => PersonalNoteMiddleware.normalizeFolderPath(p)).filter((p) => p.length > 0),
+				),
+			].sort();
+		const na = normalize(a);
+		const nb = normalize(b);
+		return na.length === nb.length && na.every((value, index) => value === nb[index]);
 	}
 
 	// 각 행을 정리하고, 빈 입력(사용자가 지우고 안 채운 행)·중복 경로·PAPER_GRAPH_ROOT
