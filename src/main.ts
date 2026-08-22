@@ -1,7 +1,7 @@
 import { Notice, Plugin } from 'obsidian';
 import type { SearchQuery } from './collect/SearchQuery';
 import { CollectAndSave } from './collect/CollectAndSave';
-import { shouldRunLoadRepair } from './collect/ScheduleSettings';
+import { shouldRunLoadRepair } from './common/ScheduleSettings';
 import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
 import { PCA } from './visualize/PCA';

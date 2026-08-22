@@ -2,10 +2,10 @@ import { Notice, TFile, Vault } from 'obsidian';
 import { Log } from './Log';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
-import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
+import { API, findApiNames, findDescriptor, type SkippedEntryRecord } from '../collect/API';
 import { ExtraData, Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
-import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
+import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from './ScheduleSettings';
 import { isUsablePaperDate } from './DateUtil';
 
 // .json 저장 래퍼. schemaVersion은 향후 대비 상수(현재 분기/마이그레이션엔 안 씀).
@@ -38,10 +38,10 @@ const MAX_TITLE_LENGTH = 100;
 const NOTE_BEGIN = '<!-- pg3d:begin -->';
 const NOTE_END = '<!-- pg3d:end -->';
 
-// provider별 논문 웹 URL 생성기. 새 provider를 지원하려면 이 목록에 한 줄만 추가하면 되고
-// paperUrl 함수 본문은 손대지 않는다(데이터 주도). localId는 sourceId의 ':' 뒤 부분.
-const PAPER_URL_BUILDERS: Record<string, (localId: string) => string> = {
-	arxiv: (localId) => `https://arxiv.org/abs/${localId}`,
+// 구독 가능한 출처(arxiv 등)의 URL 규칙은 findDescriptor(provider).paperUrl이 안다 —
+// 여기 남은 건 구독 API로 등록되지 않은 provider(semanticScholar: 지금은 인용수 보강
+// 용도로만 쓰여 자기 논문을 직접 수집하지 않지만, sourceId 접두어 체계는 공유한다)뿐이다.
+const FALLBACK_PAPER_URL_BUILDERS: Record<string, (localId: string) => string> = {
 	semanticScholar: (localId) => `https://www.semanticscholar.org/paper/${localId}`,
 };
 
@@ -388,22 +388,21 @@ export class File {
 	// 리스트는 각 API 구현체가 정한다(ArxivAPI.isValidSearchType/isValidCategoryValue) —
 	// File.ts는 apiName으로 어느 구현체의 규칙을 적용할지만 안다.
 	private static readonly MAX_QUERYS_PER_SUBSCRIPTION = 3;
-	private static readonly QUERY_VALIDATORS: Record<string, (query: SearchQuery) => boolean> = {
-		arxiv: (query) =>
-			ArxivAPI.isValidSearchType(query.searchType) &&
-			(query.searchType !== 'category' || ArxivAPI.isValidCategoryValue(query.query)),
-	};
-
-	// ApiManagementModal은 UI에서 keyword/author/category 드롭다운과 3개 상한을 지키게
-	// 하지만, 저장 파일(Subscriptions.json)은 사용자가 개발자 도구로 DOM/네트워크 요청을
-	// 조작해 그 UI 제약을 우회하고 임의의 필드/개수를 심을 수 있다(9번, 실제 재현됨).
-	// 저장이 실제로 일어나는 이 지점에서 다시 걸러내면 어떤 경로로 들어온 값이든(정상
-	// UI, 조작된 요청, 앞으로 생길 다른 저장 경로) 파일에는 항상 유효한 조건만 남는다.
-	// 알 수 없는 apiName(QUERY_VALIDATORS에 없음)은 검증 기준이 없으므로 그대로
-	// 통과시킨다 — 그 apiName 자체가 잘못됐다면 File.createApi(복원 시점)가 이미 막는다.
+	// ApiManagementModal은 UI에서 조건 드롭다운과 3개 상한을 지키게 하지만, 저장 파일
+	// (Subscriptions.json)은 사용자가 개발자 도구로 DOM/네트워크 요청을 조작해 그 UI
+	// 제약을 우회하고 임의의 필드/개수를 심을 수 있다(9번, 실제 재현됨). 저장이 실제로
+	// 일어나는 이 지점에서 다시 걸러내면 어떤 경로로 들어온 값이든(정상 UI, 조작된 요청,
+	// 앞으로 생길 다른 저장 경로) 파일에는 항상 유효한 조건만 남는다.
+	//
+	// 각 조건이 유효한지는 findDescriptor(apiName).conditionFields가 안다(그 출처의
+	// 사정이라 API.ts 쪽 구현체가 스스로 선언 — ApiDescriptor 참고). 등록되지 않은
+	// apiName은 검증 기준이 없으므로 그대로 통과시킨다 — apiName 자체가 잘못됐다면
+	// File.createApi(복원 시점)가 이미 막는다.
 	private static sanitizeQuerys(apiName: string, querys: SearchQuery[]): SearchQuery[] {
-		const isValid = File.QUERY_VALIDATORS[apiName];
-		const filtered = isValid ? querys.filter((q) => isValid(q)) : querys;
+		const fields = findDescriptor(apiName)?.conditionFields;
+		const filtered = fields
+			? querys.filter((q) => fields.some((f) => f.name === q.searchType && f.validate(q.query)))
+			: querys;
 		return filtered.slice(0, File.MAX_QUERYS_PER_SUBSCRIPTION);
 	}
 
@@ -489,20 +488,14 @@ export class File {
 		});
 	}
 
-	// API 구현체 등록부 — 이 코드베이스가 지원하는 API 목록의 유일한 진실.
-	// 새 API 추가 = 여기 한 줄 + import. 구독 UI의 드롭다운(supportedApiNames)과
-	// createApi가 같은 목록을 보므로 "UI는 받는데 복원은 못 하는 이름"이 생길 수 없다.
-	private static readonly API_FACTORIES: Record<
-		string,
-		(querys: SearchQuery[], secret?: Secret) => API
-	> = {
-		arxiv: (querys, secret) => new ArxivAPI(querys, secret),
-	};
+	// API 구현체 등록부는 collect/API.ts의 findDescriptor()다 — 새 API 추가는 그쪽 배열에
+	// 한 줄 + import로 끝난다. File은 그 결과만 조회하고, 목록의 진실을 따로 들고 있지
+	// 않는다(예전엔 여기 있는 표와 UI 드롭다운의 표가 따로 놀 수 있었다).
 
 	// 구독 UI가 API 선택지를 만들 때 쓴다. 이름을 손으로 치게 하면 'arXiv' 같은 오타가
 	// 저장은 통과하고 다음 수집(createApi)에서야 터진다 — 목록에서 고르게 해야 한다.
 	static supportedApiNames(): string[] {
-		return Object.keys(File.API_FACTORIES);
+		return findApiNames();
 	}
 
 	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
@@ -510,11 +503,11 @@ export class File {
 	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md).
 	// secret은 선택 사항 — 없으면 각 API 구현체가 알아서 익명으로 동작한다.
 	static createApi(apiName: string, querys: SearchQuery[] = [], secret?: Secret): API {
-		const factory = File.API_FACTORIES[apiName];
-		if (factory === undefined) {
+		const descriptor = findDescriptor(apiName);
+		if (descriptor === undefined) {
 			throw new Error(`Unknown apiName: ${apiName}`);
 		}
-		return factory(querys, secret);
+		return descriptor.create(querys, secret);
 	}
 
 	// ── Paper (콘텐츠 트리, .json + .md) ────────────────────────────────
@@ -1100,8 +1093,9 @@ export class File {
 		return lines.join('\n');
 	}
 
-	// 표준 웹 URL을 sourceId에서 파생(저장 안 함). provider별 규칙은 PAPER_URL_BUILDERS
-	// 레지스트리에서 조회한다 — 알 수 없는 provider면 undefined(frontmatter에서 줄 생략).
+	// 표준 웹 URL을 sourceId에서 파생(저장 안 함). 구독 가능한 출처는 findDescriptor가
+	// 알고, 그 외(semanticScholar 등)는 FALLBACK_PAPER_URL_BUILDERS를 본다 — 둘 다
+	// 모르는 provider면 undefined(frontmatter에서 줄 생략).
 	private static paperUrl(sourceId: string): string | undefined {
 		const separator = sourceId.indexOf(':');
 		if (separator <= 0) {
@@ -1112,7 +1106,7 @@ export class File {
 		if (localId.length === 0) {
 			return undefined;
 		}
-		const build = PAPER_URL_BUILDERS[provider];
+		const build = findDescriptor(provider)?.paperUrl ?? FALLBACK_PAPER_URL_BUILDERS[provider];
 		return build ? build(localId) : undefined;
 	}
 

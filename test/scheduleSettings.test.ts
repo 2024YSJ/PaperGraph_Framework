@@ -9,7 +9,7 @@ import {
 	DEFAULT_SCHEDULE_SETTINGS,
 	LOAD_REPAIR_COOLDOWN_MS,
 	shouldRunLoadRepair,
-} from '../src/collect/ScheduleSettings';
+} from '../src/common/ScheduleSettings';
 import { VaultStub } from './helpers/vaultStub';
 
 const PLUGIN_DIR = 'test-plugin-dir/papergraph3d';

@@ -4,20 +4,16 @@ import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { FailureNotifier } from '../common/Notify';
 import { hasMeaningfulQueryValue, SearchQuery } from '../collect/SearchQuery';
-import { ArxivAPI } from '../collect/API';
+import { findDescriptor } from '../collect/API';
 import { KEY_VALIDATORS } from '../collect/SecretValidation';
 
-// 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들.
-// 여기 값은 API.ts의 ARXIV_FIELD_PREFIX 키와 반드시 일치해야 한다 — 예전에 이 타입만
-// 'domain'으로 남아 있어서, UI로 그 조건을 만들면 formatTerm()이
-// "Unknown searchType"으로 throw하고 [1] 정책에 따라 해당 구독 수집 전체가 실패했다.
-type ConditionType = 'keyword' | 'author' | 'category';
-
-const CONDITION_TYPE_LABEL: Record<ConditionType, string> = {
-	keyword: '키워드',
-	author: '저자',
-	category: '분류',
-};
+// 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들 — 어떤 이름이 유효한지는
+// apiName마다 다르고, 그건 그 출처(예: ArxivAPI)만 아는 사정이라 여기서 미리 정해두지
+// 않는다. findDescriptor(apiName).conditionFields가 유일한 진실이다(ApiDescriptor
+// 참고) — 예전엔 여기 하드코딩된 유니온 타입이 API.ts의 FIELD_PREFIX 키와 수동으로
+// 맞아야 했고, 어긋나면 formatTerm()이 "Unknown searchType"으로 던지면서 그제서야
+// 드러났다.
+type ConditionType = string;
 
 // 구독 한 건 = API 하나. API 하나에 여러 조건(키워드/저자/분류 등, SearchQuery)을
 // 동시에 걸 수 있다 (Subscriptions.apis: API[], API.querys: SearchQuery[]와 대응).
@@ -45,6 +41,23 @@ const MAX_CONDITIONS_PER_API = 3;
 // 구독 UI는 Subscriptions.json과 실시간 동기화된다: 열 때 읽어와 복원하고, 추가/삭제
 // 때마다 즉시 저장한다.
 export class ApiManagementModal extends Modal {
+	// 새 카드/조건의 초기 선택지 — 그 apiName이 지원하는 첫 번째 조건 필드. 등록되지
+	// 않은 apiName(구버전 파일 등)이면 빈 문자열 — 드롭다운도 비어 그려지고, 이후
+	// createApi가 "Unknown apiName"으로 더 크게 드러낸다.
+	private static firstConditionType(apiName: string): string {
+		return findDescriptor(apiName)?.conditionFields[0]?.name ?? '';
+	}
+
+	// 조건 요약/목록에 보여줄 사람이 읽는 이름. 등록되지 않은 apiName이거나 그 출처가
+	// 모르는 필드 이름(구버전 파일이 남긴 값 등)이면 이름 그대로 보여준다 — 조용히
+	// 감추는 것보다, 알 수 없는 값이 있다는 걸 그대로 드러내는 편이 낫다.
+	private static conditionLabel(apiName: string, searchType: string): string {
+		return (
+			findDescriptor(apiName)?.conditionFields.find((f) => f.name === searchType)?.label ??
+			searchType
+		);
+	}
+
 	// 지금 폼에 입력 중인 provider·키 값. KEY_VALIDATORS가 provider 선택지의 유일한
 	// 진실이다 — 구독 API 목록(File.supportedApiNames)과는 다른 레지스트리다: 구독은
 	// "수집 출처"(arxiv 등, 키가 필요 없을 수도 있음)를, 이건 "키로 인증하는 보강용
@@ -248,7 +261,7 @@ export class ApiManagementModal extends Modal {
 						this.apiDrafts.push({
 							apiName: this.apiNameDraft,
 							conditions: [],
-							newConditionType: 'keyword',
+							newConditionType: ApiManagementModal.firstConditionType(this.apiNameDraft),
 							newConditionQuery: '',
 							saved: false, // 아직 디스크에 없다 — 「저장」을 눌러야 진짜 구독이 된다.
 						});
@@ -338,10 +351,10 @@ export class ApiManagementModal extends Modal {
 			this.apiDrafts = subscriptions.apis.map((api) => ({
 				apiName: api.apiName,
 				conditions: api.querys.map((query) => ({
-					searchType: query.searchType as ConditionType,
+					searchType: query.searchType,
 					query: query.query,
 				})),
-				newConditionType: 'keyword',
+				newConditionType: ApiManagementModal.firstConditionType(api.apiName),
 				newConditionQuery: '',
 				saved: true, // 디스크에서 그대로 읽어온 카드 — 지금 화면과 저장본이 일치한다.
 			}));
@@ -621,7 +634,9 @@ export class ApiManagementModal extends Modal {
 		const summary =
 			api.conditions.length > 0
 				? api.conditions
-						.map((c) => `${CONDITION_TYPE_LABEL[c.searchType] ?? c.searchType}:${c.query}`)
+						.map(
+							(c) => `${ApiManagementModal.conditionLabel(api.apiName, c.searchType)}:${c.query}`,
+						)
 						.join(' · ')
 				: '(조건 없음)';
 		const heading = new Setting(containerEl)
@@ -645,7 +660,9 @@ export class ApiManagementModal extends Modal {
 
 		for (const condition of api.conditions) {
 			new Setting(containerEl)
-				.setName(`${CONDITION_TYPE_LABEL[condition.searchType] ?? condition.searchType}: ${condition.query}`)
+				.setName(
+					`${ApiManagementModal.conditionLabel(api.apiName, condition.searchType)}: ${condition.query}`,
+				)
 				.addButton((button) =>
 					// 로컬에서만 지운다 — 실제 반영은 아래 「저장」을 눌러야 한다.
 					button.setButtonText('조건 삭제').onClick(() => {
@@ -662,19 +679,20 @@ export class ApiManagementModal extends Modal {
 			return;
 		}
 
+		const descriptor = findDescriptor(api.apiName);
+		const fields = descriptor?.conditionFields ?? [];
+
 		new Setting(containerEl)
 			.setName('조건 추가')
 			.setDesc(`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). 여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요.`)
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption('keyword', CONDITION_TYPE_LABEL.keyword)
-					.addOption('author', CONDITION_TYPE_LABEL.author)
-					.addOption('category', CONDITION_TYPE_LABEL.category)
-					.setValue(api.newConditionType)
-					.onChange((value) => {
-						api.newConditionType = value as ConditionType;
-					}),
-			)
+			.addDropdown((dropdown) => {
+				for (const field of fields) {
+					dropdown.addOption(field.name, field.label);
+				}
+				return dropdown.setValue(api.newConditionType).onChange((value) => {
+					api.newConditionType = value;
+				});
+			})
 			.addText((text) =>
 				text.setPlaceholder('조건 값').onChange((value) => {
 					api.newConditionQuery = value;
@@ -687,23 +705,21 @@ export class ApiManagementModal extends Modal {
 					}
 					// trim().length===0만으로는 안 걸러진다 — ""나 " "처럼 따옴표/공백만
 					// 있는 값은 원본 문자열 길이가 0이 아니라서 위 검사를 통과한다. 실제로
-					// arXiv에 전송될 값(formatTerm이 따옴표를 제거한 뒤의 값) 기준으로 다시
-					// 검사해야 이 값들이 걸린다 — ArxivAPI.formatTerm과 같은 기준
-					// (hasMeaningfulQueryValue)을 여기서도 써서, 수집이 실제로 돌기 전
-					// 저장 단계에서부터 막는다.
+					// 전송될 값(formatTerm이 따옴표를 제거한 뒤의 값) 기준으로 다시 검사해야
+					// 이 값들이 걸린다 — SearchQuery.hasMeaningfulQueryValue와 같은 기준을
+					// 여기서도 써서, 수집이 실제로 돌기 전 저장 단계에서부터 막는다.
 					if (!hasMeaningfulQueryValue(api.newConditionQuery)) {
 						new Notice('검색어에 실제 내용(글자/숫자)이 있어야 합니다.');
 						return;
 					}
-					// 분류(category)만은 arXiv 쿼리에서 따옴표로 감쌀 수 없어 값 자체가
-					// 문법이 된다 — 저장 시점 화이트리스트(File.sanitizeQuerys)가 어차피
-					// 걸러내는데, 여기서 안 막으면 사용자는 "추가됐다가 저장하니 사라진"
-					// 것처럼 보인다. 같은 기준으로 즉시 거부한다.
-					if (
-						api.newConditionType === 'category' &&
-						!ArxivAPI.isValidCategoryValue(api.newConditionQuery.trim())
-					) {
-						new Notice('분류는 arXiv 분류 코드 형식이어야 합니다 (예: cs.LG).');
+					// 필드마다 값 형식이 다를 수 있다(예: arXiv의 분류는 따옴표로 못 감싸
+					// 값 자체가 쿼리 문법이 된다) — 그 기준은 이 출처의 ConditionField가
+					// 안다. 저장 시점 화이트리스트(File.sanitizeQuerys)가 어차피 걸러내는데,
+					// 여기서 안 막으면 사용자는 "추가됐다가 저장하니 사라진" 것처럼 본다.
+					// 같은 검증 함수로 즉시 거부한다.
+					const field = fields.find((f) => f.name === api.newConditionType);
+					if (field && !field.validate(api.newConditionQuery.trim())) {
+						new Notice(`${field.label} 값의 형식이 올바르지 않습니다.`);
 						return;
 					}
 					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상

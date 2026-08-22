@@ -119,6 +119,41 @@ export interface API {
 	readonly lastCoverage: CollectionCoverage | undefined;
 }
 
+// 구독 조건 필드 하나(예: arXiv의 keyword/author/category). UI 드롭다운과 저장 시점
+// 검증이 이 값 하나로 결정된다 — "이 출처가 어떤 조건을 받는지, 값이 유효한지"는
+// 그 출처만 아는 사정이라 여기서 구현체가 직접 선언한다.
+export interface ConditionField {
+	// SearchQuery.searchType과 매칭되는 키(예: 'category'). File.QUERY_VALIDATORS가
+	// 예전에 apiName으로 분기하던 걸 대신한다.
+	readonly name: string;
+	// 구독 관리 UI 드롭다운에 그대로 쓰는 사람이 읽는 이름(예: '분류').
+	readonly label: string;
+	// 이 필드에 이 값이 유효한지. UI(추가 버튼)와 저장 시점(File.sanitizeQuerys) 양쪽이
+	// 같은 이 함수를 호출한다 — 판정 기준이 두 군데로 갈라지지 않는다.
+	// 프로퍼티(화살표 타입)로 선언한다 — 메서드 단축 구문(validate(...): ...)은 암묵적
+	// this 바인딩을 요구해서, ArxivAPI.isValidCategoryValue처럼 this를 안 쓰는 정적
+	// 메서드를 그대로 값으로 넣어도 린트가 걸린다.
+	validate: (value: string) => boolean;
+}
+
+// API 구현체가 자기 자신에 대해 "바깥(File, UI)이 알아야 하는 사실"을 서술한다.
+//
+// 예전에는 File.ts가 QUERY_VALIDATORS/PAPER_URL_BUILDERS/API_FACTORIES라는 이름으로
+// { arxiv: ... } 표 세 개를 따로 들고 있었고, ApiManagementModal도 조건 드롭다운과
+// category 검증을 직접 하드코딩했다 — 새 출처를 추가하면 그 구현체 파일 하나로 안
+// 끝나고 File/Modal 여러 곳을 같이 고쳐야 했다(실제로 그렇게 드리프트가 생겼다).
+// 이 인터페이스로 그 앎을 구현체 쪽에 되돌려 놓는다: 구현체가 스스로를 설명하고,
+// File/UI는 findDescriptor()로 조회만 한다.
+export interface ApiDescriptor {
+	readonly apiName: string;
+	readonly conditionFields: readonly ConditionField[];
+	// 논문 웹 페이지 URL. File.PAPER_URL_BUILDERS가 하던 일. validate와 같은 이유로
+	// 프로퍼티(화살표 타입)로 선언한다.
+	paperUrl: (localId: string) => string;
+	// 저장된 SearchQuery[]로 이 API의 인스턴스를 복원한다. File.API_FACTORIES가 하던 일.
+	create: (querys: SearchQuery[], secret?: Secret) => API;
+}
+
 // 구간 수집(SearchRecentPaper/Backfill)의 선택 옵션.
 //
 // 둘 다 "수집한 논문을 전부 배열로 돌려준다"는 단순한 계약을 깨기 위해 있다. 구간이
@@ -1325,4 +1360,42 @@ export class ArxivAPI implements API {
 		}
 		return result;
 	}
+}
+
+// ── API 서술자 레지스트리 ────────────────────────────────────────────
+//
+// 새 출처를 추가할 때 손대는 유일한 지점. 이 배열에 자기 서술자를 한 줄 더하면 UI
+// 드롭다운·저장 시점 검증·논문 URL·인스턴스 생성이 전부 따라온다 — File.ts와
+// ApiManagementModal.ts는 findDescriptor()만 부르고 ArxivAPI를 직접 import하지 않는다.
+const ARXIV_DESCRIPTOR: ApiDescriptor = {
+	apiName: 'arxiv',
+	conditionFields: [
+		// keyword/author는 저장 계층(File.sanitizeQuerys)에서는 자유 텍스트로 둔다 —
+		// "의미 있는 값인가"(hasMeaningfulQueryValue)는 여기서 걸러지지 않는다. 그건 UI가
+		// 입력 시점에 별도로 확인하고, 최종적으로는 formatTerm이 ConfigurationError로
+		// 던진다([1] 정책) — 값이 비었다고 File이 조용히 조건을 지워버리면(저장은
+		// 되는데 구독이 하나씩 준다) 사용자가 원인을 알기 어렵다. 반면 값이 그대로
+		// "전체 검색"으로 새는 걸 막는 게 이 필드의 유일한 역할이라 항상 통과시킨다.
+		{ name: 'keyword', label: '키워드', validate: () => true },
+		{ name: 'author', label: '저자', validate: () => true },
+		// category는 formatTerm이 따옴표로 못 감싸는 값이라(값 자체가 쿼리 문법이 됨)
+		// 자유 텍스트가 아니라 엄격한 형식 검증을 쓴다 — 저장 계층에서부터 막아야 한다
+		// (69번, 실제 재현: category 값으로 쿼리 자체를 조작).
+		{ name: 'category', label: '분류', validate: (value) => ArxivAPI.isValidCategoryValue(value) },
+	],
+	paperUrl: (localId) => `https://arxiv.org/abs/${localId}`,
+	create: (querys, secret) => new ArxivAPI(querys, secret),
+};
+
+const API_DESCRIPTORS: readonly ApiDescriptor[] = [ARXIV_DESCRIPTOR];
+
+// apiName으로 서술자를 조회한다. 등록되지 않은 이름이면 undefined — 호출자(File)가
+// "이 이름은 모른다"를 각자의 방식으로 처리한다(구독은 걸러내고, 인스턴스화는 못 한다).
+export function findDescriptor(apiName: string): ApiDescriptor | undefined {
+	return API_DESCRIPTORS.find((d) => d.apiName === apiName);
+}
+
+// 등록된 모든 apiName. File.supportedApiNames()(구독 UI 드롭다운)가 위임한다.
+export function findApiNames(): string[] {
+	return API_DESCRIPTORS.map((d) => d.apiName);
 }
