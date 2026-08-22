@@ -623,12 +623,21 @@ export class ApiManagementModal extends Modal {
 					'margin-left:16px; border-left:2px solid var(--background-modifier-border); padding-left:12px;',
 			},
 		});
+		// 카드마다 자기 컨테이너를 따로 둔다 — 조건 추가/삭제처럼 이 카드 하나만 바뀌는
+		// 변경은 renderApiDraft가 이 컨테이너만 다시 그리게 해서, 구독이 몇 개든 그 개수와
+		// 무관하게 항상 "카드 하나 분량"의 비용만 든다(전체 모달 렉 수정 — 필드에 추가/
+		// 조건 삭제를 누를 때마다 등록된 모든 구독·조건을 처음부터 다시 그리던 문제).
 		for (const draft of drafts) {
-			this.renderApiDraft(childContainer, draft);
+			const cardEl = childContainer.createDiv();
+			this.renderApiDraft(cardEl, draft);
 		}
 	}
 
+	// containerEl은 이 카드 전용 div(위 renderSubscriptionGroup에서 만듦)다. 조건 추가/
+	// 삭제 핸들러가 this.render()(전체 모달 재구성) 대신 이 함수를 자기 자신에게 다시
+	// 불러 카드 하나만 갱신한다 — 그래서 재호출에도 안전하도록 맨 먼저 비운다.
 	private renderApiDraft(containerEl: HTMLElement, api: ApiDraft): void {
+		containerEl.empty();
 		// 카드 제목은 이제 조건 요약이다 — apiName은 그룹 헤더가 이미 보여주므로 여기서
 		// 또 반복하면 중복이다.
 		const summary =
@@ -668,7 +677,8 @@ export class ApiManagementModal extends Modal {
 					button.setButtonText('조건 삭제').onClick(() => {
 						api.conditions = api.conditions.filter((item) => item !== condition);
 						api.saved = false;
-						this.render();
+						// 이 카드만 다시 그린다 — 다른 구독/카드는 그대로 둔다.
+						this.renderApiDraft(containerEl, api);
 					}),
 				);
 		}
@@ -731,8 +741,9 @@ export class ApiManagementModal extends Modal {
 					api.newConditionQuery = '';
 					api.saved = false;
 					// 로컬에서만 쌓는다 — 디스크 반영은 맨 아래 「저장」 버튼으로 한 번에
-					// (render() 끝의 단일 저장 버튼 참고 — 카드마다 두지 않는다).
-					this.render();
+					// (render() 끝의 단일 저장 버튼 참고 — 카드마다 두지 않는다). 이 카드만
+					// 다시 그린다 — 등록된 다른 구독이 많아도 이 클릭 비용은 항상 일정하다.
+					this.renderApiDraft(containerEl, api);
 				}),
 			);
 	}
