@@ -10,6 +10,17 @@ import { isUsablePaperDate } from './DateUtil';
 
 // .json 저장 래퍼. schemaVersion은 향후 대비 상수(현재 분기/마이그레이션엔 안 씀).
 // 설계 근거: docs/devLog/002.md.
+// backfill 진행 지점 한 건. 구독(apiName + querys)과 요청 구간(from~to)이 모두 같을
+// 때만 이어받기에 쓴다 — 구간이 다르면 "어디까지 훑었나"의 기준이 달라진다.
+export interface BackfillProgressRecord {
+	apiName: string;
+	querys: SearchQuery[];
+	from: number;
+	to: number;
+	coveredThrough: number;
+	updatedAt: number;
+}
+
 export interface StoredPaperFile {
 	schemaVersion: number;
 	paper: Paper; // Paper 필드 그대로 (embedding 포함)
@@ -154,6 +165,96 @@ export class File {
 
 	static writeSkippedEntries(records: SkippedEntryRecord[]): Promise<void> {
 		return File.writeConfig('SkippedEntries.json', records);
+	}
+
+	// ── Backfill 진행 지점 (BackfillProgress.json) ─────────────────
+	//
+	// 27만 편짜리 backfill은 수 시간이 걸리는데, 예전에는 진행 지점을 어디에도 남기지
+	// 않았다(backfill은 구독 커서 updateTime을 올리지 않는다 — 그건 recent 수집의
+	// "최근 어디까지 봤나"라서 과거 구간을 메우는 일과 뜻이 다르다). 그래서 절전·강제
+	// 종료·네트워크 소진 등으로 한 번 끊기면 재실행이 항상 요청 구간의 처음부터 다시
+	// 훑었다(QA 재현). 논문 파일은 남아 있어 재저장·재임베딩은 건너뛰지만, arXiv를
+	// 처음부터 다시 페이징하는 시간은 그대로 든다.
+	//
+	// 라운드가 끝날 때마다 갱신한다 — 그 시점엔 [from, coveredThrough] 구간의 논문이
+	// 이미 디스크에 저장까지 끝나 있어(collectRounds가 emit을 await한다) 그 지점부터
+	// 이어받아도 잃는 게 없다. Subscriptions.json에 얹지 않고 파일을 나눈 이유는 저장
+	// 주기가 다르기 때문이다 — 이쪽은 라운드마다(분 단위) 쓰이고, 구독 파일은 사용자가
+	// 편집하는 설정이다.
+	static readBackfillProgress(): Promise<BackfillProgressRecord[]> {
+		return File.readConfig(
+			'BackfillProgress.json',
+			(raw) => (Array.isArray(raw) ? (raw as BackfillProgressRecord[]) : []),
+			() => [],
+		);
+	}
+
+	// 같은 구독(apiName + querys)의 기록은 하나만 남긴다 — 구간이 다르면 옛 기록은
+	// 쓸모가 없다(이어받기는 요청 구간이 완전히 같을 때만 성립한다).
+	static async saveBackfillProgress(record: BackfillProgressRecord): Promise<void> {
+		await File.mutateBackfillProgress((records) => [
+			...records.filter((r) => !File.sameBackfillTarget(r, record)),
+			record,
+		]);
+	}
+
+	// 구간을 끝까지 훑었으면 기록을 지운다. 남겨두면 같은 구간을 다시 요청했을 때
+	// "이미 끝난 지점"에서 시작해 아무것도 안 하고 끝난다.
+	static async clearBackfillProgress(apiName: string, querys: SearchQuery[]): Promise<void> {
+		await File.mutateBackfillProgress((records) =>
+			records.filter((r) => !File.sameBackfillTarget(r, { apiName, querys })),
+		);
+	}
+
+	// 이 구독의 이 구간에 저장된 이어받기 지점. 없거나 구간이 다르면 undefined.
+	static findBackfillResumePoint(
+		records: BackfillProgressRecord[],
+		apiName: string,
+		querys: SearchQuery[],
+		from: number,
+		to: number,
+	): number | undefined {
+		const match = records.find(
+			(r) =>
+				File.sameBackfillTarget(r, { apiName, querys }) && r.from === from && r.to === to,
+		);
+		if (match === undefined) {
+			return undefined;
+		}
+		// 저장된 값이 구간 밖이면(파일 수동 편집 등) 믿지 않는다 — 구간을 건너뛰는
+		// 방향의 오류는 영구 누락이 된다.
+		if (
+			!Number.isFinite(match.coveredThrough) ||
+			match.coveredThrough <= from ||
+			match.coveredThrough >= to
+		) {
+			return undefined;
+		}
+		return match.coveredThrough;
+	}
+
+	private static sameBackfillTarget(
+		a: { apiName: string; querys: SearchQuery[] },
+		b: { apiName: string; querys: SearchQuery[] },
+	): boolean {
+		return a.apiName === b.apiName && File.searchQueriesEqual(a.querys, b.querys);
+	}
+
+	// 라운드마다 불리는 read-modify-write라 직렬화한다(mutateSubscriptions와 같은 이유).
+	private static backfillQueue: Promise<void> = Promise.resolve();
+
+	private static mutateBackfillProgress(
+		mutator: (records: BackfillProgressRecord[]) => BackfillProgressRecord[],
+	): Promise<void> {
+		const result = File.backfillQueue.then(async () => {
+			const records = await File.readBackfillProgress();
+			await File.writeConfig('BackfillProgress.json', mutator(records));
+		});
+		File.backfillQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 
 	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json

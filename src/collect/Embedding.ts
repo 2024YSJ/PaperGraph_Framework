@@ -127,6 +127,22 @@ export class Embedding {
 	// 메모리를 돌려준다 (3차 방어 — "완료된 작업이 메모리를 계속 차지하는" 문제의 핵심 대응).
 	private static readonly INFERENCES_PER_SESSION = 64;
 
+	// 추론 한 번에 거는 시한.
+	//
+	// ⚠️ ORT 추론에는 취소 수단이 없다 — 시한이 지나도 원래 계산은 백그라운드에 남는다.
+	// requestWithTimeout과 같은 한계이고, 목적도 같다: 호출자를 풀어주는 것.
+	//
+	// 이게 없어서 생긴 실제 문제(QA): 절전에서 깨면 WASM/JSEP 백엔드가 물려 이 Promise가
+	// 영영 안 풀리는 경우가 있는데, 그러면 embedOne -> processChunk -> collect -> runNow ->
+	// 큐 tail이 통째로 멈춰 대기 중인 수집이 영원히 "대기중"으로 남았다. 플러그인을
+	// 리로드하는 것 말고는 빠져나올 방법이 없었다.
+	//
+	// 값은 "정상 추론이 절대 여기까지 안 걸린다"만 만족하면 된다(느린 기기의 512토큰
+	// BERT도 초 단위다). 시한이 걸리면 runLocalModel의 기존 복구 경로가 세션을 새로 만들어
+	// 한 번 더 시도하고, 그래도 안 되면 서킷브레이커가 받아 이번 실행의 임베딩을 포기한다 —
+	// 즉 최악이라도 2회로 끝나지 논문마다 90초씩 서지 않는다.
+	private static readonly INFERENCE_TIMEOUT_MS = 90_000;
+
 	// ── 상수: 서킷브레이커 (5차 방어) — 모델 비의존적 ───────────────────────
 	private static readonly FAILURE_LIMIT = 3;
 	private static readonly BREAKER_COOLDOWN_MS = 60_000;
@@ -400,6 +416,35 @@ export class Embedding {
 		}
 	}
 
+	// 추론 Promise가 시한 안에 안 풀리면 에러로 바꿔 돌려준다. 에러로 만드는 이유는
+	// 호출부(runLocalModel)가 이미 "추론 실패 -> 세션 새로 만들어 한 번 재시도 -> 그래도
+	// 실패하면 세션 반납 후 throw"라는 복구 경로를 갖고 있어서다 — 멈춤을 그 경로에
+	// 태우기만 하면 된다.
+	private static async withInferenceTimeout<T>(work: Promise<T>): Promise<T> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(
+						new Error(
+							`PaperGraph3D: 임베딩 추론이 ${Embedding.INFERENCE_TIMEOUT_MS}ms 안에 끝나지 않았습니다 — 세션을 새로 만들어 다시 시도합니다.`,
+						),
+					),
+				Embedding.INFERENCE_TIMEOUT_MS,
+			);
+		});
+		// 시한이 이겨도 원래 추론은 계속 살아 있다 — 그게 나중에 reject하면 아무도 안 받는
+		// rejection이 되어 콘솔에 unhandled로 뜬다. 결과는 이미 버렸으니 조용히 삼킨다.
+		work.catch(() => undefined);
+		try {
+			return await Promise.race([work, timeout]);
+		} finally {
+			if (timer !== undefined) {
+				clearTimeout(timer);
+			}
+		}
+	}
+
 	private static bucketFor(tokenCount: number): number {
 		return (
 			Embedding.LENGTH_BUCKETS.find((bucket) => tokenCount <= bucket) ??
@@ -424,7 +469,9 @@ export class Embedding {
 			max_length: Embedding.bucketFor(tokenCount),
 		});
 
-		const { last_hidden_state: hidden } = await session.model(inputs);
+		const { last_hidden_state: hidden } = await Embedding.withInferenceTimeout(
+			session.model(inputs),
+		);
 		session.uses += 1;
 
 		const embedding = this.poolEmbedding(hidden);

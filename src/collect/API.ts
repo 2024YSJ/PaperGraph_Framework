@@ -147,6 +147,14 @@ export interface CollectOptions {
 	// 총계가 아니다(collectRounds 주석 참고). 구간에 결과가 없거나 arXiv가 총계를
 	// 못 읽어주면(-1) 호출되지 않는다.
 	onTotal?: (total: number) => void;
+
+	// 라운드(MAX_PAGES만큼의 한 묶음)가 끝날 때마다 "여기까지 훑었다"를 알린다. 이 시점엔
+	// 그 구간의 논문이 onChunk를 통해 이미 저장까지 끝나 있으므로(collectRounds가 emit을
+	// await한다), 호출자가 이 값을 남겨두면 다음 실행이 그 지점부터 이어받을 수 있다.
+	// 수 시간짜리 backfill이 중간에 끊겼을 때 처음부터 다시 훑지 않게 하는 유일한 수단이다.
+	//
+	// 실패해도 수집을 멈추지 않는다 — 진행 기록은 보조 수단이지 수집 결과의 일부가 아니다.
+	onRoundComplete?: (coveredThrough: number) => Promise<void>;
 }
 
 // 직전 날짜 구간 수집이 실제로 어디까지 훑었는지.
@@ -471,6 +479,7 @@ export class ArxivAPI implements API {
 				}
 			},
 			options?.onTotal,
+			options?.onRoundComplete,
 		);
 
 		Log.info('arxiv.window', '구간 수집 종료', { papers: total, coverage: this.coverage });
@@ -493,6 +502,7 @@ export class ArxivAPI implements API {
 		to: number,
 		emit: (papers: Paper[]) => Promise<void>,
 		onTotal?: (total: number) => void,
+		onRoundComplete?: (coveredThrough: number) => Promise<void>,
 	): Promise<void> {
 		// 이어받기는 반드시 중복을 만든다: formatDate가 분 단위로 자르고 buildDateFilter의
 		// 범위가 양끝 포함([A TO B])이라, 경계 분의 논문이 다음 라운드에 또 걸린다.
@@ -560,6 +570,15 @@ export class ArxivAPI implements API {
 				truncated: roundCoverage.truncated,
 				coveredThrough: new Date(roundCoverage.coveredThrough).toISOString(),
 			});
+
+			// 이 라운드가 커버한 지점을 알린다 — 여기까지의 논문은 emit(=저장)이 이미
+			// 끝났다. 마지막 라운드(완주)도 알려야 "요청 구간을 끝까지 봤다"가 기록된다.
+			if (onRoundComplete !== undefined) {
+				await runQuietly(
+					() => onRoundComplete(roundCoverage.coveredThrough),
+					'collectRounds.onRoundComplete',
+				);
+			}
 
 			if (!roundCoverage.truncated) {
 				break;

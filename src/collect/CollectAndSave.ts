@@ -43,6 +43,9 @@ interface CollectWindow {
 	from: number;
 	to: number;
 	advancesCursor: boolean;
+	// backfill 전용 — 사용자가 실제로 요청한 구간의 시작. 이어받기로 from이 앞당겨져도
+	// 진행 기록의 키와 실패 메시지의 "미완료 구간"은 요청한 원래 구간이어야 한다.
+	requestedFrom?: number;
 }
 
 // embedOrReuse가 서킷브레이커 대응에 필요한 만큼만 보는 조각. run()의 CollectStats와
@@ -605,13 +608,14 @@ export class CollectAndSave {
 
 		// 구독마다 독립 커서라 갱신 대상도 구독마다 다르다 — collect()가 advancesCursor인
 		// 구독만 골라 돌려준다(Backfill/테스트 hours로 돈 구독은 여기 안 낀다).
+		// 실제 저장은 collect()가 구독이 끝날 때마다 이미 마쳤다(중간에 끊겨도 끝난 구독의
+		// 커서는 남는다) — 여기서는 이번 실행의 갱신 내역을 한 줄로 남기기만 한다.
 		Log.info('collect', '수집 커서 갱신', {
 			updates: cursorUpdates.map((u) => ({
 				apiName: u.apiName,
 				cursor: new Date(u.cursor).toISOString(),
 			})),
 		});
-		await File.updateApiCursors(cursorUpdates);
 
 		// 3번: 보정 자동화(인용수) — 이번 실행에서 인용수를 못 채운 논문은 이미 메모리에
 		// 있으므로(failures.citation), File.readAllPapers()로 코퍼스를 다시 훑지 않고 그
@@ -1162,6 +1166,9 @@ export class CollectAndSave {
 		mode: 'recent' | 'backfill',
 		testOptions: CollectTestOptions | undefined,
 		api: API,
+		// 이 구독의 이 구간에 저장된 backfill 이어받기 지점(File.findBackfillResumePoint).
+		// 없으면 요청한 from부터 훑는다.
+		resumeFrom?: number,
 	): CollectWindow {
 		const now = Date.now();
 
@@ -1207,7 +1214,19 @@ export class CollectAndSave {
 					'PaperGraph3D: 과거 논문 수집 구간의 종료일이 미래입니다 — 오늘 이전 날짜로 지정하세요.',
 				);
 			}
-			return { from, to, advancesCursor: false };
+			// 지난 실행이 남긴 지점부터 이어받는다 — 그 앞 구간의 논문은 이미 저장까지
+			// 끝났다. resumeFrom은 findBackfillResumePoint가 구간 안쪽임을 이미 확인한
+			// 값이라 여기서 다시 검사하지 않는다.
+			if (resumeFrom !== undefined) {
+				Log.info('collect', 'backfill 이어받기 — 지난 실행이 멈춘 지점부터 훑는다', {
+					apiName: api.apiName,
+					requestedFrom: new Date(from).toISOString(),
+					resumeFrom: new Date(resumeFrom).toISOString(),
+					to: new Date(to).toISOString(),
+				});
+				return { from: resumeFrom, to, advancesCursor: false, requestedFrom: from };
+			}
+			return { from, to, advancesCursor: false, requestedFrom: from };
 		}
 
 		if (testOptions?.hours !== undefined) {
@@ -1262,11 +1281,9 @@ export class CollectAndSave {
 		}[];
 		skippedRecords: SkippedEntryRecord[];
 	}> {
-		const options: CollectOptions = {
-			prefill: (papers) => this.prefillFromStore(papers),
-			onChunk,
-			onTotal,
-		};
+		// backfill 이어받기 지점은 실행 시작 시 한 번만 읽는다 — 이 실행이 도는 동안
+		// 쓰는 쪽도 여기(아래 onRoundComplete)뿐이라, 매 구독마다 다시 읽을 이유가 없다.
+		const backfillProgress = mode === 'backfill' ? await File.readBackfillProgress() : [];
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
 		const subscriptionFailures: {
 			apiName: string;
@@ -1311,11 +1328,55 @@ export class CollectAndSave {
 			});
 			let window: CollectWindow | undefined;
 			try {
-				window = this.resolveWindow(mode, testOptions, api);
+				window = this.resolveWindow(
+					mode,
+					testOptions,
+					api,
+					mode === 'backfill' && testOptions?.from !== undefined && testOptions.to !== undefined
+						? File.findBackfillResumePoint(
+								backfillProgress,
+								api.apiName,
+								api.querys,
+								testOptions.from,
+								testOptions.to,
+							)
+						: undefined,
+				);
+				const requestedFrom = window.requestedFrom;
+				const requestedTo = window.to;
+				const options: CollectOptions = {
+					prefill: (papers) => this.prefillFromStore(papers),
+					onChunk,
+					onTotal,
+					// backfill만 진행 지점을 남긴다. recent는 구독 커서(updateTime)가 같은
+					// 역할을 이미 하고 있어 두 벌로 관리할 이유가 없다.
+					onRoundComplete:
+						requestedFrom === undefined
+							? undefined
+							: (coveredThrough) =>
+									File.saveBackfillProgress({
+										apiName: api.apiName,
+										querys: api.querys,
+										from: requestedFrom,
+										to: requestedTo,
+										coveredThrough,
+										updatedAt: Date.now(),
+									}),
+				};
 				if (window.hours === undefined) {
 					await api.Backfill(window.from, window.to, options);
 				} else {
 					await api.SearchRecentPaper(window.hours, options);
+				}
+				// 요청 구간을 끝까지 훑었으면 이어받기 기록은 필요 없다. 남겨두면 같은
+				// 구간을 다시 요청했을 때 "이미 끝난 지점"에서 시작해 0편으로 끝난다.
+				// 커서 정체 등으로 잘린 채(truncated) 끝났으면 기록을 남겨 다음 실행이
+				// 그 지점부터 다시 시도하게 둔다.
+				if (requestedFrom !== undefined && api.lastCoverage?.truncated !== true) {
+					await runQuietly(
+						() => File.clearBackfillProgress(api.apiName, api.querys),
+						'collect.clearBackfillProgress',
+					);
 				}
 				onApiDone?.(api, index, apis.length);
 				Log.info('collect', '구독 수집 완료', {
@@ -1335,11 +1396,16 @@ export class CollectAndSave {
 					stats.categoryMismatches += coverage.categoryMismatches;
 				}
 				if (window.advancesCursor) {
-					cursorUpdates.push({
+					const update = {
 						apiName: api.apiName,
 						querys: api.querys,
 						cursor: CollectAndSave.resolveCursor(api, window.to),
-					});
+					};
+					cursorUpdates.push(update);
+					// 구독이 끝나는 즉시 저장한다. 예전에는 실행이 전부 끝난 뒤 한 번에
+					// 썼는데, 그러면 구독 3개 중 2개가 끝난 상태에서 기기가 꺼지면 이미
+					// 끝난 2개의 커서까지 같이 날아가 다음 실행이 같은 구간을 다시 훑었다.
+					await File.updateApiCursors([update]);
 				}
 			} catch (error) {
 				// 이 구독은 실패로 남기고 다음 구독으로 넘어간다 — 이미 이 구독이 emit한
@@ -1356,9 +1422,11 @@ export class CollectAndSave {
 				// 있다 — window가 resolveWindow까지 성공한 뒤(즉 range 자체는 유효했는데
 				// 네트워크 등으로 중단된 경우)에만 채워진다. window가 없으면(범위 검증
 				// 자체가 실패) 이미 error 메시지가 원인을 설명하므로 range는 생략한다.
+				// 사용자에게는 "요청한 구간 중 어디가 안 끝났는지"를 보여준다 — 이어받기로
+				// 앞당겨진 window.from이 아니라 원래 요청한 구간이 기준이다.
 				const range =
 					mode === 'backfill' && window !== undefined
-						? { from: window.from, to: window.to }
+						? { from: window.requestedFrom ?? window.from, to: window.to }
 						: undefined;
 				subscriptionFailures.push({
 					apiName: api.apiName,
