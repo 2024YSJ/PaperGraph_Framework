@@ -1,6 +1,5 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { Log } from '../common/Log';
 import { ApiManagementModal } from './ApiManagementModal';
 import { ScheduleModal } from './ScheduleModal';
 import { formatSubscriptionProgress } from './CollectMiddlewares';
@@ -219,24 +218,6 @@ export class SettingTab extends PluginSettingTab {
 			.addButton((button) =>
 				button.setButtonText('시각화 열기').onClick(() => {
 					void this.plugin.activateVisualizationView();
-				}),
-			);
-
-		// ── 진단 로그 (임시) ──────────────────────────────────────────
-		// ⚠️ 삭제 예정 — Log.ts 상단 주석 참고. 콘솔 출력은 이 토글과 무관하게 항상 나가고,
-		// 이 토글은 vault의 collect-log.md 파일 기록만 켠다/끈다. 기본은 꺼짐이라(Log.ts
-		// 참고) 자동 수집처럼 눈에 안 보이는 백그라운드 동작을 진단할 땐 여기서 켜야 한다.
-		new Setting(containerEl).setName('진단 로그 (임시)').setHeading();
-
-		new Setting(containerEl)
-			.setName('파일에도 기록')
-			.setDesc(
-				`끄면 콘솔에만 남습니다(개발자 도구 → 콘솔, "PaperGraph"로 필터, 로그 레벨은 ` +
-					`All levels/Verbose). 켜면 ${Log.filePath()}에도 남깁니다.`,
-			)
-			.addToggle((toggle) =>
-				toggle.setValue(Log.isFileEnabled()).onChange((value) => {
-					Log.setFileEnabled(value);
 				}),
 			);
 	}

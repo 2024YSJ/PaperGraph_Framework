@@ -184,9 +184,6 @@ export default class PaperGraph3D extends Plugin {
 		// 색을 덮는다(끄면 인용 색으로 복원).
 		this.visualflow.setMiddleware(new ClusterColorMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
-		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
-		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
-		Log.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		// collectflow가 준비된 뒤에 만들어야 한다 — 생성자에서 바로 진단 미들웨어를
 		// collectflow에 등록한다(CollectController 참고).
@@ -271,8 +268,5 @@ export default class PaperGraph3D extends Plugin {
 		// 울릴 수 있다.
 		this.scheduler?.stop();
 		this.collectflow?.dispose();
-		// ⚠️ 임시 진단 코드 — 삭제 예정. flush 타이머가 안 치워지면 언로드 후에도 타이머가
-		// 남아 다음 로드 때 두 개의 타이머가 같은 파일을 두고 경쟁하게 된다.
-		Log.dispose();
 	}
 }
