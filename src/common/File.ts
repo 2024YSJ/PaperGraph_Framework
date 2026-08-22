@@ -1,4 +1,5 @@
 import { TFile, Vault } from 'obsidian';
+import { Log } from './Log';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
 import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
@@ -341,13 +342,28 @@ export class File {
 			.getFiles()
 			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
 		const papers: Paper[] = [];
+		let unreadable = 0;
 		for (const file of files) {
-			const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
-			const paper = Object.assign(new Paper(), wrapper.paper);
-			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
-			paper.collectedApis ??= [];
-			paper.collectedQueries ??= [];
-			papers.push(paper);
+			// 파일 하나가 깨졌다고 코퍼스 전체를 못 읽으면 안 된다. 수집 중 강제 종료·동기화
+			// 충돌로 .json이 손상되면 JSON.parse가 던지는데, 막지 않으면 그 예외가 밖으로
+			// 나가 멀쩡한 나머지 수천 편까지 사라진다(1편 때문에 시각화가 통째로 안 그려지는
+			// 것을 재현했다). 경로를 함께 남긴다 — 없으면 고칠 파일을 찾을 방법이 없다.
+			try {
+				const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
+				const paper = Object.assign(new Paper(), wrapper.paper);
+				// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
+				paper.collectedApis ??= [];
+				paper.collectedQueries ??= [];
+				papers.push(paper);
+			} catch (error) {
+				unreadable += 1;
+				Log.error('file', '논문 파일이 손상돼 건너뜀', error, { path: file.path });
+			}
+		}
+		// 개별 경로는 위에서 이미 남겼으므로 여기서는 총량만 알린다 — 손상이 여러 건이면
+		// 개별 줄이 흩어져 "몇 편이 빠졌는지"가 안 보인다.
+		if (unreadable > 0) {
+			Log.warn('file', `논문 ${unreadable}편이 손상돼 빠졌습니다`, { 읽은편수: papers.length });
 		}
 		return papers;
 	}
