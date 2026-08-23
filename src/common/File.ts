@@ -158,8 +158,29 @@ export class File {
 	static readSkippedEntries(): Promise<SkippedEntryRecord[]> {
 		return File.readConfig(
 			'SkippedEntries.json',
-			(raw) => (Array.isArray(raw) ? (raw as SkippedEntryRecord[]) : []),
+			(raw) => (Array.isArray(raw) ? raw.filter((v) => File.isValidSkippedEntryRecord(v)) : []),
 			() => [],
+		);
+	}
+
+	// 필드 하나라도 모양이 안 맞는 레코드는(수동 편집, 손상 등) 조용히 뺀다 — 이 파일은
+	// 7번(부분 재조회)의 임시 진단/재시도 보조용이라, 레코드 하나 이상해도 나머지가
+	// 정상 동작해야지 통째로 못 쓰게 되면 안 된다.
+	private static isValidSkippedEntryRecord(value: unknown): value is SkippedEntryRecord {
+		if (typeof value !== 'object' || value === null) {
+			return false;
+		}
+		const r = value as Partial<SkippedEntryRecord>;
+		return (
+			typeof r.rawId === 'string' &&
+			typeof r.title === 'string' &&
+			(r.reason === 'no-id' || r.reason === 'missing-fields') &&
+			typeof r.apiName === 'string' &&
+			typeof r.collectedQuery === 'object' &&
+			r.collectedQuery !== null &&
+			typeof r.collectedQuery.searchType === 'string' &&
+			typeof r.collectedQuery.query === 'string' &&
+			typeof r.skippedAt === 'number'
 		);
 	}
 
@@ -184,8 +205,34 @@ export class File {
 	static readBackfillProgress(): Promise<BackfillProgressRecord[]> {
 		return File.readConfig(
 			'BackfillProgress.json',
-			(raw) => (Array.isArray(raw) ? (raw as BackfillProgressRecord[]) : []),
+			(raw) => (Array.isArray(raw) ? raw.filter((v) => File.isValidBackfillProgressRecord(v)) : []),
 			() => [],
+		);
+	}
+
+	// findBackfillResumePoint가 이미 구간 밖 coveredThrough는 걸러내지만(사용 시점), 그건
+	// 값이 숫자라는 전제 위에서만 동작한다 — 필드 자체가 없거나 타입이 다르면 그 비교식이
+	// NaN 비교가 되어 조용히 false가 아니라 예측 못 할 값이 될 수 있다. 읽기 시점에
+	// 구조부터 확인한다.
+	private static isValidBackfillProgressRecord(value: unknown): value is BackfillProgressRecord {
+		if (typeof value !== 'object' || value === null) {
+			return false;
+		}
+		const r = value as Partial<BackfillProgressRecord>;
+		return (
+			typeof r.apiName === 'string' &&
+			Array.isArray(r.querys) &&
+			r.querys.every(
+				(q) =>
+					typeof q === 'object' &&
+					q !== null &&
+					typeof (q as Partial<SearchQuery>).searchType === 'string' &&
+					typeof (q as Partial<SearchQuery>).query === 'string',
+			) &&
+			typeof r.from === 'number' &&
+			typeof r.to === 'number' &&
+			typeof r.coveredThrough === 'number' &&
+			typeof r.updatedAt === 'number'
 		);
 	}
 
@@ -634,8 +681,29 @@ export class File {
 		if (text === null) {
 			return null;
 		}
-		const wrapper = JSON.parse(text) as StoredPaperFile;
+		// 손상된(잘린) .json은 "없다"와 동일하게 취급한다 — readPapersUnder가 스캔에서
+		// 손상 파일 하나를 건너뛰는 것과 같은 원칙. 여기서 안 막으면 이 논문이 걸리는
+		// 모든 구독의 청크 처리가 예외로 끊긴다(prefillFromStore가 구독 수집 도중 매
+		// 논문마다 이 함수를 부른다).
+		const wrapper = File.parseStoredPaperFile(text, jsonPath);
+		if (wrapper === null) {
+			return null;
+		}
 		return Object.assign(new Paper(), wrapper.paper);
+	}
+
+	// StoredPaperFile 파싱을 한 곳에 모은다 — readStoredPaper/writePaperAt이 손상된
+	// 파일을 같은 기준(파싱 실패 = 없는 것으로 취급)으로 다루게 한다. 파싱 실패는
+	// 흔치 않은 일이라 조용히 삼키지 않고 경고를 남긴다.
+	private static parseStoredPaperFile(text: string, path: string): StoredPaperFile | null {
+		try {
+			return JSON.parse(text) as StoredPaperFile;
+		} catch (error) {
+			Log.warn('papers', `손상된 논문 파일 — 없는 것으로 취급: ${path}`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return null;
+		}
 	}
 
 	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
@@ -687,7 +755,11 @@ export class File {
 		const mdPath = `${base}.md`;
 
 		const existingJson = await File.readVaultText(jsonPath);
-		const existing = existingJson ? (JSON.parse(existingJson) as StoredPaperFile) : null;
+		// 손상된 기존 파일은 "없던 자리에 새로 쓴다"로 처리한다 — createdAt이 지금 시각으로
+		// 리셋되고 collectedApis/embedding 백스톱(아래)이 안 걸리는 정도의 대가지만, 예외로
+		// 끊겨 이 논문을 영원히 다시 저장할 수 없는 것보다는 낫다(강제 종료로 쓰다 만
+		// 파일이 남으면 재현된다).
+		const existing = existingJson ? File.parseStoredPaperFile(existingJson, jsonPath) : null;
 		const createdAt = existing ? existing.createdAt : Date.now();
 
 		// 같은 sourceId(같은 파일 경로)로 다른 구독이 다시 써도, 먼저 저장된 구독의
@@ -931,6 +1003,10 @@ export class File {
 
 	// ── config 공통: encode/decode는 옵션(기본=평문 통과). Secret만 난독화 변환을 넘긴다.
 
+	// 손상된(잘린) 파일은 없는 것과 동일하게 취급해 fallback()으로 넘어간다 — 강제
+	// 종료로 쓰다 만 파일이 남으면(특히 BackfillProgress.json처럼 라운드마다 쓰이는
+	// 파일) 재현된다. 실측: 잘린 JSON을 읽으면 이전엔 그 config가 필요한 기능 전체가
+	// 예외로 막혔다(예: backfill이 영원히 시작 못 함). 조용히 삼키지 않고 경고는 남긴다.
 	private static async readConfig<T>(
 		name: string,
 		revive: (raw: unknown) => T,
@@ -942,16 +1018,44 @@ export class File {
 			return fallback();
 		}
 		const text = await decode(await File.vault.adapter.read(path));
-		return revive(JSON.parse(text));
+		// JSON.parse만 감싼다 — revive()는 감싸면 안 된다. revive는 "unknown apiName이면
+		// 크게 실패해야 한다"(readSubscriptions.createApi) 같은 의도된 도메인 에러를 던질
+		// 수 있는데, 여기서 넓게 삼키면 그 의도된 throw까지 조용히 기본값으로 덮어버린다
+		// (실제로 회귀 테스트가 잡음). 파싱 자체가 깨진 경우만 "손상됨"으로 본다.
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			Log.warn('config', `손상된 설정 파일 — 기본값으로 대체: ${path}`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return fallback();
+		}
+		return revive(parsed);
 	}
 
+	// 임시 파일에 먼저 쓰고 rename으로 갈아끼운다 — adapter.write를 직접 쓰면 쓰는
+	// 도중 전원이 끊겼을 때 그 자리에 반쯤 쓰인(잘린) JSON이 남는다(readConfig가 막 위에서
+	// 겪는 손상의 원인). rename은 원자적이라 중간 상태가 없다 — 성공하면 새 내용 전체,
+	// 실패하면(그 직전에 죽었으면) 옛 내용 그대로다.
+	//
+	// ⚠️ Windows의 fs.rename은 대상이 이미 있으면 실패한다(POSIX와 다름) — 그래서 먼저
+	// 지운다. 지운 직후~rename 사이의 극히 짧은 창에 죽으면 파일이 "없음"이 되는데,
+	// readConfig의 fallback()이 이미 그 상태를 정상적으로 처리한다 — 손상보다 훨씬
+	// 안전한 실패 모드다.
 	private static async writeConfig(
 		name: string,
 		data: unknown,
 		encode: (text: string) => Promise<string> | string = (t) => t,
 	): Promise<void> {
 		const text = await encode(JSON.stringify(data, null, 2));
-		await File.vault.adapter.write(`${File.pluginDir}/${name}`, text);
+		const path = `${File.pluginDir}/${name}`;
+		const tempPath = `${path}.tmp`;
+		await File.vault.adapter.write(tempPath, text);
+		if (await File.vault.adapter.exists(path)) {
+			await File.vault.adapter.remove(path);
+		}
+		await File.vault.adapter.rename(tempPath, path);
 	}
 
 	// ── 콘텐츠 트리 텍스트 I/O (.json/.md 공용) ─────────────────────────
