@@ -1,4 +1,34 @@
-import { Notice } from 'obsidian';
+import { App, Modal, Notice, Setting } from 'obsidian';
+
+// 되돌리기 번거롭거나 비용이 큰 동작(예: 코퍼스 전체 새로고침) 전에 한 번 더 확인받기
+// 위한 범용 확인창. 클래스로 따로 빼지 않고 함수 하나로 둔 이유: 상태라고는 "확인했는가"
+// 뿐이라 Promise<boolean> 하나로 충분하고, 별도 파일까지 만들 만큼 복잡하지 않다.
+export function confirmAction(
+	app: App,
+	title: string,
+	message: string,
+	confirmText = '확인',
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		let confirmed = false;
+		const modal = new Modal(app);
+		modal.titleEl.setText(title);
+		modal.contentEl.createEl('p', { text: message });
+		new Setting(modal.contentEl)
+			.addButton((button) => button.setButtonText('취소').onClick(() => modal.close()))
+			.addButton((button) =>
+				button
+					.setButtonText(confirmText)
+					.setCta()
+					.onClick(() => {
+						confirmed = true;
+						modal.close();
+					}),
+			);
+		modal.onClose = () => resolve(confirmed);
+		modal.open();
+	});
+}
 
 // "이유가 바뀔 때만 알린다"(once-per-reason 게이팅) — 예전 PaperGraph3D 프로젝트의
 // Scheduler.notifyFailure(FR-012a)와 같은 취지다. 자동 실행(스케줄러, 신규 구독 등록

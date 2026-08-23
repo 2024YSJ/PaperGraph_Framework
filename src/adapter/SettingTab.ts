@@ -2,6 +2,7 @@ import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { ApiManagementModal } from './ApiManagementModal';
 import { ScheduleModal } from './ScheduleModal';
+import { confirmAction } from '../common/Notify';
 import { formatSubscriptionProgress } from './CollectMiddlewares';
 
 export class SettingTab extends PluginSettingTab {
@@ -105,7 +106,18 @@ export class SettingTab extends PluginSettingTab {
 				'저장된 모든 논문의 인용수·제목·초록을 다시 조회하고, 내용이 바뀐 논문만 임베딩을 다시 계산합니다.',
 			)
 			.addButton((button) =>
+				// 코퍼스 전체를 대상으로 하는 작업이라 논문이 쌓일수록 비용도 같이 커진다 —
+				// 다른 버튼과 달리 실수로 눌렀을 때 되돌리기 번거로우므로 확인을 한 번 거친다.
+				// 리본 아이콘(main.ts)도 같은 이벤트를 재사용하므로 거기서도 같은 확인을 거친다.
 				button.setButtonText('새로고침').onClick(async () => {
+					const ok = await confirmAction(
+						this.app,
+						'전체 새로고침',
+						'저장된 모든 논문의 인용수·제목·초록을 다시 조회합니다. 논문 수가 많을수록 시간이 오래 걸릴 수 있습니다. 계속하시겠습니까?',
+					);
+					if (!ok) {
+						return;
+					}
 					try {
 						await this.plugin.eventListener.checking('ui:collect-refresh');
 					} catch (e) {

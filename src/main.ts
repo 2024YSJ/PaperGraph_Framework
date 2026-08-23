@@ -20,6 +20,7 @@ import { Task } from './common/Task';
 import { Scheduler } from './common/Scheduler';
 import { File } from './common/File';
 import { Log } from './common/Log';
+import { confirmAction } from './common/Notify';
 import { SettingTab } from './adapter/SettingTab';
 import { ApiManagementModal } from './adapter/ApiManagementModal';
 import { ScheduleModal } from './adapter/ScheduleModal';
@@ -119,11 +120,24 @@ export default class PaperGraph3D extends Plugin {
 		// 새로고침(전체 코퍼스 강제 재조회)은 지금까지 설정 탭 버튼으로만 접근할 수
 		// 있었다 — 수집/구독 관리처럼 자주 쓰는 진입점이라 왼쪽 리본에도 바로가기를
 		// 추가한다. 실행 로직은 설정 탭 버튼과 동일하게 'ui:collect-refresh' 이벤트를
-		// 그대로 재사용한다(SettingTab.ts 참고).
+		// 그대로 재사용한다(SettingTab.ts 참고). 코퍼스가 클수록 비용도 커지는 작업이라
+		// 리본에서도 설정 탭과 동일하게 확인을 한 번 거친다.
 		this.addRibbonIcon('refresh-cw', '새로고침', () => {
-			void this.eventListener.checking('ui:collect-refresh').catch((e) => {
-				new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
-			});
+			void (async () => {
+				const ok = await confirmAction(
+					this.app,
+					'전체 새로고침',
+					'저장된 모든 논문의 인용수·제목·초록을 다시 조회합니다. 논문 수가 많을수록 시간이 오래 걸릴 수 있습니다. 계속하시겠습니까?',
+				);
+				if (!ok) {
+					return;
+				}
+				try {
+					await this.eventListener.checking('ui:collect-refresh');
+				} catch (e) {
+					new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
+				}
+			})();
 		});
 
 		this.addCommand({
