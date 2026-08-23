@@ -8,6 +8,17 @@ export interface SubscriptionTarget {
 	querys: SearchQuery[];
 }
 
+// querys가 빈 구독을 이 선택 창의 목록에서 뺀다. File.readSubscriptions는 이런 구독을
+// 일부러 완전히 안 지우고 남겨두지만(apiName 자체가 미등록이면 File.createApi가
+// "Unknown apiName"으로 크게 실패해야 하므로 — File.ts 주석 참고), 그건 저장 계층의
+// 안전장치일 뿐 이 선택 창이 빈 라벨의 토글을 보여줄 이유는 아니다. 이런 구독을
+// 선택해 "실행"해도 buildUrl이 "querys is empty"로 그 자리에서 던질 뿐이라(수동
+// 편집으로 조건이 전부 걸러진 경우 실제 재현됨) 애초에 고를 게 없다 — 정리는
+// API/구독 관리 창에서 하면 된다.
+export function hasCollectableConditions(api: SubscriptionTarget): boolean {
+	return api.querys.length > 0;
+}
+
 interface SubscriptionOption extends SubscriptionTarget {
 	label: string;
 	selected: boolean;
@@ -94,13 +105,15 @@ export class SubscriptionTargetModal extends Modal {
 	private async load(): Promise<void> {
 		try {
 			const subscriptions = await File.readSubscriptions();
-			this.options = subscriptions.apis.map((api) => ({
-				apiName: api.apiName,
-				querys: api.querys,
-				// apiName 접두어는 뺀다 — 그룹 헤더(render()의 renderGroups)가 이미 보여준다.
-				label: api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
-				selected: true,
-			}));
+			this.options = subscriptions.apis
+				.filter(hasCollectableConditions)
+				.map((api) => ({
+					apiName: api.apiName,
+					querys: api.querys,
+					// apiName 접두어는 뺀다 — 그룹 헤더(render()의 renderGroups)가 이미 보여준다.
+					label: api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
+					selected: true,
+				}));
 		} catch (e) {
 			new Notice(`구독 목록을 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
 		}

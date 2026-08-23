@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { parseLocalDateInput } from '../src/adapter/SubscriptionTargetModal';
+import { hasCollectableConditions, parseLocalDateInput } from '../src/adapter/SubscriptionTargetModal';
 
 describe('parseLocalDateInput', () => {
 	it('올바른 YYYY-MM-DD는 로컬 자정 timestamp로 파싱된다', () => {
@@ -44,5 +44,26 @@ describe('parseLocalDateInput', () => {
 	it('윤년 2월 29일은 통과한다 — 검증이 과하게 막지 않는다', () => {
 		assert.notEqual(parseLocalDateInput('2024-02-29'), undefined);
 		assert.equal(parseLocalDateInput('2025-02-29'), undefined);
+	});
+});
+
+describe('hasCollectableConditions', () => {
+	// File.readSubscriptions는 조건이 전부 걸러진 구독(querys: [])을 파일에서 완전히
+	// 안 지운다(File.ts 주석 참고 — apiName 미등록 구독을 조용히 지우는 사고를 막는
+	// 안전장치와 같은 코드 경로를 타서). 그 결과가 이 선택 창에도 그대로 흘러들어와
+	// 빈 라벨의 토글로 뜨던 문제(실사용 재현: 수동 편집으로 카테고리 조건이 걸러진
+	// 구독이 "실행" 대상으로 선택 가능하게 남음)를 이 필터가 막는다.
+	it('querys가 빈 구독은 걸러진다', () => {
+		assert.equal(hasCollectableConditions({ apiName: 'arxiv', querys: [] }), false);
+	});
+
+	it('조건이 하나라도 있으면 통과한다', () => {
+		assert.equal(
+			hasCollectableConditions({
+				apiName: 'arxiv',
+				querys: [{ searchType: 'keyword', query: 'graph' }],
+			}),
+			true,
+		);
 	});
 });
