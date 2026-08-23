@@ -511,6 +511,15 @@ export class CollectController implements CollectProgressSink {
 					`수집 경로(프록시 등)를 확인하세요`,
 			);
 		}
+		if (stats.droppedInvalidConditions) {
+			// 9번/69번 화이트리스트로 걸러진 구독 조건 — 걸러진 구독은 이미 File 계층에서
+			// 완전히 삭제된다. 여기 buildPartialFailureSuffix에만 넣는 이유: 이 문자열은
+			// 수동 실행(runCollectFlow)의 완료 Notice에만 반영되고, 자동/silent 실행은
+			// 반환값을 애초에 안 쓴다(runRecentAuto 등) — 그래서 "구독이 잘못돼서 0편
+			// 모였다"는 사실을 수동으로 눌렀을 때는 알리되, 자동 수집마다 별도 Notice로
+			// 반복해서 띄우지는 않는다(checkStructuralFailures 참고 — 그쪽은 뺐다).
+			parts.push('일부 구독 조건이 허용되지 않는 형식이라 무시됨 — 구독 관리에서 확인하세요');
+		}
 		if (stats.failedSubscriptions.length > 0) {
 			// 사유(f.error, CollectAndSave.collect의 describeFailure — "HTTP 503" 등 짧은
 			// 형태)와 힌트(f.hint — "그래서 뭘 확인하면 되는지")까지 같이 보여준다. 어느
