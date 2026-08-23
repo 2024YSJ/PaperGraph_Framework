@@ -58,6 +58,22 @@ export class ApiManagementModal extends Modal {
 		);
 	}
 
+	// 저장 직전 마지막 관문 — persistSubscriptions가 이 draft를 실제로 쓰기 전에 부른다.
+	// "필드에 추가" 버튼이 쓰는 것과 같은 기준(descriptor.conditionFields)으로 다시
+	// 검사한다 — 개발자 도구로 그 버튼의 검사를 우회해 이상한 필드명을 카드에 얹어도,
+	// 여기서 걸리면 저장이 통째로 취소된다. apiName 자체가 모르는 값이면(등록 안 된
+	// 출처) 첫 조건을 그대로 "무효"로 돌려준다 — 검사할 기준(conditionFields)조차 없다.
+	private static findInvalidCondition(draft: ApiDraft): { searchType: string } | undefined {
+		const fields = findDescriptor(draft.apiName)?.conditionFields;
+		if (!fields) {
+			return draft.conditions[0];
+		}
+		return draft.conditions.find((condition) => {
+			const field = fields.find((f) => f.name === condition.searchType);
+			return !field || !field.validate(condition.query);
+		});
+	}
+
 	// 지금 폼에 입력 중인 provider·키 값. KEY_VALIDATORS가 provider 선택지의 유일한
 	// 진실이다 — 구독 API 목록(File.supportedApiNames)과는 다른 레지스트리다: 구독은
 	// "수집 출처"(arxiv 등, 키가 필요 없을 수도 있음)를, 이건 "키로 인증하는 보강용
@@ -476,6 +492,23 @@ export class ApiManagementModal extends Modal {
 		// 조건이 1개 이상인 초안만 저장 대상이다 — 0개인 채로 저장하면 다음 수집이
 		// "querys is empty"로 반드시 실패한다.
 		const ready = this.apiDrafts.filter((draft) => draft.conditions.length > 0);
+
+		// 개발자 도구로 드롭다운에 없는 필드명을 끼워 넣고 저장하면(9번, 실제 재현됨),
+		// File.writeSubscriptions의 sanitizeQuerys가 그 조건만 조용히 걸러내고 나머지는
+		// 저장했다 — 그런데 이 함수는 ready 전체를 "저장됨"으로 표시해서, 화면엔 걸러진
+		// 조건까지 "저장됨" 배지가 붙은 채로 남았다(실제 디스크엔 없는데 UI만 저장된 것처럼
+		// 보임). Notice로 알리고 마는 대신, 여기서 미리 검사해 하나라도 안 맞으면 저장
+		// 자체를 통째로 거부한다 — 부분 저장을 허용하지 않는다.
+		for (const draft of ready) {
+			const invalid = ApiManagementModal.findInvalidCondition(draft);
+			if (invalid) {
+				new Notice(
+					`${draft.apiName}의 "${invalid.searchType}" 조건이 이 출처가 지원하는 형식이 아닙니다 — ` +
+						`그 조건을 지우고 다시 저장하세요. 저장이 취소되었습니다.`,
+				);
+				return false;
+			}
+		}
 
 		// 같은 API+조건 조합이 두 개 이상이면 커서 갱신이 어느 쪽으로 갈지 모호해진다
 		// (File.updateApiCursors의 .find()가 첫 매치만 고른다) — 저장 시점에 막는다.
