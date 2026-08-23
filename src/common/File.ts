@@ -355,14 +355,25 @@ export class File {
 						}
 						return { ...apiData, querys: sanitized };
 					})
-					// 유효한 조건이 하나도 안 남았다고 여기서 구독 자체를 통째로 빼면 안 된다 —
-					// apiName이 애초에 모르는 값이라 querys를 검증할 기준조차 없는 경우
-					// (QUERY_VALIDATORS에 없음)도 이 조건에 걸리는데, 그런 항목은 조용히
-					// 사라지는 대신 아래 createApi가 "Unknown apiName"으로 크게 실패해야
-					// 한다(팀원이 새 API를 추가한 브랜치에서 저장한 파일을 구버전이 열어
-					// 조용히 그 구독을 지워버리는 사고를 막는 안전장치, 기존 테스트로 고정됨).
-					// searchType/category 값이 정말 걸러진 경우는 querys가 빈 채로 createApi까지
-					// 가고, 실제 수집 시점(buildUrl)에서 "querys is empty"로 드러난다.
+					// apiName이 등록돼 있는데(findDescriptor가 값을 돌려줌) 조건이 전부
+					// 무효라 걸러진 구독은 여기서 완전히 뺀다 — sanitizeQuerys는 apiName을
+					// 모를 때만 querys를 그대로 통과시키므로(findDescriptor가 undefined면
+					// 필터링 자체를 안 함), "필터링이 실제로 실행됐는데 결과가 비었다"는
+					// apiName은 확실히 알고 있다는 뜻이다. 이 구독을 완전히 지워도 미등록
+					// apiName 사고와는 무관하다.
+					//
+					// 반대로 apiName 자체를 모르면(findDescriptor === undefined) querys가
+					// 비어 있어도 여기서 빼지 않는다 — 팀원이 새 API를 추가한 브랜치에서
+					// 저장한 파일을 구버전이 열었을 때, 그 구독이 조용히 사라지는 대신
+					// 아래 createApi가 "Unknown apiName"으로 크게 실패해야 한다(기존 테스트로
+					// 고정됨 — apiName: 'pubmed', querys: [] 케이스).
+					.filter((apiData) => {
+						if (apiData.querys.length === 0 && findDescriptor(apiData.apiName) !== undefined) {
+							droppedAny = true;
+							return false;
+						}
+						return true;
+					})
 					.filter((apiData) => {
 						const key = `${apiData.apiName}::${JSON.stringify(apiData.querys)}`;
 						if (seen.has(key)) {

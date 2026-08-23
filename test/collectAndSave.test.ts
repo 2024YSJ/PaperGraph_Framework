@@ -1304,6 +1304,31 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 		);
 		await assert.rejects(() => File.readSubscriptions(), /Unknown apiName: pubmed/);
 	});
+
+	it('알려진 apiName인데 조건이 전부 무효로 걸러졌으면 구독 자체를 없앤다', async () => {
+		// arxiv는 등록된 apiName이라 sanitizeQuerys가 실제로 검증을 실행한다 — 그 결과
+		// querys가 비었다는 건 "이 구독은 원래도 있던 게 아니라 조건이 다 무효였다"는
+		// 뜻이지, 위 pubmed 케이스(apiName 자체를 몰라 검증을 아예 안 한 경우)와 다르다.
+		// 완전히 지워도 "미등록 API가 조용히 사라지는 사고"와는 무관하다 — 남겨두면
+		// 라벨 없는 빈 구독이 수집 대상 선택 창 등에 계속 떠서(실사용 재현) 더 혼란스럽다.
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'malicious', query: 'x' }] },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: '정상' }] },
+				],
+			}),
+		);
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis.length, 1, '무효 조건뿐이던 구독이 그대로 남아있다');
+		assert.equal(subscriptions.apis[0]?.querys[0]?.query, '정상');
+
+		// 파일에도 그대로 되돌려 써야 한다(자가 복구) — 다시 읽어도 여전히 1개여야 한다.
+		const raw = vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '';
+		const stored = JSON.parse(raw) as { apis: unknown[] };
+		assert.equal(stored.apis.length, 1, '되돌려 쓴 파일에도 빈 구독이 남아있다');
+	});
 });
 
 // ── 구독별 커서 ─────────────────────────────────────────────────────
