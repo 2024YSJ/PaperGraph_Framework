@@ -146,11 +146,7 @@ export class ApiManagementModal extends Modal {
 		new Setting(contentEl)
 			.setName('API 키')
 			.setDesc(
-				'Semantic Scholar 등 외부 API 호출에 실어 보낼 개인 키를 등록합니다. API 연동 ' +
-					'자체는 코드로 이미 구현되어 있고, 이 키는 그 위에서 내 계정의 요청 한도를 쓰기 ' +
-					'위한 선택 사항입니다 — 키가 없어도 익명으로 호출되지만, 다른 모든 익명 ' +
-					'사용자와 한도를 나눠 써서 요청이 자주 막힙니다. provider를 먼저 고르고 키를 ' +
-					'저장하면, 저장 즉시 그 provider에 실제로 요청을 보내 유효한지 바로 확인합니다.',
+				'Semantic Scholar 등 외부 API 호출에 실어 보낼 개인 키를 등록합니다.'
 			)
 			.setHeading();
 
@@ -764,9 +760,7 @@ export class ApiManagementModal extends Modal {
 			.setDesc(
 				`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). ` +
 					'여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요. ' +
-					'키워드/저자 값에 큰따옴표나 AND·OR 같은 단어가 들어있어도 검색 연산자로 해석되지 않고 ' +
-					'그 문자 그대로(리터럴 문구)로 검색됩니다 — 특수문자를 넣을 의도가 아니었다면 결과가 ' +
-					'0편이거나 예상과 다를 수 있습니다.',
+					'정확한 조건이 아니면 수집 0편으로 표기 됩니다.',
 			)
 			.addDropdown((dropdown) => {
 				for (const field of fields) {
