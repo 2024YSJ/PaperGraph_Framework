@@ -1,4 +1,4 @@
-import { App, Notice, TFile } from 'obsidian';
+import { App, Notice, TFile, TFolder } from 'obsidian';
 import type { ForceGraph3DInstance } from '3d-force-graph';
 import { Middleware, MiddlewareType } from '../common/Middleware';
 import { Log } from '../common/Log';
@@ -30,6 +30,11 @@ const CONFIG_SCHEMA_VERSION = 2;
 // 설정 파일이 없을 때(최초 실행)의 기본값 — 예전 하드코딩 동작과 100% 호환.
 const DEFAULT_FOLDER_PATH = 'PersonalNotes';
 const DEFAULT_FOLDER_PATHS = [DEFAULT_FOLDER_PATH];
+// 경로 입력칸의 placeholder(예시일 뿐 실제 채워지는 값이 아님). DEFAULT_FOLDER_PATH를
+// 그대로 쓰면 "빈 칸일 때 실제로 적용되는 기본값"과 "그냥 예시"가 헷갈린다 — 특히
+// PersonalNotes/PaperGraph3D 관련 경로 혼동을 겪은 뒤라 더 그렇다. 실제 기본 경로와
+// PAPER_GRAPH_ROOT 어느 쪽과도 겹치지 않는 별개 예시를 쓴다.
+const PATH_INPUT_PLACEHOLDER = '예: Notes/Papers';
 // 노트 노드의 sourceId 접두사. 런타임에 "이 GraphNode가 논문이 아니라 노트다"를 판별하는
 // 유일한 수단이다(GraphNode/Paper 타입을 확장하지 않기로 했으므로).
 const NOTE_SOURCE_PREFIX = 'note:';
@@ -67,6 +72,16 @@ export class PersonalNoteMiddleware implements Middleware {
 	// run()마다 새로 채운다 — 클릭 핸들러가 sourceId로 실제 파일을 찾을 때 쓴다.
 	private noteFilesBySourceId = new Map<string, TFile>();
 
+	// QA #81: 시각화 창을 열었다 닫았다 빠르게 반복하면(VisualizationView.onClose는 진행
+	// 중인 run()을 기다리거나 취소하지 않는다) 이전 run()의 노트 임베딩 루프가 아직 도는
+	// 중에 onOpen이 VisualizationFlow.run()을 다시 불러 이 미들웨어의 run()도 겹쳐 돈다.
+	// this.embedding은 이 미들웨어와 논문 수집이 공유하는 인스턴스라(생성자 참고),
+	// Embedding.embed()는 세션/서킷브레이커를 락 없이 공유해 순차 호출만 안전한데(아래
+	// 루프 주석 참고) 두 run()이 겹치면 그 전제가 깨진다 — 이게 "개인 노트 임베딩 오류
+	// 메시지가 간헐적으로 출력됨"의 원인으로 보인다. run()마다 세대 번호를 매겨, 최신
+	// run()이 아니게 된 실행은 더 이상 embed()를 부르지 않고 스스로 멈춘다.
+	private runGeneration = 0;
+
 	constructor(
 		private app: App,
 		private embedding: Embedding,
@@ -77,6 +92,7 @@ export class PersonalNoteMiddleware implements Middleware {
 	) {}
 
 	async run(context: unknown): Promise<void> {
+		const generation = ++this.runGeneration;
 		const graph = context as GraphData;
 		this.noteFilesBySourceId.clear();
 
@@ -88,12 +104,30 @@ export class PersonalNoteMiddleware implements Middleware {
 
 		const config = await this.readConfig();
 
+		// readConfig 대기 중에 더 최신 run()이 시작됐으면 여기서 멈춘다 — 아래 embed()
+		// 루프까지 가지 않는다(위 runGeneration 주석 참고).
+		if (generation !== this.runGeneration) {
+			return;
+		}
+
+		// PAPER_GRAPH_ROOT 하위·볼트 밖을 가리키는 경로·금지 문자가 섞인 경로는 설정에
+		// 남아 있어도 절대 노트 소스로 취급하지 않는다. UI(normalizeFolderPaths)가 입력을
+		// 막아도, 이 픽스 이전에 저장된 config.json이나 수동 편집으로 여전히 들어와 있을
+		// 수 있어 여기서도 방어한다 — 안 그러면 논문 md 자체가 "노트"로 재임베딩되거나
+		// 캐시 폴더를 지정해 파이프라인이 깨진다.
+		const validFolderPaths = config.folderPaths.filter(
+			(folderPath) =>
+				!PersonalNoteMiddleware.isWithinPaperGraphRoot(folderPath) &&
+				!PersonalNoteMiddleware.isOutsideVaultPath(folderPath) &&
+				!PersonalNoteMiddleware.hasInvalidPathChars(folderPath),
+		);
+
 		const noteFiles =
-			config.folderPaths.length > 0
+			validFolderPaths.length > 0
 				? this.app.vault
 						.getMarkdownFiles()
 						.filter((file) =>
-							config.folderPaths.some(
+							validFolderPaths.some(
 								(folderPath) => file.path === folderPath || file.path.startsWith(`${folderPath}/`),
 							),
 						)
@@ -113,6 +147,13 @@ export class PersonalNoteMiddleware implements Middleware {
 				);
 			}
 
+			// isModelInstalled 대기 중에도 더 최신 run()이 시작될 수 있다 — 여기서 멈추면
+			// resetCircuitBreaker()가 그 최신 run()이 이미 진행 중인 임베딩 상태를 건드리지
+			// 않는다.
+			if (generation !== this.runGeneration) {
+				return;
+			}
+
 			// CollectAndSave.run()/repairEmbeddingsBody()와 같은 패턴 — 새 배치를 시작하기
 			// 전에 서킷브레이커를 리셋한다. 안 하면 이전 배치(논문 수집이든 이전 그래프
 			// 열람이든)에서 트립된 상태가 남아 있을 때, 이번 노트들이 멀쩡한데도 첫 시도부터
@@ -130,6 +171,12 @@ export class PersonalNoteMiddleware implements Middleware {
 			// await 사이마다 브라우저가 그릴 기회를 얻어 진행 표시가 실시간으로 갱신된다.
 			try {
 				for (const [index, file] of noteFiles.entries()) {
+					// 이 배치 도중 더 최신 run()이 시작됐으면(창을 닫았다 빠르게 다시 연
+					// 경우 등) 여기서 멈춘다 — 계속 돌면 두 run()의 embed() 호출이 겹쳐
+					// this.embedding의 순차 호출 전제를 깬다(위 runGeneration 주석 참고).
+					if (generation !== this.runGeneration) {
+						break;
+					}
 					progress?.update(index + 1);
 					try {
 						const node = await this.buildNoteNode(file, graph, modelInstalled);
@@ -557,7 +604,7 @@ export class PersonalNoteMiddleware implements Middleware {
 				const input = row.createEl('input', { cls: 'papergraph3d-note-path-input' });
 				input.type = 'text';
 				input.value = path;
-				input.placeholder = DEFAULT_FOLDER_PATH;
+				input.placeholder = PATH_INPUT_PLACEHOLDER;
 				input.addEventListener('input', () => {
 					paths[index] = input.value;
 				});
@@ -579,10 +626,82 @@ export class PersonalNoteMiddleware implements Middleware {
 			renderPathRows();
 		});
 
+		// QA #85: 적용 처리 중(rerun 진행 중)에 경로 필드를 추가/편집/삭제하거나 노트 표시
+		// 토글을 건드릴 수 있었다 — 어차피 성공하면 rerun()이 끝에서 패널 전체를 새로
+		// 그리며 그 사이의 편집은 조용히 버려지고, 체크박스 토글은 별도로 writeConfig를
+		// 불러 이 적용의 writeConfig와 경합할 수도 있었다. 처리 중에는 패널의 모든
+		// 입력/버튼을 잠가 혼란과 경합을 둘 다 막는다.
+		const setPanelLocked = (locked: boolean): void => {
+			panel.querySelectorAll('input, button').forEach((el) => {
+				(el as HTMLInputElement | HTMLButtonElement).disabled = locked;
+			});
+		};
+
 		const applyButton = panel.createEl('button', { text: '적용' });
 		applyButton.addEventListener('click', () => {
-			const folderPaths = PersonalNoteMiddleware.normalizeFolderPaths(paths);
-			applyButton.disabled = true;
+			const {
+				accepted: folderPaths,
+				rejectedOutsideVault,
+				rejectedInvalid,
+				rejectedPaperGraphRoot,
+				rejectedNonexistent,
+			} = this.normalizeFolderPaths(paths);
+			const hasRejected =
+				rejectedOutsideVault.length > 0 ||
+				rejectedInvalid.length > 0 ||
+				rejectedPaperGraphRoot.length > 0 ||
+				rejectedNonexistent.length > 0;
+			if (hasRejected) {
+				// 원인마다 다른 안내를 띄운다 — 뭉뚱그리면 "왜 안 되는지" 알기 어렵다(QA #68:
+				// 볼트 밖 경로가 조용히 "0개 수집중"으로만 뜨던 문제).
+				if (rejectedOutsideVault.length > 0) {
+					PersonalNoteMiddleware.notify(
+						`볼트 바깥을 가리키는 경로는 사용할 수 없습니다 — 제외됨: ${rejectedOutsideVault.join(', ')}`,
+					);
+				}
+				if (rejectedInvalid.length > 0) {
+					PersonalNoteMiddleware.notify(
+						`사용할 수 없는 문자가 포함된 경로입니다 — 제외됨: ${rejectedInvalid.join(', ')}`,
+					);
+				}
+				if (rejectedPaperGraphRoot.length > 0) {
+					PersonalNoteMiddleware.notify(
+						`"${PAPER_GRAPH_ROOT}" 폴더(및 하위 경로)는 개인 노트 폴더로 지정할 수 없습니다 — 제외됨: ${rejectedPaperGraphRoot.join(', ')}`,
+					);
+				}
+				if (rejectedNonexistent.length > 0) {
+					PersonalNoteMiddleware.notify(
+						`볼트에 존재하지 않는 폴더라 유효하지 않은 경로입니다 — 제외됨: ${rejectedNonexistent.join(', ')}`,
+					);
+				}
+				// 거부된 경로가 있으면 저장/재실행을 아예 진행하지 않는다 — 입력 목록에서
+				// 거부된 값만 지우고 사용자가 다시 "적용"을 눌러야 나머지 경로가 반영된다.
+				// (거부와 저장을 한 클릭에서 같이 처리하면 반쯤 적용된 상태로 rerun이 걸려
+				// 버튼이 계속 비활성으로 남는 사례가 있었다 — QA 재현.)
+				paths.length = 0;
+				paths.push(...(folderPaths.length > 0 ? folderPaths : ['']));
+				renderPathRows();
+				return;
+			}
+			// 경로를 하나도 안 고쳤거나(빈 칸 행만 추가하고 채우지 않은 경우 포함) 결과가
+			// 저장된 값과 똑같으면 저장/재실행을 건너뛴다 — 매번 전체 파이프라인(전체 논문
+			// 재로드 -> PCA -> 모든 시각화 미들웨어 -> 렌더)을 다시 도는 건 비용이 크다.
+			if (PersonalNoteMiddleware.sameFolderSet(folderPaths, config.folderPaths)) {
+				PersonalNoteMiddleware.notify('경로에 변경 사항이 없어 적용하지 않았습니다.');
+				paths.length = 0;
+				paths.push(...(folderPaths.length > 0 ? folderPaths : ['']));
+				renderPathRows();
+				return;
+			}
+			setPanelLocked(true);
+			// rerun()은 이 미들웨어만 도는 게 아니라 VisualizationFlow.run() 전체(전체 논문
+			// 재로드 -> PCA -> 모든 시각화 미들웨어 -> 렌더)를 다시 돈다 — 노트가 몇 개 안 돼도
+			// 논문이 많은 그래프에서는 눈에 띄게 오래 걸릴 수 있다. QA #4: 이 대기 시간 동안
+			// 버튼이 그냥 "적용"인 채로 흐려지기만 해서 "눌러도 반응 없음/활성화 안 됨"으로
+			// 오인됐다 — 처리 중임을 텍스트로도 드러낸다. (rerun()이 성공하면 render()가
+			// container를 갈아치우면서 이 패널 자체가 새 패널로 교체되므로, 아래 finally의
+			// 복원은 실패/조기 반환 등 이 패널이 그대로 남는 경우에만 의미가 있다.)
+			applyButton.setText('적용 중…');
 			void this.writeConfig({ ...config, folderPaths })
 				.then(() => this.rerun())
 				.then(() => {
@@ -596,7 +715,8 @@ export class PersonalNoteMiddleware implements Middleware {
 					);
 				})
 				.finally(() => {
-					applyButton.disabled = false;
+					setPanelLocked(false);
+					applyButton.setText('적용');
 				});
 		});
 	}
@@ -606,17 +726,100 @@ export class PersonalNoteMiddleware implements Middleware {
 		return raw.trim().replace(/^\/+/, '').replace(/\/+$/, '');
 	}
 
-	// 각 행을 정리하고, 빈 입력(사용자가 지우고 안 채운 행)과 중복 경로는 저장에서 뺀다.
-	private static normalizeFolderPaths(raw: string[]): string[] {
+	// 두 경로 목록이 (순서 무시하고) 같은 집합인지. "적용"이 실제로 뭔가 바꾸는지 판단하는
+	// 데 쓴다 — b(저장된 config.folderPaths)는 과거에 이미 normalizeFolderPath를 거쳐
+	// 저장된 값일 수도, 아닐 수도 있어(구버전 스키마 등) 여기서도 다시 정규화해 비교한다.
+	private static sameFolderSet(a: string[], b: string[]): boolean {
+		const normalize = (list: string[]): string[] =>
+			[
+				...new Set(
+					list.map((p) => PersonalNoteMiddleware.normalizeFolderPath(p)).filter((p) => p.length > 0),
+				),
+			].sort();
+		const na = normalize(a);
+		const nb = normalize(b);
+		return na.length === nb.length && na.every((value, index) => value === nb[index]);
+	}
+
+	// 각 행을 정리하고, 빈 입력(사용자가 지우고 안 채운 행)·중복 경로·볼트 밖을 가리키는
+	// 경로·금지 문자가 섞인 경로·PAPER_GRAPH_ROOT 하위 경로(논문/캐시/설정이 있는 곳)·볼트에
+	// 실제로 존재하지 않는 경로는 저장에서 뺀다. 거부 종류를 따로 모으는 이유는 원인마다
+	// 사용자에게 다른 안내를 보여주기 위함 — 뭉뚱그리면 "왜 안 되는지" 알기 어렵다.
+	// (인스턴스 메서드인 이유: 존재 확인에 this.app.vault가 필요하다.)
+	private normalizeFolderPaths(raw: string[]): {
+		accepted: string[];
+		rejectedOutsideVault: string[];
+		rejectedInvalid: string[];
+		rejectedPaperGraphRoot: string[];
+		rejectedNonexistent: string[];
+	} {
 		const seen = new Set<string>();
-		const result: string[] = [];
+		const accepted: string[] = [];
+		const rejectedOutsideVault: string[] = [];
+		const rejectedInvalid: string[] = [];
+		const rejectedPaperGraphRoot: string[] = [];
+		const rejectedNonexistent: string[] = [];
 		for (const value of raw) {
-			const normalized = PersonalNoteMiddleware.normalizeFolderPath(value);
-			if (normalized && !seen.has(normalized)) {
-				seen.add(normalized);
-				result.push(normalized);
+			const trimmed = value.trim();
+			if (!trimmed) {
+				continue;
 			}
+			// 정규화(슬래시 정리) 전에 판정한다 — 드라이브 문자·UNC·".."나 금지 문자는
+			// normalizeFolderPath가 손대기 전의 원형에서 봐야 정확하다.
+			if (PersonalNoteMiddleware.isOutsideVaultPath(trimmed)) {
+				rejectedOutsideVault.push(trimmed);
+				continue;
+			}
+			if (PersonalNoteMiddleware.hasInvalidPathChars(trimmed)) {
+				rejectedInvalid.push(trimmed);
+				continue;
+			}
+			const normalized = PersonalNoteMiddleware.normalizeFolderPath(trimmed);
+			if (!normalized || seen.has(normalized)) {
+				continue;
+			}
+			seen.add(normalized);
+			if (PersonalNoteMiddleware.isWithinPaperGraphRoot(normalized)) {
+				rejectedPaperGraphRoot.push(normalized);
+				continue;
+			}
+			// "안녕하세요"처럼 금지 문자도 없고 볼트 밖도 아니지만(문법적으로는 멀쩡한
+			// 폴더명), 실제로 볼트에 그 이름의 폴더가 없는 경우 — 오타/엉뚱한 입력을
+			// 조용히 저장해 "0개 수집중"으로만 실패하던 것(QA #68과 같은 종류의 무알림
+			// 실패)을 막는다. 최초 설정 전 폴더를 미리 만들어두지 않는 사용 흐름은 이
+			// 체크로 막히는 게 의도된 트레이드오프다(2026-08-21 확인).
+			if (!(this.app.vault.getAbstractFileByPath(normalized) instanceof TFolder)) {
+				rejectedNonexistent.push(normalized);
+				continue;
+			}
+			accepted.push(normalized);
 		}
-		return result;
+		return { accepted, rejectedOutsideVault, rejectedInvalid, rejectedPaperGraphRoot, rejectedNonexistent };
+	}
+
+	// 볼트 밖을 가리키려는 경로인지: 드라이브 절대 경로(C:\...), UNC 경로(\\server\share),
+	// 상위 폴더 이동(..)으로 볼트 루트 밖을 가리키려는 시도. Obsidian의 TFile.path는
+	// 항상 볼트 상대 경로라 이런 값은 애초에 아무 파일과도 안 맞고(QA #68: 조용히 "0개
+	// 수집중"만 뜸), 그래서 여기서 미리 걸러 이유를 알려준다.
+	private static isOutsideVaultPath(path: string): boolean {
+		return (
+			/^[a-zA-Z]:[\\/]/.test(path) ||
+			/^\\\\/.test(path) ||
+			path.split(/[\\/]+/).includes('..')
+		);
+	}
+
+	// OS 파일명 금지 문자(Windows 기준 < > : " | ? *)·제어 문자·백슬래시(Obsidian 경로
+	// 구분자는 '/'뿐이라 '\'는 항상 오타/다른 OS 경로 표기로 본다)가 섞인 경로.
+	private static hasInvalidPathChars(path: string): boolean {
+		// eslint-disable-next-line no-control-regex -- 제어 문자를 의도적으로 걸러낸다.
+		return /[<>:"|?*\\\x00-\x1f]/.test(path);
+	}
+
+	// path가 PAPER_GRAPH_ROOT 자신이거나 그 하위인지. 논문 md·노트 캐시·설정 파일이 전부
+	// 이 아래에 있으므로, 이 영역을 노트 소스로 허용하면 논문이 "노트"로 재임베딩되거나
+	// 캐시/설정 폴더를 노트 폴더로 지정해 파이프라인이 깨진다.
+	private static isWithinPaperGraphRoot(path: string): boolean {
+		return path === PAPER_GRAPH_ROOT || path.startsWith(`${PAPER_GRAPH_ROOT}/`);
 	}
 }

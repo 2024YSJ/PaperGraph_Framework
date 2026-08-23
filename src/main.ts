@@ -282,5 +282,9 @@ export default class PaperGraph3D extends Plugin {
 		// 울릴 수 있다.
 		this.scheduler?.stop();
 		this.collectflow?.dispose();
+
+		// 뷰가 열린 채 플러그인이 언로드되면 onClose가 안 불릴 수 있어, 여기서 그래프의
+		// WebGL 컨텍스트를 직접 반납한다 — 안 하면 리로드마다 옛 컨텍스트가 쌓여 시각화가 깨진다.
+		this.visualflow?.visual.dispose();
 	}
 }

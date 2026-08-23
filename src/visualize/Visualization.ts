@@ -157,8 +157,18 @@ export class Visualization {
 	dispose(): void {
 		this.resizeObserver?.disconnect();
 		this.resizeObserver = undefined;
-		this.forceGraph?._destructor();
+		const forceGraph = this.forceGraph;
 		this.forceGraph = undefined;
+		if (!forceGraph) {
+			return;
+		}
+		forceGraph.pauseAnimation(); // 애니메이션 루프(rAF) 정지
+		// WebGL 컨텍스트를 명시적으로 반납한다 — _destructor()만으로는 GPU 컨텍스트가
+		// 남아, 반복 재오픈/리로드에서 컨텍스트 한도(~16)를 넘기면 새 그래프가 안 뜬다.
+		const renderer = forceGraph.renderer();
+		renderer.forceContextLoss();
+		renderer.dispose();
+		forceGraph._destructor(); // 3d-force-graph 내부 정리(DOM/루프)
 	}
 
 	// z 방향으로 축을 긋고, 연도 경계마다 라벨 스프라이트를 배치한다. 축은 논문 z 범위
