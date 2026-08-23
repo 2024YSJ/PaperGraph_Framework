@@ -197,16 +197,18 @@
    구분선이 "각 카드의 첫 항목"에서 사라져, 카드끼리 경계 없이 붙어 보이고 버튼 열도
    어긋나 보였다(실제 회귀). 그래서 카드 경계를 여기서 직접 그린다 — 겸사겸사 어디부터
    어디까지가 구독 하나인지 눈으로 바로 구분된다. */
+/* 배경은 안 준다 — 테두리만으로 경계를 표시한다. 좌우 padding도 0이다: 좌우로
+   여백을 주면 카드 안의 「API 삭제」 버튼이 카드 밖(「구독 추가」 등)의 버튼보다
+   안쪽으로 밀려서 오른쪽 정렬 열이 어긋나 보인다 — 카드 테두리를 다른 Setting 행과
+   같은 좌우 경계에 맞춰야 버튼 열도 같이 맞는다. */
 .papergraph3d-subscription-card {
 	margin: 10px 0;
-	padding: 4px 12px;
+	padding: 0 0 4px;
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 6px;
-	background: var(--background-secondary);
 }
 
-/* 카드 안의 첫 항목(조건 요약 제목)은 위 여백을 줄인다 — 카드 자체가 이미 padding으로
-   여백을 주므로 Obsidian 기본 padding까지 겹치면 제목이 너무 아래로 밀린다. */
+/* 카드 안의 첫 항목(조건 요약 제목)은 위 여백을 준다 — 카드 테두리에 바로 안 붙게. */
 .papergraph3d-subscription-card > .setting-item:first-child {
-	padding-top: 10px;
+	padding-top: 14px;
 }
