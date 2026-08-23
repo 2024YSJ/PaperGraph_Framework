@@ -51,6 +51,17 @@ export class ApiManagementModal extends Modal {
 	// 조건 요약/목록에 보여줄 사람이 읽는 이름. 등록되지 않은 apiName이거나 그 출처가
 	// 모르는 필드 이름(구버전 파일이 남긴 값 등)이면 이름 그대로 보여준다 — 조용히
 	// 감추는 것보다, 알 수 없는 값이 있다는 걸 그대로 드러내는 편이 낫다.
+	// render()(Setting 체이닝이 필요해 테스트 스텁으로 못 돎)와 분리해 순수 "읽었더니
+	// 걸러진 게 있었으면 알린다"만 떼어낸다 — SubscriptionTargetModal.notifyDroppedConditions와
+	// 같은 이유, 메시지 문구만 이 창에 맞게 다르다.
+	private static notifyDroppedConditions(dropped: boolean): void {
+		if (dropped) {
+			new Notice(
+				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 아래 목록을 확인하세요.',
+			);
+		}
+	}
+
 	private static conditionLabel(apiName: string, searchType: string): string {
 		return (
 			findDescriptor(apiName)?.conditionFields.find((f) => f.name === searchType)?.label ??
@@ -364,6 +375,11 @@ export class ApiManagementModal extends Modal {
 	private async loadSubscriptions(): Promise<void> {
 		try {
 			const subscriptions = await File.readSubscriptions();
+			// SubscriptionTargetModal.load()와 같은 이유 — readSubscriptions를 부르는
+			// 모든 UI 진입점이 각자 이 검사를 해야 한다(플래그가 이 호출로 리셋되면
+			// CollectAndSave.runNow가 뒤늦게 봐도 이미 늦다). 이 창은 특히 사용자가 걸러진
+			// 구독을 직접 고치러 오는 곳이라, 여기서 알리는 게 가장 도움이 된다.
+			ApiManagementModal.notifyDroppedConditions(File.lastReadDroppedInvalidConditions);
 			this.apiDrafts = subscriptions.apis.map((api) => ({
 				apiName: api.apiName,
 				conditions: api.querys.map((query) => ({

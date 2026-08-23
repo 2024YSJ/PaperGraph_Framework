@@ -19,6 +19,18 @@ export function hasCollectableConditions(api: SubscriptionTarget): boolean {
 	return api.querys.length > 0;
 }
 
+// render()(Setting 체이닝이 필요해 테스트 스텁으로 못 돎)와 분리해 순수 "읽었더니
+// 걸러진 게 있었으면 알린다"만 떼어낸다 — load()가 dropped를 넘겨 부르기만 하면 되고,
+// 이 함수 자체는 File/Modal 없이도 dropped 값 하나로 테스트할 수 있다.
+export function notifyDroppedConditions(dropped: boolean): void {
+	if (dropped) {
+		new Notice(
+			'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — ' +
+				'구독 관리에서 확인 후 다시 시도하세요.',
+		);
+	}
+}
+
 interface SubscriptionOption extends SubscriptionTarget {
 	label: string;
 	selected: boolean;
@@ -105,6 +117,16 @@ export class SubscriptionTargetModal extends Modal {
 	private async load(): Promise<void> {
 		try {
 			const subscriptions = await File.readSubscriptions();
+			// ⚠️ 이 창이 CollectAndSave.runNow보다 먼저 readSubscriptions를 부른다 — 이
+			// 창을 열지 않고 바로 수집하는 경로(자동 수집/명령 팔레트)에서는 runNow의
+			// 검사(File.lastReadDroppedInvalidConditions)가 걸러진 사실을 잡아 수집
+			// 자체를 막아주지만, 이 창을 먼저 거치면 그 검사 시점엔 이미 파일이 정리돼
+			// 있어(자가 복구가 여기서 먼저 일어남) 플래그가 false로 리셋된 뒤라 아무 일도
+			// 없었던 것처럼 넘어가 버린다(실제 재현됨 — 구독 선택 창을 열었다 실행하면
+			// "0편 수집 완료"만 뜨고 조건이 걸러졌다는 사실은 어디에도 안 남음). 여기서
+			// 먼저 확인해 알린다 — readSubscriptions를 부르는 모든 UI 진입점이 각자
+			// 이 검사를 해야 한다(ApiManagementModal.loadSubscriptions도 동일).
+			notifyDroppedConditions(File.lastReadDroppedInvalidConditions);
 			this.options = subscriptions.apis
 				.filter(hasCollectableConditions)
 				.map((api) => ({
