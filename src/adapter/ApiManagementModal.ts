@@ -675,10 +675,21 @@ export class ApiManagementModal extends Modal {
 				.addButton((button) =>
 					// 로컬에서만 지운다 — 실제 반영은 아래 「저장」을 눌러야 한다.
 					button.setButtonText('조건 삭제').onClick(() => {
+						// 이미 저장돼 있던(saved===true) 카드를 지금 처음 건드리는 순간에만
+						// 전체를 다시 그린다 — 「저장」/「구독 추가」 버튼의 표시 여부가
+						// hasUnsavedDraft/unsavedDraft(모두 render()에서만 재계산됨)에 달려
+						// 있어서, 카드만 좁혀 다시 그리면 이 전환을 못 알아챈다(실제 재현:
+						// 저장된 구독의 조건을 지워도 「저장」 버튼이 안 뜸). 이미 저장 안
+						// 된 카드를 계속 편집하는 동안은(가장 흔한 경우) 그 값이 이미
+						// false라 좁힌 재렌더로 충분하다.
+						const wasSaved = api.saved;
 						api.conditions = api.conditions.filter((item) => item !== condition);
 						api.saved = false;
-						// 이 카드만 다시 그린다 — 다른 구독/카드는 그대로 둔다.
-						this.renderApiDraft(containerEl, api);
+						if (wasSaved) {
+							this.render();
+						} else {
+							this.renderApiDraft(containerEl, api);
+						}
 					}),
 				);
 		}
@@ -734,6 +745,11 @@ export class ApiManagementModal extends Modal {
 					}
 					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상
 					// 여유가 있다.
+					//
+					// 조건 삭제 핸들러와 같은 이유로 wasSaved를 본다 — saved===true였던
+					// 카드를 지금 처음 건드리는 전환 순간에만 전체를 다시 그려 「저장」
+					// 버튼이 뜨게 한다(실제 재현: 저장된 구독에 조건을 추가해도 안 뜸).
+					const wasSaved = api.saved;
 					api.conditions.push({
 						searchType: api.newConditionType,
 						query: api.newConditionQuery.trim(),
@@ -741,9 +757,14 @@ export class ApiManagementModal extends Modal {
 					api.newConditionQuery = '';
 					api.saved = false;
 					// 로컬에서만 쌓는다 — 디스크 반영은 맨 아래 「저장」 버튼으로 한 번에
-					// (render() 끝의 단일 저장 버튼 참고 — 카드마다 두지 않는다). 이 카드만
-					// 다시 그린다 — 등록된 다른 구독이 많아도 이 클릭 비용은 항상 일정하다.
-					this.renderApiDraft(containerEl, api);
+					// (render() 끝의 단일 저장 버튼 참고 — 카드마다 두지 않는다). 이미
+					// 저장 안 된 카드를 계속 편집하는 동안은(가장 흔한 경우) 카드만 다시
+					// 그려 등록된 다른 구독이 많아도 이 클릭 비용은 항상 일정하다.
+					if (wasSaved) {
+						this.render();
+					} else {
+						this.renderApiDraft(containerEl, api);
+					}
 				}),
 			);
 	}
