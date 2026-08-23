@@ -761,7 +761,13 @@ export class ApiManagementModal extends Modal {
 
 		new Setting(containerEl)
 			.setName('조건 추가')
-			.setDesc(`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). 여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요.`)
+			.setDesc(
+				`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). ` +
+					'여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요. ' +
+					'키워드/저자 값에 큰따옴표나 AND·OR 같은 단어가 들어있어도 검색 연산자로 해석되지 않고 ' +
+					'그 문자 그대로(리터럴 문구)로 검색됩니다 — 특수문자를 넣을 의도가 아니었다면 결과가 ' +
+					'0편이거나 예상과 다를 수 있습니다.',
+			)
 			.addDropdown((dropdown) => {
 				for (const field of fields) {
 					dropdown.addOption(field.name, field.label);
