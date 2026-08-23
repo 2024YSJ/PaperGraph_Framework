@@ -1,7 +1,7 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { File } from '../common/File';
-import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
+import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../common/ScheduleSettings';
 
 // 자동 수집(스케줄러) 설정 전용 창. 원래 설정 탭 안에 있었는데, API/구독 관리와 같은
 // 이유로 분리했다 — 리본 아이콘에서 설정 탭을 거치지 않고 바로 켜고/끄고/시각을 바꿀 수

@@ -1,7 +1,7 @@
 import { Notice, Plugin } from 'obsidian';
 import type { SearchQuery } from './collect/SearchQuery';
 import { CollectAndSave } from './collect/CollectAndSave';
-import { shouldRunLoadRepair } from './collect/ScheduleSettings';
+import { shouldRunLoadRepair } from './common/ScheduleSettings';
 import { Embedding } from './collect/Embedding';
 import { VisualizationFlow } from './visualize/VisualizationFlow';
 import { PCA } from './visualize/PCA';
@@ -20,6 +20,7 @@ import { Task } from './common/Task';
 import { Scheduler } from './common/Scheduler';
 import { File } from './common/File';
 import { Log } from './common/Log';
+import { confirmAction } from './common/Notify';
 import { SettingTab } from './adapter/SettingTab';
 import { ApiManagementModal } from './adapter/ApiManagementModal';
 import { ScheduleModal } from './adapter/ScheduleModal';
@@ -119,11 +120,24 @@ export default class PaperGraph3D extends Plugin {
 		// 새로고침(전체 코퍼스 강제 재조회)은 지금까지 설정 탭 버튼으로만 접근할 수
 		// 있었다 — 수집/구독 관리처럼 자주 쓰는 진입점이라 왼쪽 리본에도 바로가기를
 		// 추가한다. 실행 로직은 설정 탭 버튼과 동일하게 'ui:collect-refresh' 이벤트를
-		// 그대로 재사용한다(SettingTab.ts 참고).
+		// 그대로 재사용한다(SettingTab.ts 참고). 코퍼스가 클수록 비용도 커지는 작업이라
+		// 리본에서도 설정 탭과 동일하게 확인을 한 번 거친다.
 		this.addRibbonIcon('refresh-cw', '새로고침', () => {
-			void this.eventListener.checking('ui:collect-refresh').catch((e) => {
-				new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
-			});
+			void (async () => {
+				const ok = await confirmAction(
+					this.app,
+					'전체 새로고침',
+					'저장된 모든 논문의 인용수·제목·초록을 다시 조회합니다. 논문 수가 많을수록 시간이 오래 걸릴 수 있습니다. 계속하시겠습니까?',
+				);
+				if (!ok) {
+					return;
+				}
+				try {
+					await this.eventListener.checking('ui:collect-refresh');
+				} catch (e) {
+					new Notice(`새로고침 실패: ${e instanceof Error ? e.message : String(e)}`);
+				}
+			})();
 		});
 
 		this.addCommand({
@@ -184,9 +198,6 @@ export default class PaperGraph3D extends Plugin {
 		// 색을 덮는다(끄면 인용 색으로 복원).
 		this.visualflow.setMiddleware(new ClusterColorMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
-		// ⚠️ 임시 진단 코드 — 삭제 예정(src/common/Log.ts 상단 참고). 이 한 줄을 빼면
-		// 로그는 콘솔로만 나가고 vault에는 아무것도 안 남는다.
-		Log.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		// collectflow가 준비된 뒤에 만들어야 한다 — 생성자에서 바로 진단 미들웨어를
 		// collectflow에 등록한다(CollectController 참고).
@@ -271,11 +282,9 @@ export default class PaperGraph3D extends Plugin {
 		// 울릴 수 있다.
 		this.scheduler?.stop();
 		this.collectflow?.dispose();
+
 		// 뷰가 열린 채 플러그인이 언로드되면 onClose가 안 불릴 수 있어, 여기서 그래프의
 		// WebGL 컨텍스트를 직접 반납한다 — 안 하면 리로드마다 옛 컨텍스트가 쌓여 시각화가 깨진다.
 		this.visualflow?.visual.dispose();
-		// ⚠️ 임시 진단 코드 — 삭제 예정. flush 타이머가 안 치워지면 언로드 후에도 타이머가
-		// 남아 다음 로드 때 두 개의 타이머가 같은 파일을 두고 경쟁하게 된다.
-		Log.dispose();
 	}
 }

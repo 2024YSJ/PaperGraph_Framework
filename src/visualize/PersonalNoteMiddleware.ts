@@ -247,7 +247,19 @@ export class PersonalNoteMiddleware implements Middleware {
 		modelInstalled: boolean,
 	): Promise<StoredNoteEmbedding | undefined> {
 		const cached = await this.readCache(file.path);
-		if (cached && cached.mtime === file.stat.mtime) {
+		// schemaVersion과 벡터 형태까지 확인한다 — 예전엔 mtime만 봤는데, 그러면 캐시
+		// 포맷이 바뀌거나(예: 임베딩 필드 이름/의미 변경) 파일이 부분적으로 손상돼도
+		// (readVaultJson은 JSON 파싱 실패만 막고 필드 내용은 안 봄) mtime이 우연히 같으면
+		// 그대로 재사용됐다. 논문 쪽(PCA.isWellFormed/isValidVector)과 같은 기준을 캐시
+		// 읽기 시점에도 적용한다 — 안 맞으면 재임베딩 경로로 자연히 떨어진다.
+		if (
+			cached &&
+			cached.mtime === file.stat.mtime &&
+			cached.schemaVersion === CACHE_SCHEMA_VERSION &&
+			Array.isArray(cached.embedding) &&
+			cached.embedding.length > 0 &&
+			cached.embedding.every((v) => typeof v === 'number' && Number.isFinite(v))
+		) {
 			return cached;
 		}
 

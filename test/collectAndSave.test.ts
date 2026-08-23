@@ -10,7 +10,7 @@ import { File } from '../src/common/File';
 import type { Middleware } from '../src/common/Middleware';
 import { Paper } from '../src/collect/Paper';
 import { S2_SECRET_PROVIDER } from '../src/collect/API';
-import { mockRequests, recordedRequests, response } from './stubs/obsidian';
+import { mockRequests, recordedNotices, recordedRequests, response } from './stubs/obsidian';
 import {
 	entries,
 	entry,
@@ -232,6 +232,47 @@ describe('CollectAndSave.run — 사전 조건', () => {
 			/수집할 구간\(from\/to\)이 필요합니다/,
 		);
 		assert.equal(recordedRequests().length, 0);
+	});
+
+	// 사용자 요청(정책 변경): 구독 조건이 허용되지 않는 형식이라 걸러졌으면(9번/69번,
+	// 보통 파일을 직접 편집한 경우), 예전엔 이번 수집 전체를 막고 throw했다 — 그런데
+	// UI가 없는 자동 실행 경로(스케줄러·명령 팔레트)에서는 걸러진 구독 하나 때문에
+	// 나머지 멀쩡한 구독까지 계속 아무것도 수집하지 못했다. 리본/구독 선택 창(걸러내고
+	// 나머지는 진행)과 동작을 통일해, 이제는 막지 않고 자가 복구된 나머지 조건으로
+	// 정상 진행하되 stats.droppedInvalidConditions로 그 사실을 실어 보낸다 —
+	// CollectController.checkStructuralFailures가 이 신호를 보고 알린다(silent 실행
+	// 경로에서도 항상 도는 지점이라 자동 수집에서도 동일하게 알려진다).
+	it('구독 조건이 걸러졌어도(파일 직접 편집) 수집을 막지 않고 나머지 조건으로 진행한다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{
+						apiName: 'arxiv',
+						querys: [
+							{ searchType: 'keyword', query: 'a' },
+							{ searchType: 'keyword', query: 'b' },
+							{ searchType: 'keyword', query: 'c' },
+							{ searchType: 'keyword', query: 'd' },
+						],
+						updateTime: 0,
+					},
+				],
+			}),
+		);
+		arxivOnly(feed([entry()], 1));
+		const { embedding } = fakeEmbedding();
+
+		const flow = collectFlow(embedding);
+		await flow.run('recent');
+
+		assert.ok(recordedRequests().length > 0, '걸러진 게 있어도 나머지 조건으로 네트워크 요청은 나가야 한다');
+		assert.equal(flow.lastStats?.droppedInvalidConditions, true, '걸러졌다는 사실이 stats에 안 실렸다');
+
+		// 파일은 이미 3개로 자가 복구됐다 — 재실행하면 더 이상 걸러낼 게 없다.
+		const second = collectFlow(fakeEmbedding().embedding);
+		await second.run('recent');
+		assert.equal(second.lastStats?.droppedInvalidConditions, false);
 	});
 });
 
@@ -1269,12 +1310,169 @@ describe('File.readSubscriptions — Subscriptions.json이 아직 없을 때', (
 		);
 		await assert.rejects(() => File.readSubscriptions(), /Unknown apiName: pubmed/);
 	});
+
+	it('알려진 apiName인데 조건이 전부 무효로 걸러졌으면 구독 자체를 없앤다', async () => {
+		// arxiv는 등록된 apiName이라 sanitizeQuerys가 실제로 검증을 실행한다 — 그 결과
+		// querys가 비었다는 건 "이 구독은 원래도 있던 게 아니라 조건이 다 무효였다"는
+		// 뜻이지, 위 pubmed 케이스(apiName 자체를 몰라 검증을 아예 안 한 경우)와 다르다.
+		// 완전히 지워도 "미등록 API가 조용히 사라지는 사고"와는 무관하다 — 남겨두면
+		// 라벨 없는 빈 구독이 수집 대상 선택 창 등에 계속 떠서(실사용 재현) 더 혼란스럽다.
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{ apiName: 'arxiv', querys: [{ searchType: 'malicious', query: 'x' }] },
+					{ apiName: 'arxiv', querys: [{ searchType: 'keyword', query: '정상' }] },
+				],
+			}),
+		);
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis.length, 1, '무효 조건뿐이던 구독이 그대로 남아있다');
+		assert.equal(subscriptions.apis[0]?.querys[0]?.query, '정상');
+
+		// 파일에도 그대로 되돌려 써야 한다(자가 복구) — 다시 읽어도 여전히 1개여야 한다.
+		const raw = vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '';
+		const stored = JSON.parse(raw) as { apis: unknown[] };
+		assert.equal(stored.apis.length, 1, '되돌려 쓴 파일에도 빈 구독이 남아있다');
+	});
 });
 
 // ── 구독별 커서 ─────────────────────────────────────────────────────
 // 커서(updateTime)는 Subscriptions 전체가 아니라 구독(API 인스턴스)마다 따로 갖는다.
 // 새 구독을 추가해도 다른 구독의 진행 상황을 건드리지 않고, 구독이 배열에서 옮겨져도
 // (추가/삭제) 커서가 그 구독을 계속 따라가야 한다.
+describe('File.writeSubscriptions — 저장 시점 구독 조건 화이트리스트 (9번/69번)', () => {
+	// 개발자 도구로 UI를 우회해 keyword/author/category 밖의 searchType이나(9번), searchType은
+	// 정상이지만 category 값에 arXiv 쿼리 문법을 심은 조건(69번)을 강제로 저장 시도해도,
+	// 저장이 실제로 일어나는 File.writeSubscriptions 지점에서 걸러져야 한다.
+	it('알 수 없는 searchType은 저장에서 제외된다', async () => {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(
+			File.createApi('arxiv', [
+				{ searchType: 'keyword', query: 'ok' },
+				{ searchType: 'admin-override', query: 'anything' },
+			]),
+		);
+		await File.writeSubscriptions(subscriptions);
+
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: { searchType: string }[] }[];
+		};
+		const querys = raw.apis?.[0]?.querys ?? [];
+		assert.deepEqual(
+			querys.map((q) => q.searchType),
+			['keyword'],
+		);
+	});
+
+	it('category 값에 쿼리 문법을 심은 조건은 저장에서 제외된다', async () => {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(
+			File.createApi('arxiv', [
+				{ searchType: 'category', query: 'cs.CR OR abs:"secret"' },
+				{ searchType: 'category', query: 'cs.AI' },
+			]),
+		);
+		await File.writeSubscriptions(subscriptions);
+
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: { query: string }[] }[];
+		};
+		const querys = raw.apis?.[0]?.querys ?? [];
+		assert.deepEqual(
+			querys.map((q) => q.query),
+			['cs.AI'],
+		);
+	});
+
+	it('조건이 3개를 넘으면 앞에서부터 3개만 저장된다', async () => {
+		const subscriptions = await File.readSubscriptions();
+		subscriptions.apis.push(
+			File.createApi('arxiv', [
+				{ searchType: 'keyword', query: 'a' },
+				{ searchType: 'keyword', query: 'b' },
+				{ searchType: 'keyword', query: 'c' },
+				{ searchType: 'keyword', query: 'd' },
+			]),
+		);
+		await File.writeSubscriptions(subscriptions);
+
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: unknown[] }[];
+		};
+		assert.equal(raw.apis?.[0]?.querys.length, 3);
+	});
+
+	// 실제 재현된 문제: 파일을 직접 편집해 4개 조건(3개 상한 초과)을 넣으면, writeSubscriptions
+	// 검증만으로는 "다음에 뭔가 저장되기 전까지" 그대로 읽혀서 실제 수집(runNow →
+	// readSubscriptions)에 검증 안 된 4개 조건이 그대로 쓰였다 — 그 사이 창을 없애려면
+	// 읽기 시점에도 같은 검증이 필요하다.
+	it('파일을 직접 편집해 상한을 넘긴 경우 — 쓰기 전에도 읽는 즉시 잘린다', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{
+						apiName: 'arxiv',
+						querys: [
+							{ searchType: 'keyword', query: 'privacy' },
+							{ searchType: 'keyword', query: 'llm' },
+							{ searchType: 'keyword', query: 'large language model' },
+							{ searchType: 'keyword', query: 'chatgpt' },
+						],
+						updateTime: 0,
+					},
+				],
+			}),
+		);
+
+		const subscriptions = await File.readSubscriptions();
+		assert.equal(subscriptions.apis[0]?.querys.length, 3);
+	});
+
+	// 실제 재현된 문제: 걸러낸 결과를 파일에 되돌려 쓰지 않으면, 같은 수집 한 번 안에서도
+	// readSubscriptions가 여러 번 불릴 때마다(runNow 시작, 커서 갱신용 mutateSubscriptions)
+	// 매번 다시 걸러졌다. 정리된 결과를 즉시 파일에 써서 다음 읽기부터는 걸러질 게 없어야
+	// 한다. 걸러졌다는 사실은 Notice가 아니라 로그로만 남긴다 — 곧이어 뜨는 수집 완료
+	// Notice와 겹쳐 한 번의 수집에 Notice가 2개(무시됨+완료) 뜨는 게 산만하다는 피드백이
+	// 있었다(실제 재현됨).
+	it('걸러낸 즉시 파일에 되돌려 써서 — 다시 읽으면 더 안 걸러진다 (Notice는 안 뜬다)', async () => {
+		vault.files.set(
+			`${PLUGIN_DIR}/Subscriptions.json`,
+			JSON.stringify({
+				apis: [
+					{
+						apiName: 'arxiv',
+						querys: [
+							{ searchType: 'keyword', query: 'a' },
+							{ searchType: 'keyword', query: 'b' },
+							{ searchType: 'keyword', query: 'c' },
+							{ searchType: 'keyword', query: 'd' },
+						],
+						updateTime: 0,
+					},
+				],
+			}),
+		);
+
+		const noticesBefore = recordedNotices().length;
+		await File.readSubscriptions(); // 1차 읽기 — 걸러내고 파일에 되돌려 써야 한다.
+		assert.equal(recordedNotices().length, noticesBefore, '읽기에서는 Notice가 뜨면 안 된다(로그로만 남김)');
+
+		// 파일이 이미 3개로 정리돼 있어야 한다(자가 복구).
+		const raw = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: unknown[] }[];
+		};
+		assert.equal(raw.apis?.[0]?.querys.length, 3);
+
+		await File.readSubscriptions(); // 2차 읽기 — 이미 정리됐으니 더 걸러질 게 없어야 한다.
+		const raw2 = JSON.parse(vault.files.get(`${PLUGIN_DIR}/Subscriptions.json`) ?? '{}') as {
+			apis?: { querys: unknown[] }[];
+		};
+		assert.equal(raw2.apis?.[0]?.querys.length, 3);
+	});
+});
+
 describe('File.readSubscriptions/writeSubscriptions — 구독별 커서', () => {
 	it('구독마다 커서를 따로 저장하고 따로 복원한다', async () => {
 		vault.files.set(

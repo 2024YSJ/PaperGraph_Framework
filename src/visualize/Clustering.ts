@@ -35,25 +35,6 @@ export class Clustering {
 	// 그보다 많아지면 색이 돌아 쓰여 화면에서 구분되지도 않는다.
 	private static readonly MIN_SAMPLES_PER_CLUSTER = 20;
 
-	// k를 고를 때 쓰는 표본 크기. k마다 전체를 돌리면 열 배 가까이 느려지는데, 몇 덩어리가
-	// 자연스러운지는 분포만 보면 알 수 있어 표본으로 충분하다.
-	//
-	// 표본을 줄여도 답은 잘 버틴다 — 실제 볼트에서 1200이든 600이든 k=4를 고르고, 1위와 2위
-	// 점수의 격차도 0.0146 / 0.0104로 둘 다 넉넉했다. 반면 아래 반복 상한을 줄이면 격차가
-	// 0.0005까지 좁아져 사실상 아무 k나 골라진다. 그래서 아껴야 할 때는 반복이 아니라 표본을
-	// 줄인다.
-	// 논문 수에 비례시키되 양 끝을 막는다. 고정값을 쓰면 코퍼스가 커질 때 무너진다 —
-	// 600으로 고정했더니 6017편·5분야에서는 k=4를 잘 골랐지만, 8238편·7분야가 되자 작은
-	// 분야가 표본에 거의 안 잡혀 k=2를 골랐다(실제로 좋은 값은 6이었고, 표본을 3000으로
-	// 올리자 k=5로 회복됐다).
-	private static readonly SAMPLE_MIN = 600;
-	private static readonly SAMPLE_MAX = 3000;
-	private static readonly SAMPLE_RATIO = 3; // 논문 몇 편당 한 편을 표본으로 볼지
-
-	private static sampleSize(count: number): number {
-		return Math.min(Clustering.SAMPLE_MAX, Math.max(Clustering.SAMPLE_MIN, Math.floor(count / Clustering.SAMPLE_RATIO)));
-	}
-
 	// k-means 반복 상한. 실제 볼트에서 전체는 17회, 표본은 k에 따라 12~31회에 스스로 멈추므로
 	// 여유를 둔 안전장치다. 중간에 끊으면 안 된다 — 덜 수렴한 결과로 매긴 점수는 k끼리
 	// 구분이 안 될 만큼 뭉개진다(표본 크기 주석 참고).
@@ -219,38 +200,6 @@ export class Clustering {
 	// UI가 입력칸에 그대로 쓸 수 있는 하한.
 	static get minK(): number {
 		return Clustering.MIN_K;
-	}
-
-	// 표본을 뽑는다. sourceId 해시가 작은 것부터 필요한 수만큼 — 무작위가 아니라 결정적이고,
-	// 논문이 늘어도 뽑히던 논문이 계속 뽑힌다.
-	//
-	// 예전에는 정렬된 순서에서 일정 간격으로 뽑았는데, 그러면 편수가 바뀔 때마다 간격이
-	// 달라져 표본이 통째로 교체됐다(6000→6400편일 때 1200개 중 225개만 유지). k를 고를
-	// 때마다 사실상 다른 데이터를 보게 되어, 논문 몇백 편 차이로 덩어리 수가 2개에서
-	// 10개까지 널뛰었다. 해시 기준으로는 같은 조건에서 1059개가 유지된다.
-	private static sampleRows(papers: Paper[], vectors: Float64Array, dim: number): Float64Array {
-		const size = Clustering.sampleSize(papers.length);
-		if (papers.length <= size) {
-			return vectors;
-		}
-		const ranked = papers.map((paper, index) => ({ key: Clustering.hash(paper.sourceId), index }));
-		ranked.sort((a, b) => a.key - b.key || a.index - b.index);
-		const sample = new Float64Array(size * dim);
-		for (let i = 0; i < size; i += 1) {
-			const source = (ranked[i]?.index ?? 0) * dim;
-			sample.set(vectors.subarray(source, source + dim), i * dim);
-		}
-		return sample;
-	}
-
-	// FNV-1a. 표본을 고르는 데만 쓰므로 충돌 내성보다 "언제 어디서 돌려도 같은 값"이 중요하다.
-	private static hash(text: string): number {
-		let value = 2166136261;
-		for (let i = 0; i < text.length; i += 1) {
-			value ^= text.charCodeAt(i);
-			value = Math.imul(value, 16777619);
-		}
-		return value >>> 0;
 	}
 
 	// ── k-means ────────────────────────────────────────────────────

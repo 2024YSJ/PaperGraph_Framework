@@ -22,6 +22,11 @@ export interface EntryOptions {
 	summary?: string | null;
 	published?: string | null;
 	authors?: string[];
+	// entry의 <category term="..."> 태그들 — 기본은 없음(대부분 테스트는 category 조건을
+	// 안 씀). category 조건으로 수집하는 테스트는 실제 arXiv 응답처럼 이 목록에 매칭되는
+	// 값을 넣어야 한다 — 안 그러면 요청-응답 정합성 검사(8번)가 불일치로 보고 저장을
+	// 거부한다(실제 arXiv는 항상 category 태그를 붙여 보낸다).
+	categories?: string[];
 }
 
 export function entry(options: EntryOptions = {}): string {
@@ -31,6 +36,7 @@ export function entry(options: EntryOptions = {}): string {
 		summary = 'An abstract.',
 		published = '2025-01-15T10:30:00Z',
 		authors = ['Alice Kim', 'Bob Lee'],
+		categories = [],
 	} = options;
 
 	const parts: string[] = ['  <entry>'];
@@ -48,6 +54,9 @@ export function entry(options: EntryOptions = {}): string {
 	}
 	for (const name of authors) {
 		parts.push(`    <author><name>${name}</name></author>`);
+	}
+	for (const category of categories) {
+		parts.push(`    <category term="${category}"/>`);
 	}
 	parts.push('  </entry>');
 	return parts.join('\n');

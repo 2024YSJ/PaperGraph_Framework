@@ -53,9 +53,10 @@ async function runCollectFlow(
 	busy: boolean,
 	action: () => Promise<string | void>,
 ): Promise<void> {
-	if (busy) {
-		new Notice(`${label} — 대기열에 넣었습니다. 진행 중인 작업이 끝나면 실행됩니다.`);
-	}
+	// busy일 때 여기서 Notice를 따로 띄우지 않는다 — action()이 부르는 runWithProgress가
+	// 곧바로 "○○ — 대기 중..." 상태 Notice를 띄우는데(renderProgress), 둘이 똑같은
+	// 내용을 거의 동시에 두 번 보여줘서 정신없었다(실제 재현됨). 그쪽 Notice는 실행이
+	// 시작되면 진행률로 계속 바뀌는 살아있는 표시라 이 일회성 토스트보다 정보량이 많다.
 	Log.info('ui', `${label} 요청`, { queued: busy });
 	try {
 		const detail = await action();
@@ -117,6 +118,13 @@ export class CollectController implements CollectProgressSink {
 	// 실패해도 상한을 넘김), buildPartialFailureSuffix에만 있으면 silent 실행(자동 backfill
 	// 등)에서는 아무도 못 본다.
 	private readonly citationOverflowNotifier = new FailureNotifier();
+
+	// categoryMismatches(8번: 요청-응답 category 불일치, 프록시 변조 재현 사례)도 같은
+	// 이유로 silent 실행에서 새는 신호다 — 자동 스케줄러가 도는 동안 요청이 변조돼도
+	// buildPartialFailureSuffix만으로는 아무도 못 본다. 보안과 관련된 신호라 매 실행마다
+	// 뜨는 스팸을 감수하기보다는(반복되는 동안은 조용히) 최초 발생/재발생 시점만 확실히
+	// 알리는 이 코드베이스의 기존 절충을 그대로 따른다.
+	private readonly categoryMismatchNotifier = new FailureNotifier();
 
 	// 인용수 보정이 "시도는 했는데 하나도 못 고쳤다"고 판단할 최소 시도 편수. 1~2편은
 	// 그 논문들이 우연히 S2에 없었을 뿐일 수 있어 노이즈가 크다 — 몇 편 이상 전부
@@ -187,13 +195,30 @@ export class CollectController implements CollectProgressSink {
 	// isBusy 체크는 모달을 여는 시점이 아니라 사용자가 실제로 「실행」을 누른 시점에
 	// 해야 한다 — 그 사이 다른 수집이 시작/종료될 수 있다.
 	runRecent(app: App): void {
-		new SubscriptionTargetModal(app, '최근 논문 수집 — 구독 선택', false, (targets) => {
+		new SubscriptionTargetModal(app, '최근 논문 수집 — 구독 선택', false, (targets, _range, allSelected) => {
 			const label = describeTargets('최근 논문 수집', targets);
+			// 「전체 선택」 상태로 실행하면 targetSubscriptions를 아예 넘기지 않는다 —
+			// 스케줄러/명령어 팔레트(runRecentAuto)가 "대상 없음(undefined)"으로 같은
+			// 요청을 표현하는 것과 동일한 키가 되게 맞춘다. 그렇지 않으면 리본 메뉴로 고른
+			// "명시적 전체 목록"과 자동 실행의 "undefined"가 의미는 같아도 키가 달라 서로
+			// 합쳐지지 않고 대기열에 각자 쌓인다(실제 재현된 문제).
+			const testOptions = allSelected ? undefined : { targetSubscriptions: targets };
+			// run()은 내부적으로 동일 요청을 합쳐주지만(pendingRuns), 그걸 모르고 여기서
+			// 매번 새 runWithProgress를 부르면 클릭마다 새 진행률 Notice가 또 생겨 실제로는
+			// 하나로 합쳐진 실행인데도 화면에는 여러 개가 쌓인 것처럼 보인다(57번과 같은
+			// 근본 원인 — UI는 항상 도메인의 합침 여부를 먼저 확인해야 한다). 이미 같은
+			// 요청이 대기 중이면 새 진행률 UI를 만들지 않는다. Notice는 따로 안 띄운다 —
+			// 이미 첫 요청이 띄운 상태 Notice("대기 중...")가 화면에 떠 있는 상태라, 여기서
+			// 또 띄우면 같은 내용이 2번 보인다(실제 재현됨).
+			if (this.plugin.collectflow.hasPendingRun('recent', testOptions)) {
+				Log.info('ui', `${label} — 이미 대기 중`);
+				return;
+			}
 			void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
 				this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
 					this.plugin.collectflow.run(
 						'recent',
-						{ targetSubscriptions: targets },
+						testOptions,
 						onStart,
 						onTotal,
 						onApiStart,
@@ -215,11 +240,17 @@ export class CollectController implements CollectProgressSink {
 					return;
 				}
 				const label = describeTargets('과거 논문 수집', targets);
+				const testOptions = { from: range.from, to: range.to, targetSubscriptions: targets };
+				// runRecent와 같은 이유 — Notice는 안 띄운다(이미 뜬 상태 Notice와 중복).
+				if (this.plugin.collectflow.hasPendingRun('backfill', testOptions)) {
+					Log.info('ui', `${label} — 이미 대기 중`);
+					return;
+				}
 				void runCollectFlow(label, this.plugin.collectflow.isBusy, () =>
 					this.runWithProgress(label, (onStart, onTotal, onApiStart, onApiDone) =>
 						this.plugin.collectflow.run(
 							'backfill',
-							{ from: range.from, to: range.to, targetSubscriptions: targets },
+							testOptions,
 							onStart,
 							onTotal,
 							onApiStart,
@@ -284,6 +315,15 @@ export class CollectController implements CollectProgressSink {
 	// 그대로 맞춘다.
 	async refreshAllAuto(): Promise<string | void> {
 		const label = '새로고침';
+		// refreshAll()은 이미 대기 중인 요청과 내부적으로 합쳐지지만(57번), 그걸 모르고
+		// 여기서 매번 새 "준비 중..." Notice를 띄우면 실제로는 하나로 합쳐진 실행인데도
+		// 화면에는 여러 개가 쌓인 것처럼 보인다 — runRecent/openBackfillModal과 같은 이유로
+		// 여기서도 먼저 확인한다. Notice는 안 띄운다 — 먼저 큐에 들어간 요청의 "준비
+		// 중.../처리 중" Notice가 이미 떠 있어서, 여기서 또 띄우면 중복이다.
+		if (this.plugin.collectflow.hasPendingRefresh) {
+			Log.info('ui', `${label} — 이미 대기 중`);
+			return undefined;
+		}
 		// "준비 중" 단계는 File.readAllPapers()로 볼트 전체를 스캔하는 구간이라 총량을 미리
 		// 몰라 진행률(%)을 못 낸다 — 그래서 오래 걸려도 멈춘 것처럼 보이지 않도록, 최소한
 		// 왜 오래 걸릴 수 있는지는 문구로 설명한다(정확한 진행률은 readAllPapers에 콜백을
@@ -460,6 +500,26 @@ export class CollectController implements CollectProgressSink {
 		if (stats.anyTruncated) {
 			parts.push('일부 구간은 다 훑지 못해 다음 실행에서 이어집니다');
 		}
+		if (stats.categoryMismatches > 0) {
+			// 정상 상황에서는 절대 발생하지 않는 신호다 — arXiv는 요청한 category로 이미
+			// 걸러 응답하므로, 어긋난 게 있다면 수집 도중 요청이 변조됐거나(8번, 프록시로
+			// 재현된 사례) 응답 자체가 이상했다는 뜻이다. API.ts가 이런 항목은 애초에
+			// 저장하지 않으므로(무결성 위반, 사용자 요청) 여기 숫자는 "걸렀다"는 뜻이지
+			// "잘못 저장됐다"는 뜻이 아니다.
+			parts.push(
+				`${stats.categoryMismatches}건은 요청한 분류(category)와 실제 응답이 어긋나 저장을 거부함 — ` +
+					`수집 경로(프록시 등)를 확인하세요`,
+			);
+		}
+		if (stats.droppedInvalidConditions) {
+			// 9번/69번 화이트리스트로 걸러진 구독 조건 — 걸러진 구독은 이미 File 계층에서
+			// 완전히 삭제된다. 여기 buildPartialFailureSuffix에만 넣는 이유: 이 문자열은
+			// 수동 실행(runCollectFlow)의 완료 Notice에만 반영되고, 자동/silent 실행은
+			// 반환값을 애초에 안 쓴다(runRecentAuto 등) — 그래서 "구독이 잘못돼서 0편
+			// 모였다"는 사실을 수동으로 눌렀을 때는 알리되, 자동 수집마다 별도 Notice로
+			// 반복해서 띄우지는 않는다(checkStructuralFailures 참고 — 그쪽은 뺐다).
+			parts.push('일부 구독 조건이 허용되지 않는 형식이라 무시됨 — 구독 관리에서 확인하세요');
+		}
 		if (stats.failedSubscriptions.length > 0) {
 			// 사유(f.error, CollectAndSave.collect의 describeFailure — "HTTP 503" 등 짧은
 			// 형태)와 힌트(f.hint — "그래서 뭘 확인하면 되는지")까지 같이 보여준다. 어느
@@ -467,7 +527,16 @@ export class CollectController implements CollectProgressSink {
 			// 503이면 기다리면 됨) 알 수 없다 — 힌트가 빈 문자열이면(원인을 특정 못 함)
 			// 사유만 보여준다.
 			const detail = stats.failedSubscriptions
-				.map((f) => `${f.apiName}(${f.error}${f.hint ? ` — ${f.hint}` : ''})`)
+				.map((f) => {
+					// backfill 실패는 어느 구간이 안 끝났는지 보여줘야 사용자가 그 범위로
+					// 「과거 논문 수집」을 다시 열어 재입력할 수 있다 — 조용히 사라지면
+					// 영영 모른 채 넘어가는 것을 막는다(recent는 커서가 있어 다음 자동
+					// 실행이 알아서 이어가지만, backfill은 그 안전망이 없다).
+					const rangeText = f.range
+						? ` — 미완료 구간 ${isoDateInput(f.range.from)}~${isoDateInput(f.range.to)}`
+						: '';
+					return `${f.apiName}(${f.error}${f.hint ? ` — ${f.hint}` : ''}${rangeText})`;
+				})
 				.join(', ');
 			parts.push(`${detail} 구독 수집 실패 — 다른 구독은 정상 진행됨`);
 		}
@@ -508,6 +577,24 @@ export class CollectController implements CollectProgressSink {
 		} else {
 			this.citationOverflowNotifier.notifySuccess();
 		}
+
+		if (stats && stats.categoryMismatches > 0) {
+			const mismatches = stats.categoryMismatches;
+			this.categoryMismatchNotifier.notifyFailure(
+				'category-mismatch',
+				() =>
+					`PaperGraph3D: 요청한 분류(category)와 실제 응답이 어긋나 ${mismatches}건의 저장을 ` +
+					`거부했습니다 — 수집 요청이 중간에 변조됐을 수 있습니다. 네트워크/프록시 설정을 확인하세요.`,
+			);
+		} else {
+			this.categoryMismatchNotifier.notifySuccess();
+		}
+		// droppedInvalidConditions(9번/69번 화이트리스트로 걸러진 구독 조건)는 여기서
+		// 더 이상 Notice로 안 띄운다(사용자 요청) — 걸러진 구독은 이미 File 계층에서
+		// 완전히 삭제되고, SubscriptionTargetModal/ApiManagementModal이 그 창을 여는
+		// 시점에 이미 알린다(notifyDroppedConditions). 자동 수집(silent 실행)까지 매번
+		// 알리는 건 과했다는 판단 — stats에는 계속 실어 보낸다(로그로는 남아 디버깅에
+		// 쓸 수 있다), UI 알림만 없앤다.
 	}
 
 	// run()의 'all'/'forEach' 미들웨어로 수집 건수와 진행률을 관측한다. run() 자체는

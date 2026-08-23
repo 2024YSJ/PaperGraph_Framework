@@ -1,10 +1,34 @@
 import { App, Modal, Notice, Setting } from 'obsidian';
 import { File } from '../common/File';
+import { isCalendarDate } from '../common/DateUtil';
 import type { SearchQuery } from '../collect/SearchQuery';
 
 export interface SubscriptionTarget {
 	apiName: string;
 	querys: SearchQuery[];
+}
+
+// querys가 빈 구독을 이 선택 창의 목록에서 뺀다. File.readSubscriptions는 이런 구독을
+// 일부러 완전히 안 지우고 남겨두지만(apiName 자체가 미등록이면 File.createApi가
+// "Unknown apiName"으로 크게 실패해야 하므로 — File.ts 주석 참고), 그건 저장 계층의
+// 안전장치일 뿐 이 선택 창이 빈 라벨의 토글을 보여줄 이유는 아니다. 이런 구독을
+// 선택해 "실행"해도 buildUrl이 "querys is empty"로 그 자리에서 던질 뿐이라(수동
+// 편집으로 조건이 전부 걸러진 경우 실제 재현됨) 애초에 고를 게 없다 — 정리는
+// API/구독 관리 창에서 하면 된다.
+export function hasCollectableConditions(api: SubscriptionTarget): boolean {
+	return api.querys.length > 0;
+}
+
+// render()(Setting 체이닝이 필요해 테스트 스텁으로 못 돎)와 분리해 순수 "읽었더니
+// 걸러진 게 있었으면 알린다"만 떼어낸다 — load()가 dropped를 넘겨 부르기만 하면 되고,
+// 이 함수 자체는 File/Modal 없이도 dropped 값 하나로 테스트할 수 있다.
+export function notifyDroppedConditions(dropped: boolean): void {
+	if (dropped) {
+		new Notice(
+			'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — ' +
+				'구독 관리에서 확인 후 다시 시도하세요.',
+		);
+	}
 }
 
 interface SubscriptionOption extends SubscriptionTarget {
@@ -19,9 +43,12 @@ interface SubscriptionOption extends SubscriptionTarget {
 // 자정으로 해석되는데, 이 앱은 항상 사용자의 로컬 기기에서만 도는 단일 사용자 플러그인
 // 이라 그 해석이 사용자가 <input type=date>에서 실제로 고른 날짜와 어긋난다(로컬이
 // UTC+9면 하루 밀림). 연/월/일을 분리해 로컬 컴포넌트로 직접 구성해 이 어긋남을 없앤다.
+//
+// 모양만 보면 2026-02-31 같은 값이 통과해 Date가 조용히 3월 3일로 굴려버린다 —
+// isCalendarDate로 달력 유효성까지 확인한다(12번과 같은 뿌리).
 export function parseLocalDateInput(value: string): number | undefined {
 	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-	if (!match) {
+	if (!match || !isCalendarDate(value)) {
 		return undefined;
 	}
 	const [, y, mo, d] = match;
@@ -60,6 +87,13 @@ export class SubscriptionTargetModal extends Modal {
 		private readonly onSubmit: (
 			targets: SubscriptionTarget[],
 			range?: { from: number; to: number },
+			// 등록된 구독 전부를 선택한 상태로 실행했는가 — 스케줄러/명령어 팔레트가
+			// "대상 없음"(undefined)으로 부르는 것과 의미상 같은 요청임을 호출자가 알 수
+			// 있게 한다. 호출자가 이 값을 몰라 매번 명시적 목록을 넘기면, run()의 합침
+			// 판단 키가 "명시적 전체 목록"과 "undefined(전체)"로 갈라져 같은 요청인데도
+			// 서로 합쳐지지 않는 문제가 생긴다(실제 재현됨 — 리본 메뉴 경로와 자동 실행
+			// 경로가 동시에 큐에 쌓임).
+			allSelected?: boolean,
 		) => void | Promise<void>,
 		defaultFrom = '',
 		defaultTo = '',
@@ -83,13 +117,25 @@ export class SubscriptionTargetModal extends Modal {
 	private async load(): Promise<void> {
 		try {
 			const subscriptions = await File.readSubscriptions();
-			this.options = subscriptions.apis.map((api) => ({
-				apiName: api.apiName,
-				querys: api.querys,
-				// apiName 접두어는 뺀다 — 그룹 헤더(render()의 renderGroups)가 이미 보여준다.
-				label: api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
-				selected: true,
-			}));
+			// ⚠️ 이 창이 CollectAndSave.runNow보다 먼저 readSubscriptions를 부른다 — 이
+			// 창을 열지 않고 바로 수집하는 경로(자동 수집/명령 팔레트)에서는 runNow의
+			// 검사(File.lastReadDroppedInvalidConditions)가 걸러진 사실을 잡아 수집
+			// 자체를 막아주지만, 이 창을 먼저 거치면 그 검사 시점엔 이미 파일이 정리돼
+			// 있어(자가 복구가 여기서 먼저 일어남) 플래그가 false로 리셋된 뒤라 아무 일도
+			// 없었던 것처럼 넘어가 버린다(실제 재현됨 — 구독 선택 창을 열었다 실행하면
+			// "0편 수집 완료"만 뜨고 조건이 걸러졌다는 사실은 어디에도 안 남음). 여기서
+			// 먼저 확인해 알린다 — readSubscriptions를 부르는 모든 UI 진입점이 각자
+			// 이 검사를 해야 한다(ApiManagementModal.loadSubscriptions도 동일).
+			notifyDroppedConditions(File.lastReadDroppedInvalidConditions);
+			this.options = subscriptions.apis
+				.filter(hasCollectableConditions)
+				.map((api) => ({
+					apiName: api.apiName,
+					querys: api.querys,
+					// apiName 접두어는 뺀다 — 그룹 헤더(render()의 renderGroups)가 이미 보여준다.
+					label: api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND '),
+					selected: true,
+				}));
 		} catch (e) {
 			new Notice(`구독 목록을 읽지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
 		}
@@ -188,9 +234,10 @@ export class SubscriptionTargetModal extends Modal {
 						new Notice('구독을 1개 이상 선택하세요.');
 						return;
 					}
+					const allSelected = targets.length === this.options.length;
 
 					if (!this.needsDateRange) {
-						void this.onSubmit(targets);
+						void this.onSubmit(targets, undefined, allSelected);
 						this.close();
 						return;
 					}
@@ -207,7 +254,7 @@ export class SubscriptionTargetModal extends Modal {
 					// 통째로 빠지고, 시작일=종료일이면 빈 구간이 된다. 하루를 더해
 					// "종료일 당일 포함"으로 맞춘다.
 					const toMs = toMidnight + 24 * 60 * 60 * 1000;
-					void this.onSubmit(targets, { from: fromMs, to: toMs });
+					void this.onSubmit(targets, { from: fromMs, to: toMs }, allSelected);
 					this.close();
 				}),
 		);

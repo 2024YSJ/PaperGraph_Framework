@@ -1,6 +1,7 @@
 import { ItemView, Notice, WorkspaceLeaf } from 'obsidian';
 import type PaperGraph3D from '../main';
 import { PCAError, type PCAExcluded } from '../visualize/PCA';
+import { File } from '../common/File';
 
 export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
 
@@ -64,6 +65,7 @@ export class VisualizationView extends ItemView {
 			// PCA는 이미 이유별 제외 수를 계산해두므로(PCAResult.excluded), 여기서 읽어
 			// 알리기만 하면 된다 — PCA 쪽 계산 로직은 그대로 둔다.
 			this.notifyPermanentExclusions(this.plugin.visualflow.lastResult?.excluded);
+			this.notifySkippedFiles();
 		} catch (error) {
 			if (error instanceof PCAError && error.needsReembedding.length > 0 && !retried) {
 				container.setText(
@@ -84,6 +86,7 @@ export class VisualizationView extends ItemView {
 			// 그린 상황에서도 malformed/duplicateId로 빠진 게 있으면 같이 알린다 —
 			// needsReembedding 재시도 대상이 아니라서 위 분기를 안 거치고 여기로 오므로.
 			this.notifyPermanentExclusions(error instanceof PCAError ? error.excluded : undefined);
+			this.notifySkippedFiles();
 			container.setText(
 				error instanceof PCAError
 					? `시각화 실패: ${error.message}`
@@ -114,6 +117,21 @@ export class VisualizationView extends ItemView {
 		new Notice(
 			`PaperGraph3D: 그래프에서 영구히 제외된 논문이 있습니다 (${parts.join(', ')}) ` +
 				`— 재임베딩으로 고칠 수 없는 구조적 손상이라, 콘솔 로그나 코퍼스를 직접 확인해야 합니다.`,
+		);
+	}
+
+	// 콘텐츠 트리 규격을 벗어난 파일(달력에 없는 날짜 폴더, 미래 날짜, 연도 폴더 바로 밑
+	// 저장 등 — QA 12/15/18번)은 File이 스캔에서 조용히 걸러낸다. 그대로 두면 "분명
+	// 파일을 넣었는데 안 보인다"가 되므로, 걸러진 게 있을 때만 한 번 알린다. 어느
+	// 파일인지는 개수가 많을 수 있어 콘솔 로그(File 쪽 Log.warn)로 넘긴다.
+	private notifySkippedFiles(): void {
+		const skipped = File.lastScanSkipped;
+		if (skipped.count === 0) {
+			return;
+		}
+		new Notice(
+			`PaperGraph3D: 저장 규격에 맞지 않는 논문 파일 ${skipped.count}개를 건너뛰었습니다 ` +
+				`(PaperGraph3D/<연>/<월>/<일>/ 아래의 정상 날짜 폴더만 읽습니다) — 경로는 콘솔 로그를 확인하세요.`,
 		);
 	}
 }

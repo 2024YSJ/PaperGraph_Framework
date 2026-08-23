@@ -1,8 +1,8 @@
 import { App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type PaperGraph3D from '../main';
-import { Log } from '../common/Log';
 import { ApiManagementModal } from './ApiManagementModal';
 import { ScheduleModal } from './ScheduleModal';
+import { confirmAction } from '../common/Notify';
 import { formatSubscriptionProgress } from './CollectMiddlewares';
 
 export class SettingTab extends PluginSettingTab {
@@ -106,7 +106,18 @@ export class SettingTab extends PluginSettingTab {
 				'저장된 모든 논문의 인용수·제목·초록을 다시 조회하고, 내용이 바뀐 논문만 임베딩을 다시 계산합니다.',
 			)
 			.addButton((button) =>
+				// 코퍼스 전체를 대상으로 하는 작업이라 논문이 쌓일수록 비용도 같이 커진다 —
+				// 다른 버튼과 달리 실수로 눌렀을 때 되돌리기 번거로우므로 확인을 한 번 거친다.
+				// 리본 아이콘(main.ts)도 같은 이벤트를 재사용하므로 거기서도 같은 확인을 거친다.
 				button.setButtonText('새로고침').onClick(async () => {
+					const ok = await confirmAction(
+						this.app,
+						'전체 새로고침',
+						'저장된 모든 논문의 인용수·제목·초록을 다시 조회합니다. 논문 수가 많을수록 시간이 오래 걸릴 수 있습니다. 계속하시겠습니까?',
+					);
+					if (!ok) {
+						return;
+					}
 					try {
 						await this.plugin.eventListener.checking('ui:collect-refresh');
 					} catch (e) {
@@ -219,24 +230,6 @@ export class SettingTab extends PluginSettingTab {
 			.addButton((button) =>
 				button.setButtonText('시각화 열기').onClick(() => {
 					void this.plugin.activateVisualizationView();
-				}),
-			);
-
-		// ── 진단 로그 (임시) ──────────────────────────────────────────
-		// ⚠️ 삭제 예정 — Log.ts 상단 주석 참고. 콘솔 출력은 이 토글과 무관하게 항상 나가고,
-		// 이 토글은 vault의 collect-log.md 파일 기록만 켠다/끈다. 기본은 꺼짐이라(Log.ts
-		// 참고) 자동 수집처럼 눈에 안 보이는 백그라운드 동작을 진단할 땐 여기서 켜야 한다.
-		new Setting(containerEl).setName('진단 로그 (임시)').setHeading();
-
-		new Setting(containerEl)
-			.setName('파일에도 기록')
-			.setDesc(
-				`끄면 콘솔에만 남습니다(개발자 도구 → 콘솔, "PaperGraph"로 필터, 로그 레벨은 ` +
-					`All levels/Verbose). 켜면 ${Log.filePath()}에도 남깁니다.`,
-			)
-			.addToggle((toggle) =>
-				toggle.setValue(Log.isFileEnabled()).onChange((value) => {
-					Log.setFileEnabled(value);
 				}),
 			);
 	}

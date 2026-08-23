@@ -152,9 +152,16 @@ export class PCA {
 		};
 
 		// 최소 개수 미달 — 에러로 올린다. 재수집 여부는 main이 판단한다 (스펙 2절)
+		//
+		// 개인 노트 설정 패널(PersonalNoteMiddleware)은 그래프가 성공적으로 뜬 뒤에만
+		// 마운트된다(그래프 노드를 이웃 좌표 기준으로 써서 개인 노트를 배치하므로,
+		// 기존 그래프 없이는 존재할 수 없다) — 이 메시지가 사실상 "왜 개인 노트 경로를
+		// 입력할 곳이 안 보이는지"에 대한 유일한 단서라, 그 연결을 명시한다(QA: 개인 노트
+		// 추가를 시도했는데 조용히 실패하는 것처럼 보인다는 보고).
 		if (valid.length < PCA.MIN_VALID_PAPERS) {
 			throw new PCAError(
-				`유효 논문이 ${valid.length}편이라 그래프를 만들 수 없습니다 (최소 ${PCA.MIN_VALID_PAPERS}편 필요)`,
+				`유효 논문이 ${valid.length}편이라 그래프를 만들 수 없습니다 (최소 ${PCA.MIN_VALID_PAPERS}편 필요) — ` +
+					`개인 노트를 포함한 그래프 화면 전체가 이 최소 편수를 채워야 열립니다.`,
 				errorInfo,
 			);
 		}

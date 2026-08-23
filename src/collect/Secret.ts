@@ -37,10 +37,17 @@ export class Secret {
 		return { ...this.apiKeys };
 	}
 
-	// File이 Secret.json을 읽어 Secret을 복원할 때 쓴다.
+	// File이 Secret.json을 읽어 Secret을 복원할 때 쓴다. 매개변수 타입은 Record<string,
+	// string>이라 적혀 있지만 실제로는 사용자가 편집할 수 있는 평문 파일에서 온 unknown이다
+	// — 값이 문자열이 아닌 항목({"x": 12345}, {"y": {...}} 등)이 그대로 들어오면
+	// apiKeys에 실려 나중에 HTTP 헤더로 나간다. 문자열 값만 통과시킨다.
 	static fromJSON(data: Record<string, string>): Secret {
 		const secret = new Secret();
-		secret.apiKeys = { ...data };
+		for (const [provider, key] of Object.entries(data)) {
+			if (typeof key === 'string') {
+				secret.apiKeys[provider] = key;
+			}
+		}
 		return secret;
 	}
 }

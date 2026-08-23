@@ -2,6 +2,7 @@ import { SearchQuery, combineQueries, hasMeaningfulQueryValue } from './SearchQu
 import { Paper } from './Paper';
 import type { Secret } from './Secret';
 import { Log } from '../common/Log';
+import { isUsablePaperDate } from '../common/DateUtil';
 import {
 	chunk,
 	ConfigurationError,
@@ -118,6 +119,41 @@ export interface API {
 	readonly lastCoverage: CollectionCoverage | undefined;
 }
 
+// 구독 조건 필드 하나(예: arXiv의 keyword/author/category). UI 드롭다운과 저장 시점
+// 검증이 이 값 하나로 결정된다 — "이 출처가 어떤 조건을 받는지, 값이 유효한지"는
+// 그 출처만 아는 사정이라 여기서 구현체가 직접 선언한다.
+export interface ConditionField {
+	// SearchQuery.searchType과 매칭되는 키(예: 'category'). File.QUERY_VALIDATORS가
+	// 예전에 apiName으로 분기하던 걸 대신한다.
+	readonly name: string;
+	// 구독 관리 UI 드롭다운에 그대로 쓰는 사람이 읽는 이름(예: '분류').
+	readonly label: string;
+	// 이 필드에 이 값이 유효한지. UI(추가 버튼)와 저장 시점(File.sanitizeQuerys) 양쪽이
+	// 같은 이 함수를 호출한다 — 판정 기준이 두 군데로 갈라지지 않는다.
+	// 프로퍼티(화살표 타입)로 선언한다 — 메서드 단축 구문(validate(...): ...)은 암묵적
+	// this 바인딩을 요구해서, ArxivAPI.isValidCategoryValue처럼 this를 안 쓰는 정적
+	// 메서드를 그대로 값으로 넣어도 린트가 걸린다.
+	validate: (value: string) => boolean;
+}
+
+// API 구현체가 자기 자신에 대해 "바깥(File, UI)이 알아야 하는 사실"을 서술한다.
+//
+// 예전에는 File.ts가 QUERY_VALIDATORS/PAPER_URL_BUILDERS/API_FACTORIES라는 이름으로
+// { arxiv: ... } 표 세 개를 따로 들고 있었고, ApiManagementModal도 조건 드롭다운과
+// category 검증을 직접 하드코딩했다 — 새 출처를 추가하면 그 구현체 파일 하나로 안
+// 끝나고 File/Modal 여러 곳을 같이 고쳐야 했다(실제로 그렇게 드리프트가 생겼다).
+// 이 인터페이스로 그 앎을 구현체 쪽에 되돌려 놓는다: 구현체가 스스로를 설명하고,
+// File/UI는 findDescriptor()로 조회만 한다.
+export interface ApiDescriptor {
+	readonly apiName: string;
+	readonly conditionFields: readonly ConditionField[];
+	// 논문 웹 페이지 URL. File.PAPER_URL_BUILDERS가 하던 일. validate와 같은 이유로
+	// 프로퍼티(화살표 타입)로 선언한다.
+	paperUrl: (localId: string) => string;
+	// 저장된 SearchQuery[]로 이 API의 인스턴스를 복원한다. File.API_FACTORIES가 하던 일.
+	create: (querys: SearchQuery[], secret?: Secret) => API;
+}
+
 // 구간 수집(SearchRecentPaper/Backfill)의 선택 옵션.
 //
 // 둘 다 "수집한 논문을 전부 배열로 돌려준다"는 단순한 계약을 깨기 위해 있다. 구간이
@@ -146,6 +182,14 @@ export interface CollectOptions {
 	// 총계가 아니다(collectRounds 주석 참고). 구간에 결과가 없거나 arXiv가 총계를
 	// 못 읽어주면(-1) 호출되지 않는다.
 	onTotal?: (total: number) => void;
+
+	// 라운드(MAX_PAGES만큼의 한 묶음)가 끝날 때마다 "여기까지 훑었다"를 알린다. 이 시점엔
+	// 그 구간의 논문이 onChunk를 통해 이미 저장까지 끝나 있으므로(collectRounds가 emit을
+	// await한다), 호출자가 이 값을 남겨두면 다음 실행이 그 지점부터 이어받을 수 있다.
+	// 수 시간짜리 backfill이 중간에 끊겼을 때 처음부터 다시 훑지 않게 하는 유일한 수단이다.
+	//
+	// 실패해도 수집을 멈추지 않는다 — 진행 기록은 보조 수단이지 수집 결과의 일부가 아니다.
+	onRoundComplete?: (coveredThrough: number) => Promise<void>;
 }
 
 // 직전 날짜 구간 수집이 실제로 어디까지 훑었는지.
@@ -173,6 +217,15 @@ export interface CollectionCoverage {
 	// RetryMissingEntries로 재조회한다 — 이 기능 자체가 통째로 사라져도(devLog에 남긴 대로
 	// "임시" 설계) 이 필드 하나만 걷어내면 된다.
 	skipped: SkippedEntryRecord[];
+	// 이번 수집에서 요청한 category 조건(searchType: 'category')과 실제 응답 entry의
+	// <category> 태그가 하나도 안 맞은 건수. 정상 상황에서는 항상 0이다 — arXiv 자체가
+	// 요청한 카테고리로 결과를 좁혀 돌려주므로. 0이 아니면 요청과 실제 응답이 어긋났다는
+	// 뜻인데, 그 원인이 될 수 있는 것 중 하나가 프록시 등으로 요청이 중간에 변조된 경우다
+	// (8번, 실제 재현됨: UI가 cs.LG를 보냈다고 표시하는 동안 서버로는 cs.CR이 나간 사례).
+	// arXiv가 실제로 뭘 돌려줬는지는 이 카운트만으로 증명되지 않지만(카테고리 태그를
+	// 아예 안 붙이는 등 다른 이유도 있을 수 있다), 0이 아니면 사용자가 확인해야 한다는
+	// 신호로는 충분하다.
+	categoryMismatches: number;
 }
 
 // [2] 정책으로 스킵된 항목의 사유. id를 arXiv id로 해석할 수 있었는지가 재시도 가능
@@ -211,6 +264,9 @@ interface ArxivPage {
 	latestPublishedMs: number | undefined;
 	// 이 페이지에서 [2] 정책으로 건너뛴 항목의 상세 기록 — CollectionCoverage.skipped 참고.
 	skipped: SkippedEntryRecord[];
+	// 이 페이지에서 요청한 category 조건과 실제 응답 entry의 category가 어긋난 건수 —
+	// CollectionCoverage.categoryMismatches 참고.
+	categoryMismatches: number;
 }
 
 // S2 배치 응답 한 칸. externalIds.ArXiv는 이 레코드가 스스로 밝히는 arXiv id다.
@@ -264,6 +320,28 @@ export class ArxivAPI implements API {
 		author: 'au',
 		category: 'cat',
 	};
+
+	// 이 API가 인정하는 searchType인가 — File.writeSubscriptions가 저장 시점에 구독 조건을
+	// 검증할 때 쓴다(9번: 개발자 도구로 UI를 우회해 keyword/author/category 밖의 조건을
+	// Subscriptions.json에 심는 경로 방어). formatTerm도 결국 이 맵을 보고 거부하지만, 그건
+	// "수집을 실행하는 시점"의 최종 방어선이고, 저장 시점에도 막아야 애초에 이상한 조건이
+	// 파일에 남지 않는다.
+	static isValidSearchType(searchType: string): boolean {
+		return typeof ArxivAPI.FIELD_PREFIX[searchType] === 'string';
+	}
+
+	// arXiv 분류 코드(cs.AI, math.NA, astro-ph.GA, 또는 상위 아카이브만 있는 cs 같은 형태)의
+	// 모양 — 소문자로 시작하는 영문/숫자/하이픈 토큰, 선택적으로 "."+영문/숫자/하이픈
+	// 서브클래스. category는 formatTerm에서 따옴표로 감싸지 않고 `cat:${value}`로 그대로
+	// 쿼리에 꽂히므로(69번: keyword/author는 따옴표 구문 검색이라 안의 AND/OR가 arXiv에서
+	// 연산자로 해석되지 않지만, category는 감싸지 않아 공백/AND/OR/콜론/괄호를 넣으면 그
+	// 자체로 새 쿼리 절이 삽입된다 — 실제 재현된 필터 우회), 이 형식을 벗어나면 애초에
+	// 값 자체를 거부한다.
+	private static readonly CATEGORY_PATTERN = /^[a-z][a-z0-9-]*(\.[A-Za-z][A-Za-z0-9-]*)?$/;
+
+	static isValidCategoryValue(value: string): boolean {
+		return ArxivAPI.CATEGORY_PATTERN.test(value);
+	}
 
 	private static readonly ENDPOINT = 'https://export.arxiv.org/api/query';
 
@@ -402,6 +480,7 @@ export class ArxivAPI implements API {
 				totalResults: -1,
 				skippedEntries: 0,
 				skipped: [],
+				categoryMismatches: 0,
 			};
 			return [];
 		}
@@ -435,6 +514,7 @@ export class ArxivAPI implements API {
 				}
 			},
 			options?.onTotal,
+			options?.onRoundComplete,
 		);
 
 		Log.info('arxiv.window', '구간 수집 종료', { papers: total, coverage: this.coverage });
@@ -457,6 +537,7 @@ export class ArxivAPI implements API {
 		to: number,
 		emit: (papers: Paper[]) => Promise<void>,
 		onTotal?: (total: number) => void,
+		onRoundComplete?: (coveredThrough: number) => Promise<void>,
 	): Promise<void> {
 		// 이어받기는 반드시 중복을 만든다: formatDate가 분 단위로 자르고 buildDateFilter의
 		// 범위가 양끝 포함([A TO B])이라, 경계 분의 논문이 다음 라운드에 또 걸린다.
@@ -465,6 +546,7 @@ export class ArxivAPI implements API {
 		let pages = 0;
 		let skippedEntries = 0;
 		const skipped: SkippedEntryRecord[] = [];
+		let categoryMismatches = 0;
 		let duplicates = 0;
 		let unique = 0;
 		// 첫 라운드의 값만 의미가 있다 — 이후 라운드는 좁아진 구간의 전체 건수라서
@@ -509,6 +591,7 @@ export class ArxivAPI implements API {
 			pages += roundCoverage.pages;
 			skippedEntries += roundCoverage.skippedEntries;
 			skipped.push(...roundCoverage.skipped);
+			categoryMismatches += roundCoverage.categoryMismatches;
 			if (round === 0) {
 				totalResults = roundCoverage.totalResults;
 			}
@@ -522,6 +605,15 @@ export class ArxivAPI implements API {
 				truncated: roundCoverage.truncated,
 				coveredThrough: new Date(roundCoverage.coveredThrough).toISOString(),
 			});
+
+			// 이 라운드가 커버한 지점을 알린다 — 여기까지의 논문은 emit(=저장)이 이미
+			// 끝났다. 마지막 라운드(완주)도 알려야 "요청 구간을 끝까지 봤다"가 기록된다.
+			if (onRoundComplete !== undefined) {
+				await runQuietly(
+					() => onRoundComplete(roundCoverage.coveredThrough),
+					'collectRounds.onRoundComplete',
+				);
+			}
 
 			if (!roundCoverage.truncated) {
 				break;
@@ -550,6 +642,7 @@ export class ArxivAPI implements API {
 			totalResults,
 			skippedEntries,
 			skipped,
+			categoryMismatches,
 		};
 	}
 
@@ -576,6 +669,7 @@ export class ArxivAPI implements API {
 		// 페이지마다 조용히 사라지지 않도록 coverage에 실어 밖에서 확인할 수 있게 한다.
 		let skippedEntries = 0;
 		const skipped: SkippedEntryRecord[] = [];
+		let categoryMismatches = 0;
 
 		for (let page = 0; page < ArxivAPI.MAX_PAGES; page += 1) {
 			if (page > 0) {
@@ -596,6 +690,7 @@ export class ArxivAPI implements API {
 			totalResults = result.totalResults;
 			skippedEntries += result.entryCount - result.papers.length;
 			skipped.push(...result.skipped);
+			categoryMismatches += result.categoryMismatches;
 			// 커서는 절대 뒤로 가지 않게 max로 누적한다. ascending이라 보통은 페이지마다
 			// 커지지만, 그 정렬을 커서 정확성의 전제로 삼지는 않는다.
 			if (result.latestPublishedMs !== undefined) {
@@ -620,6 +715,7 @@ export class ArxivAPI implements API {
 					totalResults,
 					skippedEntries,
 					skipped,
+					categoryMismatches,
 				};
 				Log.info('arxiv.paged', '구간 완주', {
 					dateFilter,
@@ -647,6 +743,7 @@ export class ArxivAPI implements API {
 			totalResults,
 			skippedEntries,
 			skipped,
+			categoryMismatches,
 		};
 		Log.info('arxiv.paged', '라운드 상한(MAX_PAGES) 도달 — 남은 구간은 다음 라운드로', {
 			dateFilter,
@@ -674,6 +771,13 @@ export class ArxivAPI implements API {
 		sortOrder: 'ascending' | 'descending',
 	): Promise<ArxivPage> {
 		const collectedQuery = combineQueries(this.querys);
+		// 이번 구독이 실제로 요청한 category 조건들 — 프록시 등으로 요청이 변조돼도 이
+		// 배열은 로컬에서 만든 원래 요청을 그대로 반영한다(변조는 네트워크 상에서
+		// 일어나므로 여기 값 자체는 안 바뀐다). 응답 entry의 실제 category와 대조하는
+		// 기준이 된다.
+		const requestedCategories = this.querys
+			.filter((q) => q.searchType === 'category')
+			.map((q) => q.query);
 		const url = this.buildUrl(dateFilter, start, maxResults, sortOrder);
 		const startedAt = Date.now();
 		// 실패하면 여기서 throw로 끊긴다([1] 정책). 어느 요청에서 끊겼는지 남기려면
@@ -685,6 +789,7 @@ export class ArxivAPI implements API {
 		const papers: Paper[] = [];
 		const skipped: SkippedEntryRecord[] = [];
 		let latestPublishedMs: number | undefined;
+		let categoryMismatches = 0;
 
 		for (const entry of entries) {
 			ArxivAPI.assertNotErrorEntry(entry);
@@ -697,6 +802,33 @@ export class ArxivAPI implements API {
 					latestPublishedMs === undefined
 						? published
 						: Math.max(latestPublishedMs, published);
+			}
+
+			let categoryMismatched = false;
+			if (requestedCategories.length > 0) {
+				const entryCategories = Array.from(entry.querySelectorAll('category')).map(
+					(c) => c.getAttribute('term') ?? '',
+				);
+				if (!requestedCategories.some((rc) => entryCategories.includes(rc))) {
+					categoryMismatches += 1;
+					categoryMismatched = true;
+				}
+			}
+
+			// 무결성 위반(8번, 프록시 재현 사례)은 저장 자체를 거부한다 — 데이터를 살려서
+			// 잘못된 collectedQueries("cs.LG로 찾음")로 저장해두면 조용히 거짓 기록이
+			// 남는다. [2] 정책(파싱 실패)과 달리 재시도로 고쳐질 문제가 아니라서
+			// SkippedEntries.json(RetryMissingEntries 대상)에는 넣지 않고, 카운트와
+			// 로그로만 남긴다 — 사용자 요청.
+			if (categoryMismatched) {
+				const rawId = ArxivAPI.text(entry.querySelector('id'));
+				const title = ArxivAPI.text(entry.querySelector('title'));
+				Log.warn('arxiv.page', '요청-응답 category 불일치로 저장 거부', {
+					rawId: rawId || '(없음)',
+					title: title || '(없음)',
+					requestedCategories,
+				});
+				continue;
 			}
 
 			const paper = ArxivAPI.parseEntry(entry, collectedQuery);
@@ -736,6 +868,14 @@ export class ArxivAPI implements API {
 			latestPublished:
 				latestPublishedMs === undefined ? undefined : new Date(latestPublishedMs).toISOString(),
 		});
+		if (categoryMismatches > 0) {
+			// 요청-응답 불일치는 흔한 일이 아니므로 debug가 아니라 warn으로 남긴다 — 8번
+			// (프록시로 요청이 변조된 사례)처럼 조용히 지나가면 안 되는 신호다.
+			Log.warn('arxiv.page', '요청한 category와 응답 category가 어긋난 항목 발견', {
+				requestedCategories,
+				categoryMismatches,
+			});
+		}
 
 		return {
 			papers,
@@ -743,6 +883,7 @@ export class ArxivAPI implements API {
 			totalResults,
 			latestPublishedMs,
 			skipped,
+			categoryMismatches,
 		};
 	}
 
@@ -795,6 +936,12 @@ export class ArxivAPI implements API {
 			throw new ConfigurationError(
 				`Empty or meaningless query value for searchType "${query.searchType}"`,
 			);
+		}
+		// category는 따옴표로 감싸지 않으므로(위 클래스 주석), 값 자체가 cs.AI 같은 고정
+		// 토큰 모양이 아니면 거부한다 — 그렇지 않으면 공백+AND/OR+다른 필드로 쿼리 전체를
+		// 조작할 수 있다(69번, 실제 재현됨).
+		if (prefix === 'cat' && !ArxivAPI.isValidCategoryValue(value)) {
+			throw new ConfigurationError(`Invalid arXiv category format: "${query.query}"`);
 		}
 		return prefix === 'cat' ? `${prefix}:${value}` : `${prefix}:"${value}"`;
 	}
@@ -927,7 +1074,10 @@ export class ArxivAPI implements API {
 		paper.references = [];
 
 		// <published>는 최초 버전 제출일(ISO 8601) — 앞 10자(YYYY-MM-DD)만 취한다.
-		paper.publicationDate = ArxivAPI.text(entry.querySelector('published')).slice(0, 10);
+		// 응답이 변조/파손돼 달력에 없거나 미래인 날짜가 오면 폴더 규격이 깨지므로
+		// (12번/15번) 빈 값으로 두어 저장 경로가 unknown/으로 가게 한다.
+		const published = ArxivAPI.text(entry.querySelector('published')).slice(0, 10);
+		paper.publicationDate = isUsablePaperDate(published) ? published : '';
 
 		// arXiv 응답엔 인용수가 없다. [3] 정책 — 보강 단계에서 채워지며, 실패하면 false로 남는다.
 		paper.citationCount = 0;
@@ -1210,4 +1360,42 @@ export class ArxivAPI implements API {
 		}
 		return result;
 	}
+}
+
+// ── API 서술자 레지스트리 ────────────────────────────────────────────
+//
+// 새 출처를 추가할 때 손대는 유일한 지점. 이 배열에 자기 서술자를 한 줄 더하면 UI
+// 드롭다운·저장 시점 검증·논문 URL·인스턴스 생성이 전부 따라온다 — File.ts와
+// ApiManagementModal.ts는 findDescriptor()만 부르고 ArxivAPI를 직접 import하지 않는다.
+const ARXIV_DESCRIPTOR: ApiDescriptor = {
+	apiName: 'arxiv',
+	conditionFields: [
+		// keyword/author는 저장 계층(File.sanitizeQuerys)에서는 자유 텍스트로 둔다 —
+		// "의미 있는 값인가"(hasMeaningfulQueryValue)는 여기서 걸러지지 않는다. 그건 UI가
+		// 입력 시점에 별도로 확인하고, 최종적으로는 formatTerm이 ConfigurationError로
+		// 던진다([1] 정책) — 값이 비었다고 File이 조용히 조건을 지워버리면(저장은
+		// 되는데 구독이 하나씩 준다) 사용자가 원인을 알기 어렵다. 반면 값이 그대로
+		// "전체 검색"으로 새는 걸 막는 게 이 필드의 유일한 역할이라 항상 통과시킨다.
+		{ name: 'keyword', label: '키워드', validate: () => true },
+		{ name: 'author', label: '저자', validate: () => true },
+		// category는 formatTerm이 따옴표로 못 감싸는 값이라(값 자체가 쿼리 문법이 됨)
+		// 자유 텍스트가 아니라 엄격한 형식 검증을 쓴다 — 저장 계층에서부터 막아야 한다
+		// (69번, 실제 재현: category 값으로 쿼리 자체를 조작).
+		{ name: 'category', label: '분류', validate: (value) => ArxivAPI.isValidCategoryValue(value) },
+	],
+	paperUrl: (localId) => `https://arxiv.org/abs/${localId}`,
+	create: (querys, secret) => new ArxivAPI(querys, secret),
+};
+
+const API_DESCRIPTORS: readonly ApiDescriptor[] = [ARXIV_DESCRIPTOR];
+
+// apiName으로 서술자를 조회한다. 등록되지 않은 이름이면 undefined — 호출자(File)가
+// "이 이름은 모른다"를 각자의 방식으로 처리한다(구독은 걸러내고, 인스턴스화는 못 한다).
+export function findDescriptor(apiName: string): ApiDescriptor | undefined {
+	return API_DESCRIPTORS.find((d) => d.apiName === apiName);
+}
+
+// 등록된 모든 apiName. File.supportedApiNames()(구독 UI 드롭다운)가 위임한다.
+export function findApiNames(): string[] {
+	return API_DESCRIPTORS.map((d) => d.apiName);
 }

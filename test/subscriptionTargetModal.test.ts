@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { parseLocalDateInput } from '../src/adapter/SubscriptionTargetModal';
+import { hasCollectableConditions, parseLocalDateInput } from '../src/adapter/SubscriptionTargetModal';
 
 describe('parseLocalDateInput', () => {
 	it('올바른 YYYY-MM-DD는 로컬 자정 timestamp로 파싱된다', () => {
@@ -31,16 +31,39 @@ describe('parseLocalDateInput', () => {
 		assert.equal(parseLocalDateInput('not-a-date'), undefined);
 	});
 
-	it('존재하지 않는 날짜(9월 31일)는 자동으로 다음 달로 정규화된다 — NaN이 아니다', () => {
-		// JS Date 생성자의 특성: new Date(2012, 8, 31) === new Date(2012, 9, 1).
-		// 즉 이 함수 자체는 "존재하지 않는 달력 날짜"를 걸러내지 못한다 — 실제 첫 거부는
-		// 브라우저의 <input type=date>가 무효 세그먼트 조합에서 빈 문자열을 보고하는
-		// 데서 온다(이 테스트가 그 사실을 문서화한다. 이 값이 언젠가 undefined로
-		// 바뀐다면 아래 assert가 그 변화를 알려준다).
-		const ms = parseLocalDateInput('2012-09-31');
-		assert.notEqual(ms, undefined, 'Date 생성자가 초과값을 더 이상 정규화하지 않는 것으로 바뀌었다');
-		const date = new Date(ms as number);
-		assert.equal(date.getMonth(), 9, '9월 31일이 10월로 안 넘어갔다');
-		assert.equal(date.getDate(), 1);
+	it('존재하지 않는 날짜(9월 31일)는 undefined다 — Date 생성자의 정규화를 막았다 (12번)', () => {
+		// JS Date 생성자는 초과값을 조용히 굴린다: new Date(2012, 8, 31) === 10월 1일.
+		// 예전엔 이 함수가 모양 정규식만 보고 그대로 통과시켜서, 사용자가 고르지도 않은
+		// 날짜로 수집 구간이 잡혔다. 이제 isCalendarDate로 달력 유효성까지 확인해 거부한다.
+		assert.equal(parseLocalDateInput('2012-09-31'), undefined);
+		assert.equal(parseLocalDateInput('2026-02-31'), undefined);
+		assert.equal(parseLocalDateInput('2026-13-01'), undefined);
+		assert.equal(parseLocalDateInput('2026-03-50'), undefined);
+	});
+
+	it('윤년 2월 29일은 통과한다 — 검증이 과하게 막지 않는다', () => {
+		assert.notEqual(parseLocalDateInput('2024-02-29'), undefined);
+		assert.equal(parseLocalDateInput('2025-02-29'), undefined);
+	});
+});
+
+describe('hasCollectableConditions', () => {
+	// File.readSubscriptions는 조건이 전부 걸러진 구독(querys: [])을 파일에서 완전히
+	// 안 지운다(File.ts 주석 참고 — apiName 미등록 구독을 조용히 지우는 사고를 막는
+	// 안전장치와 같은 코드 경로를 타서). 그 결과가 이 선택 창에도 그대로 흘러들어와
+	// 빈 라벨의 토글로 뜨던 문제(실사용 재현: 수동 편집으로 카테고리 조건이 걸러진
+	// 구독이 "실행" 대상으로 선택 가능하게 남음)를 이 필터가 막는다.
+	it('querys가 빈 구독은 걸러진다', () => {
+		assert.equal(hasCollectableConditions({ apiName: 'arxiv', querys: [] }), false);
+	});
+
+	it('조건이 하나라도 있으면 통과한다', () => {
+		assert.equal(
+			hasCollectableConditions({
+				apiName: 'arxiv',
+				querys: [{ searchType: 'keyword', query: 'graph' }],
+			}),
+			true,
+		);
 	});
 });

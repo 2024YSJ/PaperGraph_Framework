@@ -16,11 +16,24 @@ const DEFAULT_MAX_RETRY_AFTER_MS = 30_000; // 서버가 비상식적으로 긴 R
 // 에러도 없이 호출자가 멈춘다.
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+// 전송 계층 실패의 기본 재시도 — 총 대기 약 2분. 절전 복귀 후 Wi-Fi가 다시 붙는 데
+// 걸리는 시간을 넘기는 게 목적이라 일반 재시도보다 길고 성기게 잡는다.
+const DEFAULT_NETWORK_MAX_ATTEMPTS = 5;
+const DEFAULT_NETWORK_BACKOFF_MS: readonly number[] = [3_000, 10_000, 30_000, 60_000];
+
 // 타임아웃을 상태코드로 표현하기 위한 내부 값. 실제 HTTP 코드가 아니라, 재시도 판정과
 // 로그가 다른 실패와 같은 경로를 타게 하려고 쓰는 표식이다. 504(Gateway Timeout)를
 // 재사용하지 않는 이유는 "서버가 504를 줬다"와 "서버가 응답 자체를 안 했다"를 로그에서
 // 구별할 수 있어야 하기 때문이다.
 export const STATUS_CLIENT_TIMEOUT = -1;
+
+// 전송 계층 실패(연결 끊김/DNS 실패/네트워크 전환)를 상태코드로 표현하기 위한 내부 값.
+// requestUrl의 throw:false는 **상태코드만** 안 던지게 할 뿐이라, 이런 실패는 그대로
+// reject된다 — 예전에는 그 예외가 재시도 루프를 뚫고 나가 재시도 0회로 구독이 죽었다.
+// 절전에서 깨어난 직후가 정확히 이 상황이라, 깨자마자 남은 구독이 전부 즉시 실패하고
+// 수집이 끝나 있었다(QA 재현). 타임아웃과 같은 방식으로 가짜 상태코드에 실어
+// "재시도 가능한 일시적 장애" 경로를 그대로 태운다.
+export const STATUS_NETWORK_ERROR = -2;
 
 // 일시적 장애로 보고 재시도할 상태코드의 기본값.
 // - 429: rate limit
@@ -28,8 +41,11 @@ export const STATUS_CLIENT_TIMEOUT = -1;
 // - 502/504: 게이트웨이 계열 일시 장애
 // - STATUS_CLIENT_TIMEOUT: 응답 없음. 스로틀 중인 서버가 연결만 잡아두는 경우가 있어
 //   일시적 장애로 본다.
+// - STATUS_NETWORK_ERROR: 연결 자체가 안 됨. 절전 복귀 직후처럼 곧 회복되는 경우가
+//   대부분이라 재시도 대상이다.
 const DEFAULT_RETRYABLE_STATUS: ReadonlySet<number> = new Set([
 	STATUS_CLIENT_TIMEOUT,
+	STATUS_NETWORK_ERROR,
 	429,
 	502,
 	503,
@@ -45,6 +61,12 @@ export interface RetryPolicy {
 	retryableStatus?: ReadonlySet<number>;
 	// 한 번의 시도가 이 시간을 넘기면 포기하고 다음 시도로 넘어간다.
 	timeoutMs?: number;
+	// 전송 계층 실패(STATUS_NETWORK_ERROR) 전용 재시도 설정. 일반 재시도와 분리한 이유는
+	// 회복까지 걸리는 시간의 성격이 다르기 때문이다 — 429/503은 서버가 곧 받아주지만,
+	// 절전에서 깬 기기의 네트워크는 붙는 데 수십 초가 걸릴 수 있다. 기본값(3회 × 1~3초)
+	// 으로는 10초 안에 소진돼 "깨어나자마자 전부 실패"가 된다.
+	networkMaxAttempts?: number;
+	networkBackoffMs?: readonly number[];
 }
 
 // 요청이 최종 실패했을 때 던지는 에러. 상태코드를 필드로 들고 있어야 호출자가
@@ -95,7 +117,7 @@ export interface FailureDescription {
 	// ID(E001 등)는 별도 조회표 없이는 뜻을 알 수 없어서 대신 뜻이 바로 읽히는 문자열을
 	// 쓴다 — 이 코드베이스가 이미 [1]/[2]/[3] 정책 태그로 쓰는 관례와 같다(API.ts 상단
 	// 주석 참고).
-	code: 'HTTP_TIMEOUT' | 'HTTP_5XX' | 'HTTP_429' | 'HTTP_AUTH' | 'HTTP_4XX' | 'PARSE' | 'CONFIG' | 'UNKNOWN';
+	code: 'NETWORK' | 'HTTP_TIMEOUT' | 'HTTP_5XX' | 'HTTP_429' | 'HTTP_AUTH' | 'HTTP_4XX' | 'PARSE' | 'CONFIG' | 'UNKNOWN';
 	// 로그/Notice에 바로 넣을 짧은 문구. HttpRequestError의 원래 message는 요청 URL
 	// 전체(검색어 인코딩 포함)를 담고 있어 길고 잡음이 많아서, URL은 빼고 상태코드/사유만
 	// 남긴다.
@@ -107,6 +129,13 @@ export interface FailureDescription {
 
 export function describeFailure(error: unknown): FailureDescription {
 	if (error instanceof HttpRequestError) {
+		if (error.status === STATUS_NETWORK_ERROR) {
+			return {
+				code: 'NETWORK',
+				label: '연결 실패(네트워크)',
+				hint: '인터넷 연결이 끊겼거나 절전에서 막 깨어난 상태일 수 있습니다 — 연결을 확인한 뒤 다시 실행하세요.',
+			};
+		}
 		if (error.status === STATUS_CLIENT_TIMEOUT) {
 			return {
 				code: 'HTTP_TIMEOUT',
@@ -219,8 +248,12 @@ async function requestWithTimeout(
 			timeoutMs,
 		);
 	});
+	const request = requestUrl({ ...param, throw: false });
+	// 시한이 이긴 뒤에 원 요청이 실패하면 받는 사람이 없는 rejection이 된다(연결 실패는
+	// throw:false와 무관하게 reject된다) — 결과는 이미 버렸으니 여기서 삼킨다.
+	request.catch(() => undefined);
 	try {
-		return await Promise.race([requestUrl({ ...param, throw: false }), timeout]);
+		return await Promise.race([request, timeout]);
 	} finally {
 		// 요청이 먼저 끝났으면 타이머를 치운다 — 안 그러면 마지막 요청 뒤로 timeoutMs만큼
 		// 프로세스에 살아있는 타이머가 남는다.
@@ -242,11 +275,50 @@ export async function requestWithRetry(
 	const maxRetryAfterMs = policy.maxRetryAfterMs ?? DEFAULT_MAX_RETRY_AFTER_MS;
 	const retryableStatus = policy.retryableStatus ?? DEFAULT_RETRYABLE_STATUS;
 	const timeoutMs = policy.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const networkMaxAttempts = policy.networkMaxAttempts ?? DEFAULT_NETWORK_MAX_ATTEMPTS;
+	const networkBackoff = policy.networkBackoffMs ?? DEFAULT_NETWORK_BACKOFF_MS;
 	let lastStatus = 0;
+
+	// 전송 실패는 자기 예산으로 따로 센다 — 상태코드 재시도(maxAttempts)와 같은 통에서
+	// 세면, 깨어나는 동안의 연결 실패가 예산을 다 먹어 정작 서버가 429를 줄 때 재시도가
+	// 남아있지 않게 된다.
+	let networkAttempts = 0;
 
 	for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
 		const startedAt = Date.now();
-		const response = await requestWithTimeout(param, timeoutMs);
+		let response: RequestUrlResponse;
+		try {
+			response = await requestWithTimeout(param, timeoutMs);
+		} catch (error) {
+			// 여기 오는 건 상태코드가 아닌 전송 계층 실패다(requestUrl은 throw:false여도
+			// 연결 실패는 reject한다). 예산이 남아 있으면 이 시도는 없던 걸로 하고
+			// 백오프만큼 쉰 뒤 다시 건다.
+			networkAttempts += 1;
+			const willRetry = networkAttempts < networkMaxAttempts;
+			const waitMs =
+				networkBackoff[Math.min(networkAttempts - 1, networkBackoff.length - 1)] ??
+				retryDelayMs;
+			Log.warn('http.retry', '연결 실패 — 전송 계층 오류', {
+				url: param.url,
+				networkAttempt: networkAttempts,
+				networkMaxAttempts,
+				elapsedMs: Date.now() - startedAt,
+				waitMs: willRetry ? waitMs : 0,
+				willRetry,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			if (!willRetry) {
+				Log.error('http.fail', '연결 실패 — 재시도 소진', error, {
+					url: param.url,
+					networkAttempts,
+				});
+				throw new HttpRequestError(param.url, STATUS_NETWORK_ERROR, true, networkAttempts);
+			}
+			await delay(waitMs);
+			// 상태코드 재시도 예산은 쓰지 않는다.
+			attempt -= 1;
+			continue;
+		}
 		const elapsedMs = Date.now() - startedAt;
 		if (retryableStatus.has(response.status)) {
 			lastStatus = response.status;

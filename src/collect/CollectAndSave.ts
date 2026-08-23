@@ -43,6 +43,9 @@ interface CollectWindow {
 	from: number;
 	to: number;
 	advancesCursor: boolean;
+	// backfill 전용 — 사용자가 실제로 요청한 구간의 시작. 이어받기로 from이 앞당겨져도
+	// 진행 기록의 키와 실패 메시지의 "미완료 구간"은 요청한 원래 구간이어야 한다.
+	requestedFrom?: number;
 }
 
 // embedOrReuse가 서킷브레이커 대응에 필요한 만큼만 보는 조각. run()의 CollectStats와
@@ -64,7 +67,15 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 이번 실행에서 끝까지 실패한 구독들. 한 구독의 실패가 나머지 구독의 진행/커서 갱신을
 	// 막지 않도록 collect()가 구독 경계에서 격리하는데(아래 collect() 주석 참고), 그
 	// 대가로 "무엇이 실패했는지"를 어딘가에는 남겨야 한다 — 그게 여기다.
-	failedSubscriptions: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[];
+	failedSubscriptions: {
+		apiName: string;
+		querys: SearchQuery[];
+		error: string;
+		hint: string;
+		// backfill 실패에서만 채워진다 — 어느 구간이 안 끝났는지 사용자가 알아야
+		// 「과거 논문 수집」을 그 범위로 다시 열어 재입력할 수 있다.
+		range?: { from: number; to: number };
+	}[];
 	// [2] 정책으로 arXiv 응답에서 건너뛴 항목 수의 합(API.CollectionCoverage.skippedEntries,
 	// 구독마다 누적). Paper로 승격되지 못해 어디에도 저장되지 않는 항목이라, 여기서 집계하지
 	// 않으면 "N편 수집" 요약만 보고는 이런 항목이 있었다는 사실 자체를 알 수 없다.
@@ -77,6 +88,19 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 자동 재시도(repairCitationsBody) 대상에서 빠진 수. 이 논문들은 유실은 아니고(다음
 	// 플러그인 로드 시 전수 보정이 결국 잡는다 — 위 상수 주석 참고) 재시도만 늦어진다.
 	citationRetryOverflow: number;
+	// 요청한 category 조건과 실제 응답이 어긋난 건수의 합(API.CollectionCoverage.
+	// categoryMismatches, 구독마다 누적). 정상 상황에서는 항상 0 — 0이 아니면 수집 도중
+	// 요청이 변조됐거나(8번, 프록시 재현 사례) arXiv 응답 자체가 이상했다는 신호라, 조용히
+	// 넘기지 않고 사용자에게 알린다.
+	categoryMismatches: number;
+	// 읽는 중에 허용되지 않는 구독 조건이 걸러졌는가(9번/69번 화이트리스트 — 보통 파일을
+	// 직접 편집한 경우). 예전엔 이 경우 수집 전체를 막고 throw했는데, 그러면 UI가 없는
+	// 자동 실행 경로(자동 수집 스케줄러·명령 팔레트)에서는 걸러진 구독 하나 때문에 나머지
+	// 멀쩡한 구독까지 아무것도 수집되지 않은 채로 계속 실패만 반복했다(사용자 요청 —
+	// 리본/구독 선택 창처럼 "걸러내고 나머지는 계속 진행"이 자동 실행에서도 똑같이
+	// 적용돼야 한다). 이제 막지 않고 계속 진행하되, 이 신호를 실어 CollectController가
+	// (실행 경로와 무관하게) 완료 알림에 반영한다.
+	droppedInvalidConditions: boolean;
 }
 
 // 한 번의 보정 실행이 무엇을 했는지 (예전 combined 경로 — repair()가 남긴다).
@@ -167,6 +191,14 @@ export class CollectAndSave {
 	private queueListeners: ((state: CollectQueueState) => void)[] = [];
 	// 아직 시작하지 않은 recent 작업. 합침(coalescing) 대상이다 — 아래 requestRecent 참고.
 	private pendingRecent: Promise<void> | undefined;
+	// 아직 시작하지 않은 run() 작업들 — mode+대상 구독이 같으면 새로 큐에 넣지 않고 여기
+	// 걸린 Promise를 그대로 돌려준다. 사용자가 같은 버튼을 연타해도 대기 중인 동일 요청이
+	// 있으면 합쳐진다(연타로 큐가 무한히 쌓이는 것을 막는다) — run() 참고.
+	private pendingRuns = new Map<string, Promise<void>>();
+	// 아직 시작하지 않은 refreshAll() 작업 — pendingRecent와 같은 패턴. refreshAll은
+	// 대상을 좁히는 인자가 없어(항상 코퍼스 전체) 요청마다 구분할 키가 필요 없다 —
+	// 「새로고침」 버튼 연타가 그대로 큐에 쌓이던 문제(57번) 방지.
+	private pendingRefresh: Promise<void> | undefined;
 	// dispose() 이후 true. 이미 시작한 네트워크 요청은 취소할 수 없지만(requestUrl에
 	// 취소 수단이 없다 — ApiSupport.requestWithTimeout 주석 참고), 이 플래그가 서는
 	// 지점들(enqueue/collect/processChunk/repairNow)은 그 요청이 끝나는 대로 더 진행하지
@@ -216,6 +248,23 @@ export class CollectAndSave {
 	// 횟수만큼 진행률 Notice를 띄우게 된다.
 	get hasPendingRecent(): boolean {
 		return this.pendingRecent !== undefined;
+	}
+
+	// run()과 정확히 같은 키(mode+대상 구독)로 아직 시작하지 않은 요청이 이미 큐에 있는가 —
+	// hasPendingRecent와 같은 이유다. run() 자체는 이미 대기 중인 요청과 합쳐 같은
+	// Promise를 돌려주지만(57번, 새로고침과 같은 근본 원인), 그 사실을 모르는 호출자
+	// (CollectController.runRecent/openBackfillModal)는 매 클릭마다 새 ProgressFlow와
+	// Notice를 또 만든다 — run()이 내부적으로 합쳐도 UI에서는 "쌓이는 것처럼" 보였다.
+	// 호출자가 실제로 run()을 부르기 전에 이걸로 먼저 확인해, 이미 대기 중이면 새
+	// 진행률 UI를 만들지 않고 조용히 안내만 하게 한다.
+	hasPendingRun(mode: 'recent' | 'backfill', testOptions?: CollectTestOptions): boolean {
+		return this.pendingRuns.has(CollectAndSave.runKey(mode, testOptions));
+	}
+
+	// hasPendingRun과 같은 이유로 refreshAll() 전용 — CollectController.refreshAllAuto가
+	// 매 클릭마다 "준비 중..." Notice를 새로 띄우기 전에 먼저 확인한다.
+	get hasPendingRefresh(): boolean {
+		return this.pendingRefresh !== undefined;
 	}
 
 	// 큐가 변할 때마다(입큐/시작/종료) 불린다. UI가 버튼 상태와 안내 문구를 갱신한다.
@@ -312,8 +361,12 @@ export class CollectAndSave {
 	}
 
 	// 실행 계열. 큐를 거쳐 직렬로 실행된다 — 이미 돌고 있는 작업이 있으면 그 뒤에 선다.
-	// requestRecent와 달리 합치지 않는다: 호출자가 명시적으로 요청한 실행이라 임의로
-	// 하나로 묶으면 "누른 만큼 돈다"는 기대가 깨진다.
+	//
+	// 아직 시작하지 않은 동일 요청(mode + 대상 구독이 같음)이 큐에 있으면 새로 넣지 않고
+	// 그 Promise를 합쳐 돌려준다(pendingRuns) — 사용자가 같은 버튼을 연타해도 의미 없는
+	// 중복 실행이 쌓이지 않는다. targetSubscriptions가 없으면(구독 전체 대상) 항상 같은
+	// 키로 취급한다. 이미 시작된 작업은 합치지 않는다 — 그 시점의 구독 목록으로 이미 돌고
+	// 있어서 뒤늦은 요청은 별개로 다시 실행해야 반영된다.
 	//
 	// onStart는 "줄에서 빠져나와 실제로 시작했다"는 신호다. 큐가 생기면서 요청 시점과 실행
 	// 시점이 갈라졌고, UI는 그 둘을 다르게 표시해야 한다(대기 중 / 수집 중).
@@ -334,11 +387,36 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
 		const label = mode === 'recent' ? '최근 논문 수집' : '과거 논문 수집';
-		return this.enqueue(
+		const key = CollectAndSave.runKey(mode, testOptions);
+		const pending = this.pendingRuns.get(key);
+		if (pending !== undefined) {
+			return pending;
+		}
+		const result = this.enqueue(
 			{ kind: mode, label },
 			() => this.runNow(mode, testOptions, onTotal, onApiStart, onApiDone),
-			onStart,
+			() => {
+				// 시작하는 순간 합침 대상에서 빠진다(requestRecent와 같은 패턴).
+				if (this.pendingRuns.get(key) === result) {
+					this.pendingRuns.delete(key);
+				}
+				onStart?.();
+			},
 		);
+		this.pendingRuns.set(key, result);
+		return result;
+	}
+
+	// run() 합침 판단용 키 — mode와 대상 구독(선택 안 했으면 "전체")이 같으면 같은 요청으로
+	// 본다. backfill은 날짜 범위도 다르면 별개 요청이어야 하므로 from/to까지 포함한다.
+	private static runKey(mode: 'recent' | 'backfill', testOptions?: CollectTestOptions): string {
+		const targets =
+			testOptions?.targetSubscriptions
+				?.map((t) => `${t.apiName}:${t.querys.map((q) => `${q.searchType}:${q.query}`).join(',')}`)
+				.sort()
+				.join('|') ?? 'ALL';
+		const range = mode === 'backfill' ? `:${testOptions?.from ?? ''}~${testOptions?.to ?? ''}` : '';
+		return `${mode}:${targets}${range}`;
 	}
 
 	// targetSourceIds를 주면 그 논문들만 재시도한다. 생략하면 코퍼스 전체에서 실패 플래그가
@@ -391,11 +469,22 @@ export class CollectAndSave {
 		onStart?: () => void,
 		onProgress?: (done: number, total: number) => void,
 	): Promise<void> {
-		return this.enqueue(
+		if (this.pendingRefresh !== undefined) {
+			return this.pendingRefresh;
+		}
+		const pending = this.enqueue(
 			{ kind: 'refresh', label: '새로고침' },
 			() => this.refreshAllNow(onProgress),
-			onStart,
+			() => {
+				// 시작하는 순간 합침 대상에서 빠진다(requestRecent/run()과 같은 패턴).
+				if (this.pendingRefresh === pending) {
+					this.pendingRefresh = undefined;
+				}
+				onStart?.();
+			},
 		);
+		this.pendingRefresh = pending;
+		return pending;
 	}
 
 	// 실제 수집 몸통 — 큐가 한 번에 하나만 부른다.
@@ -412,6 +501,14 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<void> {
 		this.sub = await File.readSubscriptions();
+		// 읽는 중에 허용되지 않는 조건이 걸러졌으면(9번/69번 화이트리스트 — 보통 파일을
+		// 직접 편집한 경우) 여기서 값을 캡처해둔다 — 이 뒤로 다른 File 호출이 끼어들면
+		// 플래그가 다시 계산돼 이 정보를 놓친다. 예전엔 이 경우 수집 전체를 막고 throw
+		// 했는데, UI가 없는 자동 실행 경로(스케줄러·명령 팔레트)에서는 걸러진 구독 하나
+		// 때문에 나머지 멀쩡한 구독까지 계속 아무것도 수집 못 했다 — 리본/구독 선택
+		// 창(걸러내고 나머지는 진행)과 다른 동작이었다(사용자 요청으로 통일). 이제 막지
+		// 않고 stats에 실어 CollectController가 완료 알림에 반영한다.
+		const droppedInvalidConditions = File.lastReadDroppedInvalidConditions;
 		const allApis = this.sub.apis ?? [];
 		if (allApis.length === 0) {
 			throw new Error(
@@ -459,6 +556,8 @@ export class CollectAndSave {
 			skippedEntries: 0,
 			anyTruncated: false,
 			citationRetryOverflow: 0,
+			categoryMismatches: 0,
+			droppedInvalidConditions,
 		};
 		const failures: { citation: Paper[] } = { citation: [] };
 		let chunks = 0;
@@ -517,13 +616,14 @@ export class CollectAndSave {
 
 		// 구독마다 독립 커서라 갱신 대상도 구독마다 다르다 — collect()가 advancesCursor인
 		// 구독만 골라 돌려준다(Backfill/테스트 hours로 돈 구독은 여기 안 낀다).
+		// 실제 저장은 collect()가 구독이 끝날 때마다 이미 마쳤다(중간에 끊겨도 끝난 구독의
+		// 커서는 남는다) — 여기서는 이번 실행의 갱신 내역을 한 줄로 남기기만 한다.
 		Log.info('collect', '수집 커서 갱신', {
 			updates: cursorUpdates.map((u) => ({
 				apiName: u.apiName,
 				cursor: new Date(u.cursor).toISOString(),
 			})),
 		});
-		await File.updateApiCursors(cursorUpdates);
 
 		// 3번: 보정 자동화(인용수) — 이번 실행에서 인용수를 못 채운 논문은 이미 메모리에
 		// 있으므로(failures.citation), File.readAllPapers()로 코퍼스를 다시 훑지 않고 그
@@ -1074,6 +1174,9 @@ export class CollectAndSave {
 		mode: 'recent' | 'backfill',
 		testOptions: CollectTestOptions | undefined,
 		api: API,
+		// 이 구독의 이 구간에 저장된 backfill 이어받기 지점(File.findBackfillResumePoint).
+		// 없으면 요청한 from부터 훑는다.
+		resumeFrom?: number,
 	): CollectWindow {
 		const now = Date.now();
 
@@ -1119,7 +1222,19 @@ export class CollectAndSave {
 					'PaperGraph3D: 과거 논문 수집 구간의 종료일이 미래입니다 — 오늘 이전 날짜로 지정하세요.',
 				);
 			}
-			return { from, to, advancesCursor: false };
+			// 지난 실행이 남긴 지점부터 이어받는다 — 그 앞 구간의 논문은 이미 저장까지
+			// 끝났다. resumeFrom은 findBackfillResumePoint가 구간 안쪽임을 이미 확인한
+			// 값이라 여기서 다시 검사하지 않는다.
+			if (resumeFrom !== undefined) {
+				Log.info('collect', 'backfill 이어받기 — 지난 실행이 멈춘 지점부터 훑는다', {
+					apiName: api.apiName,
+					requestedFrom: new Date(from).toISOString(),
+					resumeFrom: new Date(resumeFrom).toISOString(),
+					to: new Date(to).toISOString(),
+				});
+				return { from: resumeFrom, to, advancesCursor: false, requestedFrom: from };
+			}
+			return { from, to, advancesCursor: false, requestedFrom: from };
 		}
 
 		if (testOptions?.hours !== undefined) {
@@ -1165,16 +1280,26 @@ export class CollectAndSave {
 		onApiDone?: (api: API, index: number, total: number) => void,
 	): Promise<{
 		cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[];
-		subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[];
+		subscriptionFailures: {
+			apiName: string;
+			querys: SearchQuery[];
+			error: string;
+			hint: string;
+			range?: { from: number; to: number };
+		}[];
 		skippedRecords: SkippedEntryRecord[];
 	}> {
-		const options: CollectOptions = {
-			prefill: (papers) => this.prefillFromStore(papers),
-			onChunk,
-			onTotal,
-		};
+		// backfill 이어받기 지점은 실행 시작 시 한 번만 읽는다 — 이 실행이 도는 동안
+		// 쓰는 쪽도 여기(아래 onRoundComplete)뿐이라, 매 구독마다 다시 읽을 이유가 없다.
+		const backfillProgress = mode === 'backfill' ? await File.readBackfillProgress() : [];
 		const cursorUpdates: { apiName: string; querys: SearchQuery[]; cursor: number }[] = [];
-		const subscriptionFailures: { apiName: string; querys: SearchQuery[]; error: string; hint: string }[] = [];
+		const subscriptionFailures: {
+			apiName: string;
+			querys: SearchQuery[];
+			error: string;
+			hint: string;
+			range?: { from: number; to: number };
+		}[] = [];
 		// 7번(부분 재조회)용 원자재 — CollectStats에는 안 넣는다(그 인터페이스는 이 기능이
 		// 없어져도 남아야 하는 핵심 통계라 임시 기능과 섞지 않는다). runNow()가 이 배열을
 		// 그대로 SkippedEntries.json에 append한다.
@@ -1209,12 +1334,57 @@ export class CollectAndSave {
 				apiName: api.apiName,
 				querys: api.querys.map((q) => `${q.searchType}:${q.query}`),
 			});
+			let window: CollectWindow | undefined;
 			try {
-				const window = this.resolveWindow(mode, testOptions, api);
+				window = this.resolveWindow(
+					mode,
+					testOptions,
+					api,
+					mode === 'backfill' && testOptions?.from !== undefined && testOptions.to !== undefined
+						? File.findBackfillResumePoint(
+								backfillProgress,
+								api.apiName,
+								api.querys,
+								testOptions.from,
+								testOptions.to,
+							)
+						: undefined,
+				);
+				const requestedFrom = window.requestedFrom;
+				const requestedTo = window.to;
+				const options: CollectOptions = {
+					prefill: (papers) => this.prefillFromStore(papers),
+					onChunk,
+					onTotal,
+					// backfill만 진행 지점을 남긴다. recent는 구독 커서(updateTime)가 같은
+					// 역할을 이미 하고 있어 두 벌로 관리할 이유가 없다.
+					onRoundComplete:
+						requestedFrom === undefined
+							? undefined
+							: (coveredThrough) =>
+									File.saveBackfillProgress({
+										apiName: api.apiName,
+										querys: api.querys,
+										from: requestedFrom,
+										to: requestedTo,
+										coveredThrough,
+										updatedAt: Date.now(),
+									}),
+				};
 				if (window.hours === undefined) {
 					await api.Backfill(window.from, window.to, options);
 				} else {
 					await api.SearchRecentPaper(window.hours, options);
+				}
+				// 요청 구간을 끝까지 훑었으면 이어받기 기록은 필요 없다. 남겨두면 같은
+				// 구간을 다시 요청했을 때 "이미 끝난 지점"에서 시작해 0편으로 끝난다.
+				// 커서 정체 등으로 잘린 채(truncated) 끝났으면 기록을 남겨 다음 실행이
+				// 그 지점부터 다시 시도하게 둔다.
+				if (requestedFrom !== undefined && api.lastCoverage?.truncated !== true) {
+					await runQuietly(
+						() => File.clearBackfillProgress(api.apiName, api.querys),
+						'collect.clearBackfillProgress',
+					);
 				}
 				onApiDone?.(api, index, apis.length);
 				Log.info('collect', '구독 수집 완료', {
@@ -1231,13 +1401,19 @@ export class CollectAndSave {
 						stats.anyTruncated = true;
 					}
 					skippedRecords.push(...coverage.skipped);
+					stats.categoryMismatches += coverage.categoryMismatches;
 				}
 				if (window.advancesCursor) {
-					cursorUpdates.push({
+					const update = {
 						apiName: api.apiName,
 						querys: api.querys,
 						cursor: CollectAndSave.resolveCursor(api, window.to),
-					});
+					};
+					cursorUpdates.push(update);
+					// 구독이 끝나는 즉시 저장한다. 예전에는 실행이 전부 끝난 뒤 한 번에
+					// 썼는데, 그러면 구독 3개 중 2개가 끝난 상태에서 기기가 꺼지면 이미
+					// 끝난 2개의 커서까지 같이 날아가 다음 실행이 같은 구간을 다시 훑었다.
+					await File.updateApiCursors([update]);
 				}
 			} catch (error) {
 				// 이 구독은 실패로 남기고 다음 구독으로 넘어간다 — 이미 이 구독이 emit한
@@ -1250,7 +1426,23 @@ export class CollectAndSave {
 				// (검색어 인코딩 포함)를 담고 있어 Notice/로그 한 줄에 넣기엔 너무 길고
 				// 잡음이 많다. 전체 스택은 Log.error의 error 인자로 이미 따로 남는다.
 				const { code, label, hint } = describeFailure(error);
-				subscriptionFailures.push({ apiName: api.apiName, querys: api.querys, error: label, hint });
+				// backfill이 실패하면 어느 구간이 안 끝났는지 사용자가 알아야 재입력할 수
+				// 있다 — window가 resolveWindow까지 성공한 뒤(즉 range 자체는 유효했는데
+				// 네트워크 등으로 중단된 경우)에만 채워진다. window가 없으면(범위 검증
+				// 자체가 실패) 이미 error 메시지가 원인을 설명하므로 range는 생략한다.
+				// 사용자에게는 "요청한 구간 중 어디가 안 끝났는지"를 보여준다 — 이어받기로
+				// 앞당겨진 window.from이 아니라 원래 요청한 구간이 기준이다.
+				const range =
+					mode === 'backfill' && window !== undefined
+						? { from: window.requestedFrom ?? window.from, to: window.to }
+						: undefined;
+				subscriptionFailures.push({
+					apiName: api.apiName,
+					querys: api.querys,
+					error: label,
+					hint,
+					range,
+				});
 				// 메시지 문자열 자체에 "어느 구독이 왜 죽었는지, 뭘 확인해야 하는지"가 다
 				// 들어가야 한다 — 로그를 죽 훑을 때 매 줄 뒤의 JSON을 펼쳐보지 않고도 원인과
 				// 대응을 바로 알 수 있게. code를 대괄호로 붙이는 건 이 코드베이스가 이미
@@ -1258,15 +1450,24 @@ export class CollectAndSave {
 				// 종류의 실패를 모아볼 수 있다.
 				const querysText = api.querys.map((q) => `${q.searchType}:${q.query}`).join(' AND ');
 				const hintText = hint ? ` — ${hint}` : '';
+				const rangeText = range
+					? ` — 미완료 구간 ${CollectAndSave.formatDate(range.from)}~${CollectAndSave.formatDate(range.to)}`
+					: '';
 				Log.error(
 					'collect',
-					`구독 수집 실패 [${code}] — [${api.apiName}] ${querysText} — ${label}${hintText} — 다음 구독으로 진행`,
+					`구독 수집 실패 [${code}] — [${api.apiName}] ${querysText} — ${label}${hintText}${rangeText} — 다음 구독으로 진행`,
 					error,
 					{ apiName: api.apiName, querys: api.querys.map((q) => `${q.searchType}:${q.query}`) },
 				);
 			}
 		}
 		return { cursorUpdates, subscriptionFailures, skippedRecords };
+	}
+
+	// 실패 메시지에 넣을 사람이 읽는 날짜(YYYY-MM-DD). 시각까지는 필요 없다 — backfill
+	// 범위는 항상 날짜 단위로 고른다(SubscriptionTargetModal).
+	private static formatDate(ms: number): string {
+		return new Date(ms).toISOString().slice(0, 10);
 	}
 
 	// 잘린(truncated) API는 그 지점까지만 인정한다. 요청한 구간의 끝(requestedTo)을

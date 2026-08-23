@@ -54,11 +54,22 @@ export class VaultStub {
 	}
 
 	// ── adapter API (플러그인 폴더의 Secret/Subscriptions) ──────────
+	// rename/remove는 File.writeConfig의 임시 파일 → rename 원자적 쓰기가 쓴다.
 	readonly adapter = {
 		exists: (path: string): Promise<boolean> => Promise.resolve(this.files.has(path)),
 		read: (path: string): Promise<string> => Promise.resolve(this.files.get(path) ?? ''),
 		write: (path: string, text: string): Promise<void> => {
 			this.files.set(path, text);
+			return Promise.resolve();
+		},
+		remove: (path: string): Promise<void> => {
+			this.files.delete(path);
+			return Promise.resolve();
+		},
+		rename: (path: string, newPath: string): Promise<void> => {
+			const text = this.files.get(path) ?? '';
+			this.files.delete(path);
+			this.files.set(newPath, text);
 			return Promise.resolve();
 		},
 	};

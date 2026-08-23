@@ -1,14 +1,26 @@
-import { TFile, Vault } from 'obsidian';
+import { Notice, TFile, Vault } from 'obsidian';
 import { Log } from './Log';
 import { Secret } from '../collect/Secret';
 import { Subscriptions } from '../collect/Subscriptions';
-import { API, ArxivAPI, type SkippedEntryRecord } from '../collect/API';
+import { API, findApiNames, findDescriptor, type SkippedEntryRecord } from '../collect/API';
 import { ExtraData, Paper } from '../collect/Paper';
 import { SearchQuery } from '../collect/SearchQuery';
-import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from '../collect/ScheduleSettings';
+import { DEFAULT_SCHEDULE_SETTINGS, ScheduleSettings } from './ScheduleSettings';
+import { isUsablePaperDate } from './DateUtil';
 
 // .json 저장 래퍼. schemaVersion은 향후 대비 상수(현재 분기/마이그레이션엔 안 씀).
 // 설계 근거: docs/devLog/002.md.
+// backfill 진행 지점 한 건. 구독(apiName + querys)과 요청 구간(from~to)이 모두 같을
+// 때만 이어받기에 쓴다 — 구간이 다르면 "어디까지 훑었나"의 기준이 달라진다.
+export interface BackfillProgressRecord {
+	apiName: string;
+	querys: SearchQuery[];
+	from: number;
+	to: number;
+	coveredThrough: number;
+	updatedAt: number;
+}
+
 export interface StoredPaperFile {
 	schemaVersion: number;
 	paper: Paper; // Paper 필드 그대로 (embedding 포함)
@@ -26,10 +38,10 @@ const MAX_TITLE_LENGTH = 100;
 const NOTE_BEGIN = '<!-- pg3d:begin -->';
 const NOTE_END = '<!-- pg3d:end -->';
 
-// provider별 논문 웹 URL 생성기. 새 provider를 지원하려면 이 목록에 한 줄만 추가하면 되고
-// paperUrl 함수 본문은 손대지 않는다(데이터 주도). localId는 sourceId의 ':' 뒤 부분.
-const PAPER_URL_BUILDERS: Record<string, (localId: string) => string> = {
-	arxiv: (localId) => `https://arxiv.org/abs/${localId}`,
+// 구독 가능한 출처(arxiv 등)의 URL 규칙은 findDescriptor(provider).paperUrl이 안다 —
+// 여기 남은 건 구독 API로 등록되지 않은 provider(semanticScholar: 지금은 인용수 보강
+// 용도로만 쓰여 자기 논문을 직접 수집하지 않지만, sourceId 접두어 체계는 공유한다)뿐이다.
+const FALLBACK_PAPER_URL_BUILDERS: Record<string, (localId: string) => string> = {
 	semanticScholar: (localId) => `https://www.semanticscholar.org/paper/${localId}`,
 };
 
@@ -48,6 +60,27 @@ export class File {
 	private static readonly OBFUSCATION_KEY = 'PaperGraph3D::pg3d-obfuscation-v1';
 
 	private static readonly PAPER_ROOT = 'PaperGraph3D';
+
+	// 가장 최근 readSubscriptions() 호출에서 화이트리스트 검증(9번/69번)에 걸려 조건이
+	// 걸러졌는지 — 호출자(CollectAndSave.runNow)가 "구독이 이상하면 이번 수집은 하지 않고
+	// 경고만 띄운다"를 판단하는 데 쓴다. readSubscriptions 자체는 자가 복구(파일을 정리된
+	// 상태로 되돌려 씀)까지만 책임지고, "그래서 이번 수집을 계속할지"는 도메인(수집 로직)의
+	// 판단이라 여기 File은 사실만 노출한다. readSubscriptions를 부를 때마다 다시 계산된다.
+	static lastReadDroppedInvalidConditions = false;
+
+	// 가장 최근 readAllPapers()/readPapersByYear() 호출에서 규격을 벗어나 건너뛴 파일들
+	// (QA 12번/15번/18번). lastReadDroppedInvalidConditions와 같은 방침 — File은 "이런
+	// 파일을 무시했다"는 사실만 노출하고, 사용자에게 알릴지 말지는 호출자가 정한다.
+	// 경로 목록은 로그용이라 앞쪽 몇 개만 보관한다(코퍼스 전체가 어긋난 경우 대비).
+	static lastScanSkipped: { count: number; samples: string[] } = { count: 0, samples: [] };
+
+	private static readonly SKIPPED_SAMPLE_LIMIT = 5;
+
+	// 콘텐츠 트리에서 논문으로 인정하는 유일한 경로 모양:
+	// PaperGraph3D/<YYYY>/<MM>/<DD>/<이름>.json (날짜가 없는 논문은 unknown/<이름>.json).
+	// startsWith + 확장자만 보던 예전 필터는 깊이를 전혀 안 봐서, 연도 폴더 바로 밑에
+	// 넣은 .json(18번)도 논문으로 읽혔다.
+	private static readonly PAPER_RELATIVE_PATH = /^(?:(\d{4})\/(\d{2})\/(\d{2})|unknown)\/[^/]+\.json$/;
 
 	static init(vault: Vault, pluginDir: string): void {
 		File.vault = vault;
@@ -125,13 +158,150 @@ export class File {
 	static readSkippedEntries(): Promise<SkippedEntryRecord[]> {
 		return File.readConfig(
 			'SkippedEntries.json',
-			(raw) => (Array.isArray(raw) ? (raw as SkippedEntryRecord[]) : []),
+			(raw) => (Array.isArray(raw) ? raw.filter((v) => File.isValidSkippedEntryRecord(v)) : []),
 			() => [],
+		);
+	}
+
+	// 필드 하나라도 모양이 안 맞는 레코드는(수동 편집, 손상 등) 조용히 뺀다 — 이 파일은
+	// 7번(부분 재조회)의 임시 진단/재시도 보조용이라, 레코드 하나 이상해도 나머지가
+	// 정상 동작해야지 통째로 못 쓰게 되면 안 된다.
+	private static isValidSkippedEntryRecord(value: unknown): value is SkippedEntryRecord {
+		if (typeof value !== 'object' || value === null) {
+			return false;
+		}
+		const r = value as Partial<SkippedEntryRecord>;
+		return (
+			typeof r.rawId === 'string' &&
+			typeof r.title === 'string' &&
+			(r.reason === 'no-id' || r.reason === 'missing-fields') &&
+			typeof r.apiName === 'string' &&
+			typeof r.collectedQuery === 'object' &&
+			r.collectedQuery !== null &&
+			typeof r.collectedQuery.searchType === 'string' &&
+			typeof r.collectedQuery.query === 'string' &&
+			typeof r.skippedAt === 'number'
 		);
 	}
 
 	static writeSkippedEntries(records: SkippedEntryRecord[]): Promise<void> {
 		return File.writeConfig('SkippedEntries.json', records);
+	}
+
+	// ── Backfill 진행 지점 (BackfillProgress.json) ─────────────────
+	//
+	// 27만 편짜리 backfill은 수 시간이 걸리는데, 예전에는 진행 지점을 어디에도 남기지
+	// 않았다(backfill은 구독 커서 updateTime을 올리지 않는다 — 그건 recent 수집의
+	// "최근 어디까지 봤나"라서 과거 구간을 메우는 일과 뜻이 다르다). 그래서 절전·강제
+	// 종료·네트워크 소진 등으로 한 번 끊기면 재실행이 항상 요청 구간의 처음부터 다시
+	// 훑었다(QA 재현). 논문 파일은 남아 있어 재저장·재임베딩은 건너뛰지만, arXiv를
+	// 처음부터 다시 페이징하는 시간은 그대로 든다.
+	//
+	// 라운드가 끝날 때마다 갱신한다 — 그 시점엔 [from, coveredThrough] 구간의 논문이
+	// 이미 디스크에 저장까지 끝나 있어(collectRounds가 emit을 await한다) 그 지점부터
+	// 이어받아도 잃는 게 없다. Subscriptions.json에 얹지 않고 파일을 나눈 이유는 저장
+	// 주기가 다르기 때문이다 — 이쪽은 라운드마다(분 단위) 쓰이고, 구독 파일은 사용자가
+	// 편집하는 설정이다.
+	static readBackfillProgress(): Promise<BackfillProgressRecord[]> {
+		return File.readConfig(
+			'BackfillProgress.json',
+			(raw) => (Array.isArray(raw) ? raw.filter((v) => File.isValidBackfillProgressRecord(v)) : []),
+			() => [],
+		);
+	}
+
+	// findBackfillResumePoint가 이미 구간 밖 coveredThrough는 걸러내지만(사용 시점), 그건
+	// 값이 숫자라는 전제 위에서만 동작한다 — 필드 자체가 없거나 타입이 다르면 그 비교식이
+	// NaN 비교가 되어 조용히 false가 아니라 예측 못 할 값이 될 수 있다. 읽기 시점에
+	// 구조부터 확인한다.
+	private static isValidBackfillProgressRecord(value: unknown): value is BackfillProgressRecord {
+		if (typeof value !== 'object' || value === null) {
+			return false;
+		}
+		const r = value as Partial<BackfillProgressRecord>;
+		return (
+			typeof r.apiName === 'string' &&
+			Array.isArray(r.querys) &&
+			r.querys.every(
+				(q) =>
+					typeof q === 'object' &&
+					q !== null &&
+					typeof (q as Partial<SearchQuery>).searchType === 'string' &&
+					typeof (q as Partial<SearchQuery>).query === 'string',
+			) &&
+			typeof r.from === 'number' &&
+			typeof r.to === 'number' &&
+			typeof r.coveredThrough === 'number' &&
+			typeof r.updatedAt === 'number'
+		);
+	}
+
+	// 같은 구독(apiName + querys)의 기록은 하나만 남긴다 — 구간이 다르면 옛 기록은
+	// 쓸모가 없다(이어받기는 요청 구간이 완전히 같을 때만 성립한다).
+	static async saveBackfillProgress(record: BackfillProgressRecord): Promise<void> {
+		await File.mutateBackfillProgress((records) => [
+			...records.filter((r) => !File.sameBackfillTarget(r, record)),
+			record,
+		]);
+	}
+
+	// 구간을 끝까지 훑었으면 기록을 지운다. 남겨두면 같은 구간을 다시 요청했을 때
+	// "이미 끝난 지점"에서 시작해 아무것도 안 하고 끝난다.
+	static async clearBackfillProgress(apiName: string, querys: SearchQuery[]): Promise<void> {
+		await File.mutateBackfillProgress((records) =>
+			records.filter((r) => !File.sameBackfillTarget(r, { apiName, querys })),
+		);
+	}
+
+	// 이 구독의 이 구간에 저장된 이어받기 지점. 없거나 구간이 다르면 undefined.
+	static findBackfillResumePoint(
+		records: BackfillProgressRecord[],
+		apiName: string,
+		querys: SearchQuery[],
+		from: number,
+		to: number,
+	): number | undefined {
+		const match = records.find(
+			(r) =>
+				File.sameBackfillTarget(r, { apiName, querys }) && r.from === from && r.to === to,
+		);
+		if (match === undefined) {
+			return undefined;
+		}
+		// 저장된 값이 구간 밖이면(파일 수동 편집 등) 믿지 않는다 — 구간을 건너뛰는
+		// 방향의 오류는 영구 누락이 된다.
+		if (
+			!Number.isFinite(match.coveredThrough) ||
+			match.coveredThrough <= from ||
+			match.coveredThrough >= to
+		) {
+			return undefined;
+		}
+		return match.coveredThrough;
+	}
+
+	private static sameBackfillTarget(
+		a: { apiName: string; querys: SearchQuery[] },
+		b: { apiName: string; querys: SearchQuery[] },
+	): boolean {
+		return a.apiName === b.apiName && File.searchQueriesEqual(a.querys, b.querys);
+	}
+
+	// 라운드마다 불리는 read-modify-write라 직렬화한다(mutateSubscriptions와 같은 이유).
+	private static backfillQueue: Promise<void> = Promise.resolve();
+
+	private static mutateBackfillProgress(
+		mutator: (records: BackfillProgressRecord[]) => BackfillProgressRecord[],
+	): Promise<void> {
+		const result = File.backfillQueue.then(async () => {
+			const records = await File.readBackfillProgress();
+			await File.writeConfig('BackfillProgress.json', mutator(records));
+		});
+		File.backfillQueue = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
 	}
 
 	// Secret.json도 함께 읽어 복원된 각 API 인스턴스에 실어 보낸다 — 저장된 Subscriptions.json
@@ -140,7 +310,12 @@ export class File {
 	// 넘긴다.
 	static async readSubscriptions(): Promise<Subscriptions> {
 		const secret = await File.readSecret();
-		return File.readConfig(
+		// revive는 동기 함수라 그 안에서 flag를 못 들고 나가므로, 바깥의 let으로 받는다 —
+		// 아래 readConfig 호출 이후 이 값을 보고 자가 복구(write-back) 여부를 정한다.
+		let droppedAny = false;
+		// 이번 호출 결과로 매번 새로 계산한다 — 이전 호출의 값이 남아있으면 안 된다.
+		File.lastReadDroppedInvalidConditions = false;
+		const subscriptions = await File.readConfig(
 			'Subscriptions.json',
 			(raw) => {
 				// 저장된 apis는 평범한 객체({ apiName, querys, updateTime })라 메서드가 없다.
@@ -165,11 +340,40 @@ export class File {
 				// 복원하는 유일한 지점에서 걸러내면 어떤 경로로 파일에 들어왔든(수동 편집,
 				// 앞으로 생길 다른 저장 경로) 런타임에는 항상 하나로만 존재한다.
 				const seen = new Set<string>();
+				// sanitizeQuerys(9번/69번 화이트리스트)는 원래 writeSubscriptions에만 있었는데,
+				// 그러면 파일을 직접 편집해 잘못된 조건을 넣었을 때 "다음에 뭔가 저장되기
+				// 전까지"는 검증 없이 그대로 읽혀 실제 수집(runNow → readSubscriptions)에
+				// 쓰였다(실제 재현됨 — write가 한 번 더 일어나기 전까지 4개 조건이 그대로
+				// 실행되고, 그제서야 뒤늦게 3개로 줄어들며 Notice가 떴다). 읽는 이 시점에도
+				// 같은 검증을 적용해 파일을 읽자마자 걸러지게 한다 — 쓰기 전까지의 창을 없앤다.
 				subscriptions.apis = (data.apis ?? [])
-					.map((apiData) => ({
-						...apiData,
-						querys: (apiData.querys ?? []).map((query) => File.migrateSearchType(query)),
-					}))
+					.map((apiData) => {
+						const migrated = (apiData.querys ?? []).map((query) => File.migrateSearchType(query));
+						const sanitized = File.sanitizeQuerys(apiData.apiName, migrated);
+						if (sanitized.length !== migrated.length) {
+							droppedAny = true;
+						}
+						return { ...apiData, querys: sanitized };
+					})
+					// apiName이 등록돼 있는데(findDescriptor가 값을 돌려줌) 조건이 전부
+					// 무효라 걸러진 구독은 여기서 완전히 뺀다 — sanitizeQuerys는 apiName을
+					// 모를 때만 querys를 그대로 통과시키므로(findDescriptor가 undefined면
+					// 필터링 자체를 안 함), "필터링이 실제로 실행됐는데 결과가 비었다"는
+					// apiName은 확실히 알고 있다는 뜻이다. 이 구독을 완전히 지워도 미등록
+					// apiName 사고와는 무관하다.
+					//
+					// 반대로 apiName 자체를 모르면(findDescriptor === undefined) querys가
+					// 비어 있어도 여기서 빼지 않는다 — 팀원이 새 API를 추가한 브랜치에서
+					// 저장한 파일을 구버전이 열었을 때, 그 구독이 조용히 사라지는 대신
+					// 아래 createApi가 "Unknown apiName"으로 크게 실패해야 한다(기존 테스트로
+					// 고정됨 — apiName: 'pubmed', querys: [] 케이스).
+					.filter((apiData) => {
+						if (apiData.querys.length === 0 && findDescriptor(apiData.apiName) !== undefined) {
+							droppedAny = true;
+							return false;
+						}
+						return true;
+					})
 					.filter((apiData) => {
 						const key = `${apiData.apiName}::${JSON.stringify(apiData.querys)}`;
 						if (seen.has(key)) {
@@ -197,6 +401,25 @@ export class File {
 				return subscriptions;
 			},
 		);
+		if (droppedAny) {
+			// 걸러낸 결과를 즉시 파일에 되돌려 쓴다 — 안 그러면 파일은 여전히 잘못된 값을
+			// 그대로 갖고 있어서, 이 함수가 다시 불릴 때마다(같은 수집 한 번 안에서도
+			// runNow 시작과 커서 갱신용 mutateSubscriptions가 각각 부른다) 매번 다시
+			// 걸러진다. writeSubscriptions에도 같은 검증이 있지만, 여기서 넘기는
+			// subscriptions는 이미 이 함수가 정리한 값이라 그쪽에서는 아무것도 더 안 걸린다.
+			//
+			// Notice는 여기서 안 띄운다 — 수집(CollectAndSave.runNow)이 이 플래그를 보고
+			// "구독이 이상하면 이번엔 경고만 띄우고 수집 자체를 하지 않는다"로 처리한다
+			// (사용자 요청 — 걸러진 채로 조용히 "정상 완료"된 것처럼 보이면 안 됨). 수집이
+			// 아닌 다른 경로(설정 탭 등)에서 읽었을 때는 로그로만 남는다.
+			Log.warn(
+				'subscriptions',
+				'일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 파일을 정리된 상태로 되돌려 씀',
+			);
+			await File.writeSubscriptions(subscriptions);
+			File.lastReadDroppedInvalidConditions = true;
+		}
+		return subscriptions;
 	}
 
 	// 이름이 바뀐 searchType을 현재 값으로 옮긴다. 설정탭이 'domain'을 저장하던 시절의
@@ -214,6 +437,33 @@ export class File {
 		return typeof renamed === 'string' ? { ...query, searchType: renamed } : query;
 	}
 
+	// 구독 조건은 API 단위로 최대 3개(002.md 확정)까지, 그 API가 인정하는 searchType
+	// (예: arXiv의 keyword/author/category)만, 그리고 그 searchType이 받아들이는 값
+	// 모양만 허용한다. searchType은 맞아도 값 자체가 문제인 경우가 있다 — arXiv의
+	// category는 값을 따옴표로 감싸지 않고 쿼리에 그대로 꽂히므로(ArxivAPI.formatTerm),
+	// "cs.AI" 같은 고정 토큰이 아니라 공백+AND/OR+다른 필드를 넣으면 쿼리 전체를 조작할
+	// 수 있다(69번, 실제 재현됨: searchType은 정상인데 값으로 필터를 우회). 이 화이트
+	// 리스트는 각 API 구현체가 정한다(ArxivAPI.isValidSearchType/isValidCategoryValue) —
+	// File.ts는 apiName으로 어느 구현체의 규칙을 적용할지만 안다.
+	private static readonly MAX_QUERYS_PER_SUBSCRIPTION = 3;
+	// ApiManagementModal은 UI에서 조건 드롭다운과 3개 상한을 지키게 하지만, 저장 파일
+	// (Subscriptions.json)은 사용자가 개발자 도구로 DOM/네트워크 요청을 조작해 그 UI
+	// 제약을 우회하고 임의의 필드/개수를 심을 수 있다(9번, 실제 재현됨). 저장이 실제로
+	// 일어나는 이 지점에서 다시 걸러내면 어떤 경로로 들어온 값이든(정상 UI, 조작된 요청,
+	// 앞으로 생길 다른 저장 경로) 파일에는 항상 유효한 조건만 남는다.
+	//
+	// 각 조건이 유효한지는 findDescriptor(apiName).conditionFields가 안다(그 출처의
+	// 사정이라 API.ts 쪽 구현체가 스스로 선언 — ApiDescriptor 참고). 등록되지 않은
+	// apiName은 검증 기준이 없으므로 그대로 통과시킨다 — apiName 자체가 잘못됐다면
+	// File.createApi(복원 시점)가 이미 막는다.
+	private static sanitizeQuerys(apiName: string, querys: SearchQuery[]): SearchQuery[] {
+		const fields = findDescriptor(apiName)?.conditionFields;
+		const filtered = fields
+			? querys.filter((q) => fields.some((f) => f.name === q.searchType && f.validate(q.query)))
+			: querys;
+		return filtered.slice(0, File.MAX_QUERYS_PER_SUBSCRIPTION);
+	}
+
 	static writeSubscriptions(subscriptions: Subscriptions): Promise<void> {
 		// secret은 별도 Secret.json(난독화)에만 저장한다. Subscriptions.json에 함께 넣으면
 		// API 키가 평문으로 중복 저장되므로 제외한다.
@@ -227,13 +477,22 @@ export class File {
 		// 커서(updateTime)를 구독 하나마다 따로 싣는다 — 전역 커서 한 값이던 시절과 달리,
 		// 구독이 배열의 어느 위치로 옮겨져도(추가/삭제/재배열) 그 구독 고유의 진행 상황이
 		// 함께 따라간다.
-		return File.writeConfig('Subscriptions.json', {
-			apis: subscriptions.apis.map((api) => ({
-				apiName: api.apiName,
-				querys: api.querys,
-				updateTime: api.updateTime,
-			})),
+		let droppedAny = false;
+		const apis = subscriptions.apis.map((api) => {
+			const querys = File.sanitizeQuerys(api.apiName, api.querys);
+			if (querys.length !== api.querys.length) {
+				droppedAny = true;
+			}
+			return { apiName: api.apiName, querys, updateTime: api.updateTime };
 		});
+		if (droppedAny) {
+			// 저장은 계속 진행한다(나머지 정상 구독까지 막을 이유는 없다) — 다만 조용히
+			// 걸러내면 사용자는 자기 구독이 왜 줄었는지 알 방법이 없다.
+			new Notice(
+				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 저장에서 제외되었습니다 — 구독 관리에서 확인하세요.',
+			);
+		}
+		return File.writeConfig('Subscriptions.json', { apis });
 	}
 
 	// Subscriptions.json에 대한 읽기-수정-쓰기를 한 번에 하나씩만 실행한다.
@@ -287,20 +546,14 @@ export class File {
 		});
 	}
 
-	// API 구현체 등록부 — 이 코드베이스가 지원하는 API 목록의 유일한 진실.
-	// 새 API 추가 = 여기 한 줄 + import. 구독 UI의 드롭다운(supportedApiNames)과
-	// createApi가 같은 목록을 보므로 "UI는 받는데 복원은 못 하는 이름"이 생길 수 없다.
-	private static readonly API_FACTORIES: Record<
-		string,
-		(querys: SearchQuery[], secret?: Secret) => API
-	> = {
-		arxiv: (querys, secret) => new ArxivAPI(querys, secret),
-	};
+	// API 구현체 등록부는 collect/API.ts의 findDescriptor()다 — 새 API 추가는 그쪽 배열에
+	// 한 줄 + import로 끝난다. File은 그 결과만 조회하고, 목록의 진실을 따로 들고 있지
+	// 않는다(예전엔 여기 있는 표와 UI 드롭다운의 표가 따로 놀 수 있었다).
 
 	// 구독 UI가 API 선택지를 만들 때 쓴다. 이름을 손으로 치게 하면 'arXiv' 같은 오타가
 	// 저장은 통과하고 다음 수집(createApi)에서야 터진다 — 목록에서 고르게 해야 한다.
 	static supportedApiNames(): string[] {
-		return Object.keys(File.API_FACTORIES);
+		return findApiNames();
 	}
 
 	// apiName에 따라 API 구현 클래스를 인스턴스화한다. Subscriptions.json에서 읽은
@@ -308,11 +561,11 @@ export class File {
 	// (JSON 복원 시 메서드가 사라지는 문제 해결 — 002.md).
 	// secret은 선택 사항 — 없으면 각 API 구현체가 알아서 익명으로 동작한다.
 	static createApi(apiName: string, querys: SearchQuery[] = [], secret?: Secret): API {
-		const factory = File.API_FACTORIES[apiName];
-		if (factory === undefined) {
+		const descriptor = findDescriptor(apiName);
+		if (descriptor === undefined) {
 			throw new Error(`Unknown apiName: ${apiName}`);
 		}
-		return factory(querys, secret);
+		return descriptor.create(querys, secret);
 	}
 
 	// ── Paper (콘텐츠 트리, .json + .md) ────────────────────────────────
@@ -337,35 +590,85 @@ export class File {
 	// readPapersByYear/readAllPapers의 공통 몸통 — 둘 다 "이 prefix 아래 .json을 전부
 	// Paper로 읽는다"만 다르게 좁힌 것이라 한 곳에만 둔다. vault.getFiles()가 이미 전체
 	// 목록을 주므로 연도를 하나씩 열거할 필요가 없다.
+	//
+	// 이 함수가 "이 파일은 논문이다"를 정하는 유일한 지점이라, 콘텐츠 트리를 신뢰 경계로
+	// 두고 여기서 전부 검사한다(QA 12번/15번/18번 — 손으로 만든 3월 50일 폴더, 미래
+	// 날짜 폴더, 연도 폴더 바로 밑 .json이 전부 임베딩·시각화까지 되던 문제):
+	//   1) 경로 모양(연/월/일 4단계 또는 unknown)이 맞는가
+	//   2) 폴더에서 조합한 날짜가 달력에 있고 미래가 아닌가
+	//   3) 폴더 날짜와 파일 안의 publicationDate가 일치하는가 (파일을 옮겨 심는 경우 차단
+	//      — 응답 category 불일치 논문을 저장 거부한 8번과 같은 무결성 검사)
+	// 걸린 파일은 조용히 빼고 File.lastScanSkipped로만 사실을 남긴다.
 	private static async readPapersUnder(prefix: string): Promise<Paper[]> {
 		const files = File.vault
 			.getFiles()
 			.filter((f) => f.path.startsWith(prefix) && f.extension === 'json');
 		const papers: Paper[] = [];
-		let unreadable = 0;
-		for (const file of files) {
-			// 파일 하나가 깨졌다고 코퍼스 전체를 못 읽으면 안 된다. 수집 중 강제 종료·동기화
-			// 충돌로 .json이 손상되면 JSON.parse가 던지는데, 막지 않으면 그 예외가 밖으로
-			// 나가 멀쩡한 나머지 수천 편까지 사라진다(1편 때문에 시각화가 통째로 안 그려지는
-			// 것을 재현했다). 경로를 함께 남긴다 — 없으면 고칠 파일을 찾을 방법이 없다.
-			try {
-				const wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
-				const paper = Object.assign(new Paper(), wrapper.paper);
-				// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
-				paper.collectedApis ??= [];
-				paper.collectedQueries ??= [];
-				papers.push(paper);
-			} catch (error) {
-				unreadable += 1;
-				Log.error('file', '논문 파일이 손상돼 건너뜀', error, { path: file.path });
+		const skipped: string[] = [];
+		let skippedCount = 0;
+		const skip = (path: string): void => {
+			skippedCount += 1;
+			if (skipped.length < File.SKIPPED_SAMPLE_LIMIT) {
+				skipped.push(path);
 			}
+		};
+		for (const file of files) {
+			const folderDate = File.paperPathDate(file.path);
+			if (folderDate === null) {
+				skip(file.path);
+				continue;
+			}
+			// 손상된 .json 하나가 스캔 전체를 예외로 끝내면 그래프가 통째로 안 뜬다 —
+			// 그 파일만 건너뛴다.
+			let wrapper: StoredPaperFile;
+			try {
+				wrapper = JSON.parse(await File.vault.read(file)) as StoredPaperFile;
+			} catch {
+				skip(file.path);
+				continue;
+			}
+			if (wrapper?.paper === undefined || wrapper.paper === null) {
+				skip(file.path);
+				continue;
+			}
+			const paper = Object.assign(new Paper(), wrapper.paper);
+			// unknown/ 은 날짜를 모르는 논문의 정상 자리라 대조할 게 없다.
+			if (folderDate !== 'unknown' && paper.publicationDate !== folderDate) {
+				skip(file.path);
+				continue;
+			}
+			// 구버전 스키마(collectedApi/collectedQuery 단일 값 시절) 파일 대비 폴백.
+			paper.collectedApis ??= [];
+			paper.collectedQueries ??= [];
+			papers.push(paper);
 		}
-		// 개별 경로는 위에서 이미 남겼으므로 여기서는 총량만 알린다 — 손상이 여러 건이면
-		// 개별 줄이 흩어져 "몇 편이 빠졌는지"가 안 보인다.
-		if (unreadable > 0) {
-			Log.warn('file', `논문 ${unreadable}편이 손상돼 빠졌습니다`, { 읽은편수: papers.length });
+		File.lastScanSkipped = { count: skippedCount, samples: skipped };
+		if (skippedCount > 0) {
+			Log.warn(
+				'papers',
+				`콘텐츠 트리 규격에 맞지 않는 파일 ${skippedCount}개를 건너뜀: ${skipped.join(', ')}${skippedCount > skipped.length ? ' 외' : ''}`,
+			);
 		}
 		return papers;
+	}
+
+	// 논문 .json의 경로에서 폴더가 나타내는 날짜(YYYY-MM-DD)를 돌려준다. 규격을 벗어나면
+	// null, 날짜 없는 정상 저장 자리(unknown/)면 문자열 'unknown'.
+	private static paperPathDate(path: string): string | null {
+		if (!path.startsWith(`${File.PAPER_ROOT}/`)) {
+			return null;
+		}
+		const relative = path.slice(File.PAPER_ROOT.length + 1);
+		const match = File.PAPER_RELATIVE_PATH.exec(relative);
+		if (!match) {
+			return null;
+		}
+		const [, year, month, day] = match;
+		if (year === undefined) {
+			return 'unknown';
+		}
+		const date = `${year}-${month}-${day}`;
+		return isUsablePaperDate(date) ? date : null;
 	}
 
 	// .json(진실 원본)과 .md(Obsidian 뷰)를 함께 쓴다. 재작성 시 기존 createdAt / 사용자
@@ -389,14 +692,37 @@ export class File {
 		if (text === null) {
 			return null;
 		}
-		const wrapper = JSON.parse(text) as StoredPaperFile;
+		// 손상된(잘린) .json은 "없다"와 동일하게 취급한다 — readPapersUnder가 스캔에서
+		// 손상 파일 하나를 건너뛰는 것과 같은 원칙. 여기서 안 막으면 이 논문이 걸리는
+		// 모든 구독의 청크 처리가 예외로 끊긴다(prefillFromStore가 구독 수집 도중 매
+		// 논문마다 이 함수를 부른다).
+		const wrapper = File.parseStoredPaperFile(text, jsonPath);
+		if (wrapper === null) {
+			return null;
+		}
 		return Object.assign(new Paper(), wrapper.paper);
+	}
+
+	// StoredPaperFile 파싱을 한 곳에 모은다 — readStoredPaper/writePaperAt이 손상된
+	// 파일을 같은 기준(파싱 실패 = 없는 것으로 취급)으로 다루게 한다. 파싱 실패는
+	// 흔치 않은 일이라 조용히 삼키지 않고 경고를 남긴다.
+	private static parseStoredPaperFile(text: string, path: string): StoredPaperFile | null {
+		try {
+			return JSON.parse(text) as StoredPaperFile;
+		} catch (error) {
+			Log.warn('papers', `손상된 논문 파일 — 없는 것으로 취급: ${path}`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return null;
+		}
 	}
 
 	// 테스트/검증용: 정식 수집 경로(PaperGraph3D/<year>/<month>/<day>) 대신 지정한 폴더
 	// 바로 아래에 저장한다. .json+.md 형식과 upsert(생성 또는 갱신) 동작은 writePaper와
-	// 동일 — readPapersByYear는 PaperGraph3D/<year>/ 접두사만 보므로 이 폴더 아래 파일은
-	// 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용 SettingTab 버튼에서 사용).
+	// 동일 — 이 폴더 아래 파일은 정식 수집 데이터와 섞이지 않는다(임베딩 테스트용
+	// SettingTab 버튼에서 사용).
+	// ⚠️ folder는 반드시 PaperGraph3D/ 밖이어야 한다. 안에 두면 평평하게 쓰는 이 경로가
+	// 콘텐츠 트리 규격(<YYYY>/<MM>/<DD>/)을 어겨 readPapersUnder가 건너뛴다.
 	static async writeTestPaper(paper: Paper, folder: string): Promise<void> {
 		await File.writePaperAt(paper, `${folder}/${File.baseNoteName(paper.title, paper.sourceId)}`);
 	}
@@ -440,7 +766,11 @@ export class File {
 		const mdPath = `${base}.md`;
 
 		const existingJson = await File.readVaultText(jsonPath);
-		const existing = existingJson ? (JSON.parse(existingJson) as StoredPaperFile) : null;
+		// 손상된 기존 파일은 "없던 자리에 새로 쓴다"로 처리한다 — createdAt이 지금 시각으로
+		// 리셋되고 collectedApis/embedding 백스톱(아래)이 안 걸리는 정도의 대가지만, 예외로
+		// 끊겨 이 논문을 영원히 다시 저장할 수 없는 것보다는 낫다(강제 종료로 쓰다 만
+		// 파일이 남으면 재현된다).
+		const existing = existingJson ? File.parseStoredPaperFile(existingJson, jsonPath) : null;
 		const createdAt = existing ? existing.createdAt : Date.now();
 
 		// 같은 sourceId(같은 파일 경로)로 다른 구독이 다시 써도, 먼저 저장된 구독의
@@ -684,6 +1014,10 @@ export class File {
 
 	// ── config 공통: encode/decode는 옵션(기본=평문 통과). Secret만 난독화 변환을 넘긴다.
 
+	// 손상된(잘린) 파일은 없는 것과 동일하게 취급해 fallback()으로 넘어간다 — 강제
+	// 종료로 쓰다 만 파일이 남으면(특히 BackfillProgress.json처럼 라운드마다 쓰이는
+	// 파일) 재현된다. 실측: 잘린 JSON을 읽으면 이전엔 그 config가 필요한 기능 전체가
+	// 예외로 막혔다(예: backfill이 영원히 시작 못 함). 조용히 삼키지 않고 경고는 남긴다.
 	private static async readConfig<T>(
 		name: string,
 		revive: (raw: unknown) => T,
@@ -695,16 +1029,44 @@ export class File {
 			return fallback();
 		}
 		const text = await decode(await File.vault.adapter.read(path));
-		return revive(JSON.parse(text));
+		// JSON.parse만 감싼다 — revive()는 감싸면 안 된다. revive는 "unknown apiName이면
+		// 크게 실패해야 한다"(readSubscriptions.createApi) 같은 의도된 도메인 에러를 던질
+		// 수 있는데, 여기서 넓게 삼키면 그 의도된 throw까지 조용히 기본값으로 덮어버린다
+		// (실제로 회귀 테스트가 잡음). 파싱 자체가 깨진 경우만 "손상됨"으로 본다.
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			Log.warn('config', `손상된 설정 파일 — 기본값으로 대체: ${path}`, {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return fallback();
+		}
+		return revive(parsed);
 	}
 
+	// 임시 파일에 먼저 쓰고 rename으로 갈아끼운다 — adapter.write를 직접 쓰면 쓰는
+	// 도중 전원이 끊겼을 때 그 자리에 반쯤 쓰인(잘린) JSON이 남는다(readConfig가 막 위에서
+	// 겪는 손상의 원인). rename은 원자적이라 중간 상태가 없다 — 성공하면 새 내용 전체,
+	// 실패하면(그 직전에 죽었으면) 옛 내용 그대로다.
+	//
+	// ⚠️ Windows의 fs.rename은 대상이 이미 있으면 실패한다(POSIX와 다름) — 그래서 먼저
+	// 지운다. 지운 직후~rename 사이의 극히 짧은 창에 죽으면 파일이 "없음"이 되는데,
+	// readConfig의 fallback()이 이미 그 상태를 정상적으로 처리한다 — 손상보다 훨씬
+	// 안전한 실패 모드다.
 	private static async writeConfig(
 		name: string,
 		data: unknown,
 		encode: (text: string) => Promise<string> | string = (t) => t,
 	): Promise<void> {
 		const text = await encode(JSON.stringify(data, null, 2));
-		await File.vault.adapter.write(`${File.pluginDir}/${name}`, text);
+		const path = `${File.pluginDir}/${name}`;
+		const tempPath = `${path}.tmp`;
+		await File.vault.adapter.write(tempPath, text);
+		if (await File.vault.adapter.exists(path)) {
+			await File.vault.adapter.remove(path);
+		}
+		await File.vault.adapter.rename(tempPath, path);
 	}
 
 	// ── 콘텐츠 트리 텍스트 I/O (.json/.md 공용) ─────────────────────────
@@ -761,8 +1123,10 @@ export class File {
 
 	// 논문의 연/월/일 폴더. 기존은 publicationYear를 썼으나 새 Paper는 이를 제거해
 	// publicationDate(ISO)에서 연도까지 파생한다. 유효한 날짜가 없으면 'unknown'.
+	// 모양 정규식만으로는 2026-03-50 같은 값이 통과해 달력에 없는 폴더가 생겼다(12번) —
+	// 달력 유효성과 미래 여부까지 본다. 어느 쪽이든 실패하면 'unknown'으로 보낸다.
 	private static publicationDir(paper: Paper): string {
-		if (/^\d{4}-\d{2}-\d{2}$/.test(paper.publicationDate)) {
+		if (isUsablePaperDate(paper.publicationDate)) {
 			return `${paper.publicationDate.slice(0, 4)}/${paper.publicationDate.slice(5, 7)}/${paper.publicationDate.slice(8, 10)}`;
 		}
 		return 'unknown';
@@ -818,7 +1182,7 @@ export class File {
 			}
 		}
 		// 새 Paper는 publicationYear를 제거 → publicationDate(ISO)에서 연도 파생.
-		if (/^\d{4}-\d{2}-\d{2}$/.test(paper.publicationDate)) {
+		if (isUsablePaperDate(paper.publicationDate)) {
 			lines.push(`publicationYear: ${Number(paper.publicationDate.slice(0, 4))}`);
 		}
 		if (paper.publicationDate) {
@@ -844,8 +1208,9 @@ export class File {
 		return lines.join('\n');
 	}
 
-	// 표준 웹 URL을 sourceId에서 파생(저장 안 함). provider별 규칙은 PAPER_URL_BUILDERS
-	// 레지스트리에서 조회한다 — 알 수 없는 provider면 undefined(frontmatter에서 줄 생략).
+	// 표준 웹 URL을 sourceId에서 파생(저장 안 함). 구독 가능한 출처는 findDescriptor가
+	// 알고, 그 외(semanticScholar 등)는 FALLBACK_PAPER_URL_BUILDERS를 본다 — 둘 다
+	// 모르는 provider면 undefined(frontmatter에서 줄 생략).
 	private static paperUrl(sourceId: string): string | undefined {
 		const separator = sourceId.indexOf(':');
 		if (separator <= 0) {
@@ -856,7 +1221,7 @@ export class File {
 		if (localId.length === 0) {
 			return undefined;
 		}
-		const build = PAPER_URL_BUILDERS[provider];
+		const build = findDescriptor(provider)?.paperUrl ?? FALLBACK_PAPER_URL_BUILDERS[provider];
 		return build ? build(localId) : undefined;
 	}
 

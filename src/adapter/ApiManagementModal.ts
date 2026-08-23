@@ -4,19 +4,16 @@ import { File } from '../common/File';
 import { Log } from '../common/Log';
 import { FailureNotifier } from '../common/Notify';
 import { hasMeaningfulQueryValue, SearchQuery } from '../collect/SearchQuery';
+import { findDescriptor } from '../collect/API';
 import { KEY_VALIDATORS } from '../collect/SecretValidation';
 
-// 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들.
-// 여기 값은 API.ts의 ARXIV_FIELD_PREFIX 키와 반드시 일치해야 한다 — 예전에 이 타입만
-// 'domain'으로 남아 있어서, UI로 그 조건을 만들면 formatTerm()이
-// "Unknown searchType"으로 throw하고 [1] 정책에 따라 해당 구독 수집 전체가 실패했다.
-type ConditionType = 'keyword' | 'author' | 'category';
-
-const CONDITION_TYPE_LABEL: Record<ConditionType, string> = {
-	keyword: '키워드',
-	author: '저자',
-	category: '분류',
-};
+// 조건 타입은 SearchQuery.searchType(string)의 구체적인 값들 — 어떤 이름이 유효한지는
+// apiName마다 다르고, 그건 그 출처(예: ArxivAPI)만 아는 사정이라 여기서 미리 정해두지
+// 않는다. findDescriptor(apiName).conditionFields가 유일한 진실이다(ApiDescriptor
+// 참고) — 예전엔 여기 하드코딩된 유니온 타입이 API.ts의 FIELD_PREFIX 키와 수동으로
+// 맞아야 했고, 어긋나면 formatTerm()이 "Unknown searchType"으로 던지면서 그제서야
+// 드러났다.
+type ConditionType = string;
 
 // 구독 한 건 = API 하나. API 하나에 여러 조건(키워드/저자/분류 등, SearchQuery)을
 // 동시에 걸 수 있다 (Subscriptions.apis: API[], API.querys: SearchQuery[]와 대응).
@@ -44,6 +41,50 @@ const MAX_CONDITIONS_PER_API = 3;
 // 구독 UI는 Subscriptions.json과 실시간 동기화된다: 열 때 읽어와 복원하고, 추가/삭제
 // 때마다 즉시 저장한다.
 export class ApiManagementModal extends Modal {
+	// 새 카드/조건의 초기 선택지 — 그 apiName이 지원하는 첫 번째 조건 필드. 등록되지
+	// 않은 apiName(구버전 파일 등)이면 빈 문자열 — 드롭다운도 비어 그려지고, 이후
+	// createApi가 "Unknown apiName"으로 더 크게 드러낸다.
+	private static firstConditionType(apiName: string): string {
+		return findDescriptor(apiName)?.conditionFields[0]?.name ?? '';
+	}
+
+	// 조건 요약/목록에 보여줄 사람이 읽는 이름. 등록되지 않은 apiName이거나 그 출처가
+	// 모르는 필드 이름(구버전 파일이 남긴 값 등)이면 이름 그대로 보여준다 — 조용히
+	// 감추는 것보다, 알 수 없는 값이 있다는 걸 그대로 드러내는 편이 낫다.
+	// render()(Setting 체이닝이 필요해 테스트 스텁으로 못 돎)와 분리해 순수 "읽었더니
+	// 걸러진 게 있었으면 알린다"만 떼어낸다 — SubscriptionTargetModal.notifyDroppedConditions와
+	// 같은 이유, 메시지 문구만 이 창에 맞게 다르다.
+	private static notifyDroppedConditions(dropped: boolean): void {
+		if (dropped) {
+			new Notice(
+				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 아래 목록을 확인하세요.',
+			);
+		}
+	}
+
+	private static conditionLabel(apiName: string, searchType: string): string {
+		return (
+			findDescriptor(apiName)?.conditionFields.find((f) => f.name === searchType)?.label ??
+			searchType
+		);
+	}
+
+	// 저장 직전 마지막 관문 — persistSubscriptions가 이 draft를 실제로 쓰기 전에 부른다.
+	// "필드에 추가" 버튼이 쓰는 것과 같은 기준(descriptor.conditionFields)으로 다시
+	// 검사한다 — 개발자 도구로 그 버튼의 검사를 우회해 이상한 필드명을 카드에 얹어도,
+	// 여기서 걸리면 저장이 통째로 취소된다. apiName 자체가 모르는 값이면(등록 안 된
+	// 출처) 첫 조건을 그대로 "무효"로 돌려준다 — 검사할 기준(conditionFields)조차 없다.
+	private static findInvalidCondition(draft: ApiDraft): { searchType: string } | undefined {
+		const fields = findDescriptor(draft.apiName)?.conditionFields;
+		if (!fields) {
+			return draft.conditions[0];
+		}
+		return draft.conditions.find((condition) => {
+			const field = fields.find((f) => f.name === condition.searchType);
+			return !field || !field.validate(condition.query);
+		});
+	}
+
 	// 지금 폼에 입력 중인 provider·키 값. KEY_VALIDATORS가 provider 선택지의 유일한
 	// 진실이다 — 구독 API 목록(File.supportedApiNames)과는 다른 레지스트리다: 구독은
 	// "수집 출처"(arxiv 등, 키가 필요 없을 수도 있음)를, 이건 "키로 인증하는 보강용
@@ -105,11 +146,7 @@ export class ApiManagementModal extends Modal {
 		new Setting(contentEl)
 			.setName('API 키')
 			.setDesc(
-				'Semantic Scholar 등 외부 API 호출에 실어 보낼 개인 키를 등록합니다. API 연동 ' +
-					'자체는 코드로 이미 구현되어 있고, 이 키는 그 위에서 내 계정의 요청 한도를 쓰기 ' +
-					'위한 선택 사항입니다 — 키가 없어도 익명으로 호출되지만, 다른 모든 익명 ' +
-					'사용자와 한도를 나눠 써서 요청이 자주 막힙니다. provider를 먼저 고르고 키를 ' +
-					'저장하면, 저장 즉시 그 provider에 실제로 요청을 보내 유효한지 바로 확인합니다.',
+				'Semantic Scholar 등 외부 API 호출에 실어 보낼 개인 키를 등록합니다.'
 			)
 			.setHeading();
 
@@ -247,7 +284,7 @@ export class ApiManagementModal extends Modal {
 						this.apiDrafts.push({
 							apiName: this.apiNameDraft,
 							conditions: [],
-							newConditionType: 'keyword',
+							newConditionType: ApiManagementModal.firstConditionType(this.apiNameDraft),
 							newConditionQuery: '',
 							saved: false, // 아직 디스크에 없다 — 「저장」을 눌러야 진짜 구독이 된다.
 						});
@@ -334,13 +371,18 @@ export class ApiManagementModal extends Modal {
 	private async loadSubscriptions(): Promise<void> {
 		try {
 			const subscriptions = await File.readSubscriptions();
+			// SubscriptionTargetModal.load()와 같은 이유 — readSubscriptions를 부르는
+			// 모든 UI 진입점이 각자 이 검사를 해야 한다(플래그가 이 호출로 리셋되면
+			// CollectAndSave.runNow가 뒤늦게 봐도 이미 늦다). 이 창은 특히 사용자가 걸러진
+			// 구독을 직접 고치러 오는 곳이라, 여기서 알리는 게 가장 도움이 된다.
+			ApiManagementModal.notifyDroppedConditions(File.lastReadDroppedInvalidConditions);
 			this.apiDrafts = subscriptions.apis.map((api) => ({
 				apiName: api.apiName,
 				conditions: api.querys.map((query) => ({
-					searchType: query.searchType as ConditionType,
+					searchType: query.searchType,
 					query: query.query,
 				})),
-				newConditionType: 'keyword',
+				newConditionType: ApiManagementModal.firstConditionType(api.apiName),
 				newConditionQuery: '',
 				saved: true, // 디스크에서 그대로 읽어온 카드 — 지금 화면과 저장본이 일치한다.
 			}));
@@ -462,6 +504,23 @@ export class ApiManagementModal extends Modal {
 		// 조건이 1개 이상인 초안만 저장 대상이다 — 0개인 채로 저장하면 다음 수집이
 		// "querys is empty"로 반드시 실패한다.
 		const ready = this.apiDrafts.filter((draft) => draft.conditions.length > 0);
+
+		// 개발자 도구로 드롭다운에 없는 필드명을 끼워 넣고 저장하면(9번, 실제 재현됨),
+		// File.writeSubscriptions의 sanitizeQuerys가 그 조건만 조용히 걸러내고 나머지는
+		// 저장했다 — 그런데 이 함수는 ready 전체를 "저장됨"으로 표시해서, 화면엔 걸러진
+		// 조건까지 "저장됨" 배지가 붙은 채로 남았다(실제 디스크엔 없는데 UI만 저장된 것처럼
+		// 보임). Notice로 알리고 마는 대신, 여기서 미리 검사해 하나라도 안 맞으면 저장
+		// 자체를 통째로 거부한다 — 부분 저장을 허용하지 않는다.
+		for (const draft of ready) {
+			const invalid = ApiManagementModal.findInvalidCondition(draft);
+			if (invalid) {
+				new Notice(
+					`${draft.apiName}의 "${invalid.searchType}" 조건이 이 출처가 지원하는 형식이 아닙니다 — ` +
+						`그 조건을 지우고 다시 저장하세요. 저장이 취소되었습니다.`,
+				);
+				return false;
+			}
+		}
 
 		// 같은 API+조건 조합이 두 개 이상이면 커서 갱신이 어느 쪽으로 갈지 모호해진다
 		// (File.updateApiCursors의 .find()가 첫 매치만 고른다) — 저장 시점에 막는다.
@@ -609,18 +668,36 @@ export class ApiManagementModal extends Modal {
 					'margin-left:16px; border-left:2px solid var(--background-modifier-border); padding-left:12px;',
 			},
 		});
+		// 카드마다 자기 컨테이너를 따로 둔다 — 조건 추가/삭제처럼 이 카드 하나만 바뀌는
+		// 변경은 renderApiDraft가 이 컨테이너만 다시 그리게 해서, 구독이 몇 개든 그 개수와
+		// 무관하게 항상 "카드 하나 분량"의 비용만 든다(전체 모달 렉 수정 — 필드에 추가/
+		// 조건 삭제를 누를 때마다 등록된 모든 구독·조건을 처음부터 다시 그리던 문제).
+		//
+		// ⚠️ wrapper에 반드시 클래스를 준다(스타일 없는 맨 div면 안 된다). Obsidian의
+		// .setting-item은 border-top으로 항목을 구분하고 그 컨테이너의 첫 항목에서는
+		// 그 선을 없애는데, 카드마다 wrapper가 생기면 각 카드의 첫 항목이 전부
+		// "첫 항목"이 되어 카드 사이 구분선이 통째로 사라진다 — 실제로 그렇게 회귀했다
+		// (카드 경계가 안 보이고 「조건 삭제」·「API 삭제」 버튼 열이 어긋나 보임).
+		// styles.css의 .papergraph3d-subscription-card가 카드 자신의 경계를 그린다.
 		for (const draft of drafts) {
-			this.renderApiDraft(childContainer, draft);
+			const cardEl = childContainer.createDiv({ cls: 'papergraph3d-subscription-card' });
+			this.renderApiDraft(cardEl, draft);
 		}
 	}
 
+	// containerEl은 이 카드 전용 div(위 renderSubscriptionGroup에서 만듦)다. 조건 추가/
+	// 삭제 핸들러가 this.render()(전체 모달 재구성) 대신 이 함수를 자기 자신에게 다시
+	// 불러 카드 하나만 갱신한다 — 그래서 재호출에도 안전하도록 맨 먼저 비운다.
 	private renderApiDraft(containerEl: HTMLElement, api: ApiDraft): void {
+		containerEl.empty();
 		// 카드 제목은 이제 조건 요약이다 — apiName은 그룹 헤더가 이미 보여주므로 여기서
 		// 또 반복하면 중복이다.
 		const summary =
 			api.conditions.length > 0
 				? api.conditions
-						.map((c) => `${CONDITION_TYPE_LABEL[c.searchType] ?? c.searchType}:${c.query}`)
+						.map(
+							(c) => `${ApiManagementModal.conditionLabel(api.apiName, c.searchType)}:${c.query}`,
+						)
 						.join(' · ')
 				: '(조건 없음)';
 		const heading = new Setting(containerEl)
@@ -644,13 +721,27 @@ export class ApiManagementModal extends Modal {
 
 		for (const condition of api.conditions) {
 			new Setting(containerEl)
-				.setName(`${CONDITION_TYPE_LABEL[condition.searchType] ?? condition.searchType}: ${condition.query}`)
+				.setName(
+					`${ApiManagementModal.conditionLabel(api.apiName, condition.searchType)}: ${condition.query}`,
+				)
 				.addButton((button) =>
 					// 로컬에서만 지운다 — 실제 반영은 아래 「저장」을 눌러야 한다.
 					button.setButtonText('조건 삭제').onClick(() => {
+						// 이미 저장돼 있던(saved===true) 카드를 지금 처음 건드리는 순간에만
+						// 전체를 다시 그린다 — 「저장」/「구독 추가」 버튼의 표시 여부가
+						// hasUnsavedDraft/unsavedDraft(모두 render()에서만 재계산됨)에 달려
+						// 있어서, 카드만 좁혀 다시 그리면 이 전환을 못 알아챈다(실제 재현:
+						// 저장된 구독의 조건을 지워도 「저장」 버튼이 안 뜸). 이미 저장 안
+						// 된 카드를 계속 편집하는 동안은(가장 흔한 경우) 그 값이 이미
+						// false라 좁힌 재렌더로 충분하다.
+						const wasSaved = api.saved;
 						api.conditions = api.conditions.filter((item) => item !== condition);
 						api.saved = false;
-						this.render();
+						if (wasSaved) {
+							this.render();
+						} else {
+							this.renderApiDraft(containerEl, api);
+						}
 					}),
 				);
 		}
@@ -661,19 +752,24 @@ export class ApiManagementModal extends Modal {
 			return;
 		}
 
+		const descriptor = findDescriptor(api.apiName);
+		const fields = descriptor?.conditionFields ?? [];
+
 		new Setting(containerEl)
 			.setName('조건 추가')
-			.setDesc(`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). 여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요.`)
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption('keyword', CONDITION_TYPE_LABEL.keyword)
-					.addOption('author', CONDITION_TYPE_LABEL.author)
-					.addOption('category', CONDITION_TYPE_LABEL.category)
-					.setValue(api.newConditionType)
-					.onChange((value) => {
-						api.newConditionType = value as ConditionType;
-					}),
+			.setDesc(
+				`${api.apiName}에 동시에 구독할 조건을 추가합니다 (최대 ${MAX_CONDITIONS_PER_API}개, 전부 AND). ` +
+					'여러 개를 모은 뒤 맨 아래 「저장」으로 한 번에 반영하세요. ' +
+					'정확한 조건이 아니면 수집 0편으로 표기 됩니다.',
 			)
+			.addDropdown((dropdown) => {
+				for (const field of fields) {
+					dropdown.addOption(field.name, field.label);
+				}
+				return dropdown.setValue(api.newConditionType).onChange((value) => {
+					api.newConditionType = value;
+				});
+			})
 			.addText((text) =>
 				text.setPlaceholder('조건 값').onChange((value) => {
 					api.newConditionQuery = value;
@@ -686,16 +782,30 @@ export class ApiManagementModal extends Modal {
 					}
 					// trim().length===0만으로는 안 걸러진다 — ""나 " "처럼 따옴표/공백만
 					// 있는 값은 원본 문자열 길이가 0이 아니라서 위 검사를 통과한다. 실제로
-					// arXiv에 전송될 값(formatTerm이 따옴표를 제거한 뒤의 값) 기준으로 다시
-					// 검사해야 이 값들이 걸린다 — ArxivAPI.formatTerm과 같은 기준
-					// (hasMeaningfulQueryValue)을 여기서도 써서, 수집이 실제로 돌기 전
-					// 저장 단계에서부터 막는다.
+					// 전송될 값(formatTerm이 따옴표를 제거한 뒤의 값) 기준으로 다시 검사해야
+					// 이 값들이 걸린다 — SearchQuery.hasMeaningfulQueryValue와 같은 기준을
+					// 여기서도 써서, 수집이 실제로 돌기 전 저장 단계에서부터 막는다.
 					if (!hasMeaningfulQueryValue(api.newConditionQuery)) {
 						new Notice('검색어에 실제 내용(글자/숫자)이 있어야 합니다.');
 						return;
 					}
+					// 필드마다 값 형식이 다를 수 있다(예: arXiv의 분류는 따옴표로 못 감싸
+					// 값 자체가 쿼리 문법이 된다) — 그 기준은 이 출처의 ConditionField가
+					// 안다. 저장 시점 화이트리스트(File.sanitizeQuerys)가 어차피 걸러내는데,
+					// 여기서 안 막으면 사용자는 "추가됐다가 저장하니 사라진" 것처럼 본다.
+					// 같은 검증 함수로 즉시 거부한다.
+					const field = fields.find((f) => f.name === api.newConditionType);
+					if (field && !field.validate(api.newConditionQuery.trim())) {
+						new Notice(`${field.label} 값의 형식이 올바르지 않습니다.`);
+						return;
+					}
 					// 상한(3개) 도달 시 이 버튼 자체가 안 그려지므로(위 가드) 여기선 항상
 					// 여유가 있다.
+					//
+					// 조건 삭제 핸들러와 같은 이유로 wasSaved를 본다 — saved===true였던
+					// 카드를 지금 처음 건드리는 전환 순간에만 전체를 다시 그려 「저장」
+					// 버튼이 뜨게 한다(실제 재현: 저장된 구독에 조건을 추가해도 안 뜸).
+					const wasSaved = api.saved;
 					api.conditions.push({
 						searchType: api.newConditionType,
 						query: api.newConditionQuery.trim(),
@@ -703,8 +813,14 @@ export class ApiManagementModal extends Modal {
 					api.newConditionQuery = '';
 					api.saved = false;
 					// 로컬에서만 쌓는다 — 디스크 반영은 맨 아래 「저장」 버튼으로 한 번에
-					// (render() 끝의 단일 저장 버튼 참고 — 카드마다 두지 않는다).
-					this.render();
+					// (render() 끝의 단일 저장 버튼 참고 — 카드마다 두지 않는다). 이미
+					// 저장 안 된 카드를 계속 편집하는 동안은(가장 흔한 경우) 카드만 다시
+					// 그려 등록된 다른 구독이 많아도 이 클릭 비용은 항상 일정하다.
+					if (wasSaved) {
+						this.render();
+					} else {
+						this.renderApiDraft(containerEl, api);
+					}
 				}),
 			);
 	}
