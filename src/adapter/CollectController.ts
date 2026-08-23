@@ -126,6 +126,15 @@ export class CollectController implements CollectProgressSink {
 	// 알리는 이 코드베이스의 기존 절충을 그대로 따른다.
 	private readonly categoryMismatchNotifier = new FailureNotifier();
 
+	// droppedInvalidConditions(9번/69번 화이트리스트로 걸러진 구독 조건, 보통 파일을
+	// 직접 편집한 경우)도 같은 이유로 silent 실행에서 새는 신호다 — 예전엔 이 경우
+	// CollectAndSave.runNow가 수집 전체를 막고 throw했는데, 그러면 UI가 없는 자동
+	// 실행 경로(스케줄러·명령 팔레트)는 걸러진 구독 하나 때문에 나머지 멀쩡한 구독까지
+	// 계속 아무것도 수집하지 못했다. 이제 막지 않고 진행하는 대신, 그 사실이 조용히
+	// 묻히지 않도록 여기서 알린다 — silent 여부와 무관하게 항상 도는 checkStructuralFailures
+	// 경로라 리본/자동 스케줄러/명령 팔레트 어디서 실행하든 동일하게 알려준다.
+	private readonly droppedConditionsNotifier = new FailureNotifier();
+
 	// 인용수 보정이 "시도는 했는데 하나도 못 고쳤다"고 판단할 최소 시도 편수. 1~2편은
 	// 그 논문들이 우연히 S2에 없었을 뿐일 수 있어 노이즈가 크다 — 몇 편 이상 전부
 	// 실패해야 "키/네트워크 문제"라는 구조적 신호로 본다.
@@ -579,6 +588,17 @@ export class CollectController implements CollectProgressSink {
 			);
 		} else {
 			this.categoryMismatchNotifier.notifySuccess();
+		}
+
+		if (stats && stats.droppedInvalidConditions) {
+			this.droppedConditionsNotifier.notifyFailure(
+				'dropped-invalid-conditions',
+				() =>
+					'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — ' +
+					'구독 관리에서 확인하세요.',
+			);
+		} else {
+			this.droppedConditionsNotifier.notifySuccess();
 		}
 	}
 

@@ -234,10 +234,15 @@ describe('CollectAndSave.run — 사전 조건', () => {
 		assert.equal(recordedRequests().length, 0);
 	});
 
-	// 사용자 요청: 구독 조건이 허용되지 않는 형식이라 걸러졌으면(9번/69번, 보통 파일을
-	// 직접 편집한 경우), 걸러진 채로 조용히 "정상 완료"되면 안 된다 — 경고로 멈추고,
-	// 사용자가 구독 관리에서 확인한 뒤 다시 실행해야 한다.
-	it('구독 조건이 걸러졌으면(파일 직접 편집) 수집을 하지 않고 경고로 멈춘다', async () => {
+	// 사용자 요청(정책 변경): 구독 조건이 허용되지 않는 형식이라 걸러졌으면(9번/69번,
+	// 보통 파일을 직접 편집한 경우), 예전엔 이번 수집 전체를 막고 throw했다 — 그런데
+	// UI가 없는 자동 실행 경로(스케줄러·명령 팔레트)에서는 걸러진 구독 하나 때문에
+	// 나머지 멀쩡한 구독까지 계속 아무것도 수집하지 못했다. 리본/구독 선택 창(걸러내고
+	// 나머지는 진행)과 동작을 통일해, 이제는 막지 않고 자가 복구된 나머지 조건으로
+	// 정상 진행하되 stats.droppedInvalidConditions로 그 사실을 실어 보낸다 —
+	// CollectController.checkStructuralFailures가 이 신호를 보고 알린다(silent 실행
+	// 경로에서도 항상 도는 지점이라 자동 수집에서도 동일하게 알려진다).
+	it('구독 조건이 걸러졌어도(파일 직접 편집) 수집을 막지 않고 나머지 조건으로 진행한다', async () => {
 		vault.files.set(
 			`${PLUGIN_DIR}/Subscriptions.json`,
 			JSON.stringify({
@@ -258,15 +263,16 @@ describe('CollectAndSave.run — 사전 조건', () => {
 		arxivOnly(feed([entry()], 1));
 		const { embedding } = fakeEmbedding();
 
-		await assert.rejects(
-			() => collectFlow(embedding).run('recent'),
-			/일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다/,
-		);
-		assert.equal(recordedRequests().length, 0, '구독이 이상하면 네트워크 요청도 나가면 안 된다');
+		const flow = collectFlow(embedding);
+		await flow.run('recent');
 
-		// 파일은 이미 3개로 자가 복구됐으니, 재시도하면 정상적으로 수집된다.
-		await collectFlow(fakeEmbedding().embedding).run('recent');
-		assert.ok(recordedRequests().length > 0, '자가 복구된 뒤 재시도는 정상 진행돼야 한다');
+		assert.ok(recordedRequests().length > 0, '걸러진 게 있어도 나머지 조건으로 네트워크 요청은 나가야 한다');
+		assert.equal(flow.lastStats?.droppedInvalidConditions, true, '걸러졌다는 사실이 stats에 안 실렸다');
+
+		// 파일은 이미 3개로 자가 복구됐다 — 재실행하면 더 이상 걸러낼 게 없다.
+		const second = collectFlow(fakeEmbedding().embedding);
+		await second.run('recent');
+		assert.equal(second.lastStats?.droppedInvalidConditions, false);
 	});
 });
 

@@ -93,6 +93,14 @@ export interface CollectStats extends EmbedBreakerStats {
 	// 요청이 변조됐거나(8번, 프록시 재현 사례) arXiv 응답 자체가 이상했다는 신호라, 조용히
 	// 넘기지 않고 사용자에게 알린다.
 	categoryMismatches: number;
+	// 읽는 중에 허용되지 않는 구독 조건이 걸러졌는가(9번/69번 화이트리스트 — 보통 파일을
+	// 직접 편집한 경우). 예전엔 이 경우 수집 전체를 막고 throw했는데, 그러면 UI가 없는
+	// 자동 실행 경로(자동 수집 스케줄러·명령 팔레트)에서는 걸러진 구독 하나 때문에 나머지
+	// 멀쩡한 구독까지 아무것도 수집되지 않은 채로 계속 실패만 반복했다(사용자 요청 —
+	// 리본/구독 선택 창처럼 "걸러내고 나머지는 계속 진행"이 자동 실행에서도 똑같이
+	// 적용돼야 한다). 이제 막지 않고 계속 진행하되, 이 신호를 실어 CollectController가
+	// (실행 경로와 무관하게) 완료 알림에 반영한다.
+	droppedInvalidConditions: boolean;
 }
 
 // 한 번의 보정 실행이 무엇을 했는지 (예전 combined 경로 — repair()가 남긴다).
@@ -494,14 +502,13 @@ export class CollectAndSave {
 	): Promise<void> {
 		this.sub = await File.readSubscriptions();
 		// 읽는 중에 허용되지 않는 조건이 걸러졌으면(9번/69번 화이트리스트 — 보통 파일을
-		// 직접 편집한 경우) 이번 수집은 하지 않는다. 걸러진 채로 조용히 진행해 "N편 수집
-		// 완료"가 뜨면, 구독이 이상했다는 사실을 완료 Notice에 묻혀 놓치기 쉽다 — 사용자가
-		// 구독 관리에서 직접 확인하고 다시 실행하도록 여기서 멈춘다(사용자 요청).
-		if (File.lastReadDroppedInvalidConditions) {
-			throw new Error(
-				'PaperGraph3D: 일부 구독 조건이 허용되지 않는 형식이라 무시되었습니다 — 구독 관리에서 확인 후 다시 실행하세요.',
-			);
-		}
+		// 직접 편집한 경우) 여기서 값을 캡처해둔다 — 이 뒤로 다른 File 호출이 끼어들면
+		// 플래그가 다시 계산돼 이 정보를 놓친다. 예전엔 이 경우 수집 전체를 막고 throw
+		// 했는데, UI가 없는 자동 실행 경로(스케줄러·명령 팔레트)에서는 걸러진 구독 하나
+		// 때문에 나머지 멀쩡한 구독까지 계속 아무것도 수집 못 했다 — 리본/구독 선택
+		// 창(걸러내고 나머지는 진행)과 다른 동작이었다(사용자 요청으로 통일). 이제 막지
+		// 않고 stats에 실어 CollectController가 완료 알림에 반영한다.
+		const droppedInvalidConditions = File.lastReadDroppedInvalidConditions;
 		const allApis = this.sub.apis ?? [];
 		if (allApis.length === 0) {
 			throw new Error(
@@ -550,6 +557,7 @@ export class CollectAndSave {
 			anyTruncated: false,
 			citationRetryOverflow: 0,
 			categoryMismatches: 0,
+			droppedInvalidConditions,
 		};
 		const failures: { citation: Paper[] } = { citation: [] };
 		let chunks = 0;
