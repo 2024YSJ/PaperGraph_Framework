@@ -189,3 +189,24 @@
 .papergraph3d-cluster-info.papergraph3d-cluster-warn {
 	color: var(--text-error);
 }
+
+/* 구독 카드 하나(ApiManagementModal.renderApiDraft가 그리는 단위). 카드마다 전용
+   wrapper div를 두는 이유는 렌더 비용 때문이다 — 조건을 추가/삭제할 때 모달 전체가
+   아니라 이 wrapper만 다시 그린다(구독이 몇 개든 클릭 비용이 일정하게 유지된다).
+   그런데 wrapper가 생기면 Obsidian의 .setting-item이 border-top으로 만들던 항목 간
+   구분선이 "각 카드의 첫 항목"에서 사라져, 카드끼리 경계 없이 붙어 보이고 버튼 열도
+   어긋나 보였다(실제 회귀). 그래서 카드 경계를 여기서 직접 그린다 — 겸사겸사 어디부터
+   어디까지가 구독 하나인지 눈으로 바로 구분된다. */
+.papergraph3d-subscription-card {
+	margin: 10px 0;
+	padding: 4px 12px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-secondary);
+}
+
+/* 카드 안의 첫 항목(조건 요약 제목)은 위 여백을 줄인다 — 카드 자체가 이미 padding으로
+   여백을 주므로 Obsidian 기본 padding까지 겹치면 제목이 너무 아래로 밀린다. */
+.papergraph3d-subscription-card > .setting-item:first-child {
+	padding-top: 10px;
+}

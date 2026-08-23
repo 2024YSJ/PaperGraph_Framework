@@ -627,8 +627,15 @@ export class ApiManagementModal extends Modal {
 		// 변경은 renderApiDraft가 이 컨테이너만 다시 그리게 해서, 구독이 몇 개든 그 개수와
 		// 무관하게 항상 "카드 하나 분량"의 비용만 든다(전체 모달 렉 수정 — 필드에 추가/
 		// 조건 삭제를 누를 때마다 등록된 모든 구독·조건을 처음부터 다시 그리던 문제).
+		//
+		// ⚠️ wrapper에 반드시 클래스를 준다(스타일 없는 맨 div면 안 된다). Obsidian의
+		// .setting-item은 border-top으로 항목을 구분하고 그 컨테이너의 첫 항목에서는
+		// 그 선을 없애는데, 카드마다 wrapper가 생기면 각 카드의 첫 항목이 전부
+		// "첫 항목"이 되어 카드 사이 구분선이 통째로 사라진다 — 실제로 그렇게 회귀했다
+		// (카드 경계가 안 보이고 「조건 삭제」·「API 삭제」 버튼 열이 어긋나 보임).
+		// styles.css의 .papergraph3d-subscription-card가 카드 자신의 경계를 그린다.
 		for (const draft of drafts) {
-			const cardEl = childContainer.createDiv();
+			const cardEl = childContainer.createDiv({ cls: 'papergraph3d-subscription-card' });
 			this.renderApiDraft(cardEl, draft);
 		}
 	}
