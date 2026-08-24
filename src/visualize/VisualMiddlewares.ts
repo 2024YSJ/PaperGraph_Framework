@@ -373,3 +373,46 @@ export class ClusterColorMiddleware implements Middleware {
 		forceGraph?.nodeColor(forceGraph.nodeColor());
 	}
 }
+
+// 시각화 미들웨어: 노드 라벨(논문 제목 등)을 HTML 엔티티로 이스케이프해 XSS를 막는다.
+//
+// 왜 필요한가 — 실제 싱크는 Visualization.render의 `.nodeLabel((n) => n.label)`이다.
+// 3d-force-graph는 이 반환 문자열을 툴팁 DOM에 **innerHTML로 삽입**하므로, 라벨에
+// 마크업이 들어 있으면 그대로 파싱된다. 라벨의 출처인 논문 제목(paper.title)은 arXiv
+// 응답에서 온 신뢰할 수 없는 외부 데이터라, `<img src=x onerror=alert(document.cookie)>`
+// 같은 제목이 저장돼 있으면 사용자가 그 노드에 마우스를 올리는 순간 스크립트가 실행된다.
+// 여기서 라벨을 텍스트로 무해화하면, render가 innerHTML에 넣어도 브라우저가 마크업이
+// 아니라 글자로 그린다.
+//
+// ⚠️ 등록 순서 — 반드시 **맨 마지막에** 등록해야 한다. 다른 visual 미들웨어가 노드를
+// 더하거나(PersonalNoteMiddleware는 node.label에 노트 제목을 채운다) 라벨을 고칠 수
+// 있는데, 그보다 먼저 돌면 나중에 추가된 라벨은 이스케이프되지 않은 채 render로 넘어간다.
+// 이 미들웨어가 마지막에 돌면 그 시점에 존재하는 모든 node.label을 빠짐없이 덮는다.
+//
+// node.paper.title(원본 Paper)이 아니라 node.label만 바꾼다 — Paper 객체는 노트 열기 등
+// 다른 경로로도 쓰이므로 표시용 사본인 라벨에서만 무해화한다.
+export class LabelSanitizeMiddleware implements Middleware {
+	type: MiddlewareType = 'visual';
+
+	run(context: unknown): void {
+		const graph = context as GraphData;
+		for (const node of graph.nodes) {
+			if (node.label !== undefined) {
+				node.label = LabelSanitizeMiddleware.escapeHtml(node.label);
+			}
+		}
+	}
+
+	// HTML 엔티티 인코딩. `&`를 **가장 먼저** 치환해야 한다 — 나중에 치환하면 방금 만든
+	// `&lt;` 등의 `&`까지 다시 `&amp;lt;`로 이중 인코딩된다. 툴팁은 엘리먼트 내용 문맥이라
+	// `<`·`>`·`&`만으로 무해화에 충분하지만, 라이브러리가 값을 속성 안에 넣도록 바뀌어도
+	// 안전하도록 따옴표(`"`·`'`)까지 함께 막는다.
+	private static escapeHtml(value: string): string {
+		return value
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
+	}
+}

@@ -9,6 +9,15 @@ export const VIEW_TYPE_PAPERGRAPH3D = 'papergraph3d-visualization-view';
 // VisualizationFlow.run()을 돌려 그래프를 그린다 (설계: docs/devLog/007.md, 008.md).
 // run이 논문 로드 → PCA → init → 미들웨어 → render를 한 번에 처리한다.
 export class VisualizationView extends ItemView {
+	// 그래프를 그리는 컨테이너 — onOpen에서 만들고, 컨텍스트 손실 후 재렌더에서 재사용한다.
+	private graphContainer?: HTMLElement;
+	// 지금 webglcontextlost 리스너를 건 canvas. 재렌더 때마다 새 canvas가 생기므로 추적해
+	// 이전 canvas에서 리스너를 뗀다.
+	private trackedCanvas?: HTMLCanvasElement;
+	// 백그라운드 탭으로 밀려나 WebGL 컨텍스트를 잃었는가. 이 탭이 다시 활성화될 때 이 값이
+	// true면 다시 그린다.
+	private contextLost = false;
+
 	constructor(
 		leaf: WorkspaceLeaf,
 		private plugin: PaperGraph3D,
@@ -36,19 +45,73 @@ export class VisualizationView extends ItemView {
 
 		// 그래프를 그릴 컨테이너 — 뷰를 열 때마다 새로 만들어 등록한다(DOM 수명 = 뷰 수명).
 		const container = contentEl.createDiv({ cls: 'papergraph3d-graph' });
+		this.graphContainer = container;
 		this.plugin.visualflow.visual.setContainer(container);
 
 		// 열리면 바로 시각화를 그린다.
 		await this.renderWithRepairRetry(container);
+		this.trackCanvas();
+
+		// 노드를 클릭해 노트를 새 탭에 열면 이 뷰가 백그라운드로 밀려나고, Obsidian이 그
+		// DOM을 떼어내면서 canvas의 WebGL 컨텍스트가 사라진다(three.js는 자동 복원하지
+		// 않아 돌아오면 흰 화면이 된다). 이 탭이 다시 활성화될 때 컨텍스트를 잃은 상태였다면
+		// 다시 그린다. render()가 시작 시 dispose()를 부르고 PCA 축은 캐시되므로, 재렌더는
+		// 컨텍스트를 새로 만들되 노드 위치는 그대로 유지한다.
+		this.registerEvent(
+			this.app.workspace.on('active-leaf-change', (leaf) => {
+				if (leaf === this.leaf && this.contextLost) {
+					void this.rerenderAfterContextLoss();
+				}
+			}),
+		);
 	}
 
 	async onClose(): Promise<void> {
+		this.untrackCanvas();
 		// 3d-force-graph/WebGL 컨텍스트를 정리한다 — 안 하면 재오픈·플러그인 리로드마다
 		// 컨텍스트가 쌓여 한도를 넘겨 시각화가 안 뜬다.
 		this.plugin.visualflow.visual.dispose();
+		this.graphContainer = undefined;
 		this.contentEl.removeClass('papergraph3d-view');
 		this.contentEl.empty();
 	}
+
+	// 컨텍스트를 잃은 뒤 이 탭이 다시 활성화됐을 때 그래프를 다시 그린다. 재렌더가 새
+	// canvas를 만들므로 리스너도 그 canvas에 다시 건다.
+	private async rerenderAfterContextLoss(): Promise<void> {
+		const container = this.graphContainer;
+		if (!container) {
+			return;
+		}
+		// 재렌더 자체가 dispose()로 옛 canvas의 컨텍스트를 강제 반납하며 contextlost를
+		// 다시 쏘므로, 그 이벤트가 이 플래그를 되살리지 않도록 먼저 리스너를 떼고 내린다.
+		this.untrackCanvas();
+		this.contextLost = false;
+		await this.renderWithRepairRetry(container);
+		this.trackCanvas();
+	}
+
+	// 지금 컨테이너 안의 canvas에 webglcontextlost 리스너를 건다. preventDefault로 브라우저가
+	// 컨텍스트를 영구 손실로 못박지 않게 하고, 플래그만 세워 재활성화 시점에 재렌더한다.
+	private trackCanvas(): void {
+		const canvas = this.graphContainer?.querySelector('canvas') ?? undefined;
+		if (!canvas) {
+			return;
+		}
+		this.trackedCanvas = canvas;
+		canvas.addEventListener('webglcontextlost', this.handleContextLost);
+	}
+
+	private untrackCanvas(): void {
+		this.trackedCanvas?.removeEventListener('webglcontextlost', this.handleContextLost);
+		this.trackedCanvas = undefined;
+	}
+
+	// 화살표 함수 필드라 add/removeEventListener가 같은 참조를 가리킨다(정상적으로 해제됨).
+	private readonly handleContextLost = (event: Event): void => {
+		event.preventDefault();
+		this.contextLost = true;
+	};
 
 	// PCA가 needsReembedding(임베딩이 안 됐거나 깨진 논문)을 신호로 주면, 그 논문들만
 	// collectflow.repairEmbeddings()로 재임베딩한 뒤 파이프라인을 한 번 더 돌린다. 인용수는

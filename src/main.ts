@@ -11,6 +11,7 @@ import {
 	CitationEdgeMiddleware,
 	ClusterColorMiddleware,
 	EdgeToggleMiddleware,
+	LabelSanitizeMiddleware,
 	OpenNoteOnClickMiddleware,
 } from './visualize/VisualMiddlewares';
 import { PersonalNoteMiddleware } from './visualize/PersonalNoteMiddleware';
@@ -197,6 +198,10 @@ export default class PaperGraph3D extends Plugin {
 		// 등록해야, 켜졌을 때 paint()가 인용 색을 previousColors로 기억하고 그 위에 덩어리
 		// 색을 덮는다(끄면 인용 색으로 복원).
 		this.visualflow.setMiddleware(new ClusterColorMiddleware());
+		// 노드 라벨(논문 제목 등)을 HTML 엔티티로 이스케이프해 XSS를 막는 시각화 미들웨어.
+		// 반드시 맨 마지막에 등록한다 — 앞선 미들웨어(PersonalNoteMiddleware 등)가 더하거나
+		// 고친 라벨까지 이 시점에 전부 무해화해야 render의 nodeLabel(innerHTML)이 안전하다.
+		this.visualflow.setMiddleware(new LabelSanitizeMiddleware());
 		File.init(this.app.vault, this.manifest.dir ?? '');
 		this.collectflow.embedding.init(this.app.vault, this.manifest.dir ?? '');
 		// collectflow가 준비된 뒤에 만들어야 한다 — 생성자에서 바로 진단 미들웨어를
