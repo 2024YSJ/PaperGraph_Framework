@@ -12,11 +12,36 @@ node_modules
 # They should be uploaded to GitHub releases instead.
 main.js
 
+# 임베딩 모델 자산(ONNX ~108MB + WASM ~21MB). main.js와 같은 이유로 repo에 넣지 않고
+# GitHub Release에서 런타임에 다운로드한다 (docs/devLog/003-embedding-model.md).
+# Obsidian "설치" 버튼이 vault 플러그인 폴더에 떨어뜨리는데, 그 폴더가 이 repo를
+# 가리키고 있으면 작업 트리에 섞여 들어온다 — 실제로 wasm이 한 번 커밋됐다.
+/models/
+/wasm/
+
+# npm test가 esbuild로 만드는 테스트 번들. 매번 재생성된다.
+.test-build/
+
 # Exclude sourcemaps
 *.map
 
 # obsidian
 data.json
 
+# 이 저장소를 vault의 플러그인 폴더로 가리켜 실기기에서 테스트하면, 플러그인이 만드는
+# 런타임 데이터(구독/키/수집된 논문)가 작업 트리에 그대로 섞여 들어온다 — 실제로
+# Subscriptions.json이 한 번 이렇게 커밋될 뻔했다. 위 models//wasm/과 같은 이유.
+/Subscriptions.json
+/Secret.json
+/Schedule.json
+/PaperGraph3D/
+/embedding_test/
+# Log.ts(임시 진단 로거, 삭제 예정)가 vault 플러그인 폴더에 남기는 파일. 위와 같은 이유로
+# 실제로 한 번 커밋됐다.
+/collect-log.md
+
 # Exclude macOS Finder (System Explorer) View States
 .DS_Store
+
+# spec-kit downloaded extension catalog (regenerable, machine-local)
+.specify/extensions/.cache/

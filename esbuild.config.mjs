@@ -32,6 +32,37 @@ const context = await esbuild.context({
 		'@lezer/lr',
 		...builtinModules,
 	],
+	// Obsidian installs only main.js/manifest.json/styles.css, so the embedding runtime
+	// (@huggingface/transformers) has to be INSIDE main.js — it can't ship as a sibling
+	// file. Bundling it is only possible on the browser platform: the package's exports
+	// map routes `node` to onnxruntime-node, whose prebuilt *.node binaries esbuild cannot
+	// load ("No loader is configured for '.node'"). The browser condition resolves to
+	// the onnxruntime-web build instead, which is pure JS + a WASM asset.
+	platform: 'browser',
+	// Choosing the web build at build time is only half of it: both libraries sniff the
+	// environment at RUNTIME and Obsidian looks like Node to them, so these two defines
+	// correct that. The WASM binary itself (~20MB) cannot be bundled either; it is
+	// downloaded into the plugin folder and handed to onnxruntime as bytes
+	// (Embedding.ts's installModel/createSession).
+	define: {
+		// transformers.js decides which ONNX runtime to use with
+		//   IS_NODE_ENV = process?.release?.name === 'node'   -> use onnxruntime-node
+		// Obsidian is an Electron renderer, so that check would be true, and
+		// transformers.js would reach for onnxruntime-node — which this bundle does not
+		// and cannot contain (its prebuilt .node binaries are unbundleable, which is why
+		// we are on the web build at all). Answering the check as electron-renderer keeps
+		// transformers.js on its web branch (fetches/reads model files instead of a
+		// filesystem path).
+		'process.release.name': JSON.stringify('electron-renderer'),
+
+		// onnxruntime derives `scriptSrc` from import.meta.url, which a CJS bundle does
+		// not have — it would be undefined, and ORT reads that as "I cannot tell where I
+		// came from", refuses to trust the WASM glue compiled into this very bundle, and
+		// dynamic-imports it from a URL instead (which Obsidian's CSP blocks). Reporting
+		// the app's own document URL is both true and same-origin by construction, which
+		// is exactly the test ORT applies before trusting the embedded module.
+		'import.meta.url': 'globalThis.location.href',
+	},
 	format: 'cjs',
 	target: 'es2021',
 	logLevel: 'info',
